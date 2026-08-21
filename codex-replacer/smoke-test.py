@@ -78,15 +78,24 @@ def main():
         client.notify("notifications/initialized")
 
         tools = client.request("tools/list").get("tools", [])
-        names = {item["name"] for item in tools}
+        name_list = [item["name"] for item in tools]
+        names = set(name_list)
         required = {
             "fs_read", "fs_write", "fs_search", "host_exec", "process_start",
             "git", "github", "docker", "browser_navigate", "browser_take_screenshot",
-            "prepare_chat_handoff", "chatgpt_start_chat",
+            "prepare_chat_handoff", "chatgpt_start_chat", "chatgpt_browser_status",
         }
         missing = sorted(required - names)
         if missing:
             raise RuntimeError(f"Missing tools: {missing}")
+        if name_list.count("chatgpt_start_chat") != 1:
+            raise RuntimeError("chatgpt_start_chat must be exposed exactly once.")
+        invalid_chat_start = client.request("tools/call", {
+            "name": "chatgpt_start_chat",
+            "arguments": {"message": "   "},
+        })
+        if invalid_chat_start.get("isError") is not True or "message is required" not in json.dumps(invalid_chat_start):
+            raise RuntimeError("chatgpt_start_chat did not reject empty input locally.")
         checks["tools"] = len(tools)
 
         handoff = structured(client.call("prepare_chat_handoff", {

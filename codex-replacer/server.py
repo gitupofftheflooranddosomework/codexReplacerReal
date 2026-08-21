@@ -6,6 +6,7 @@ import json
 import mimetypes
 import os
 import queue
+import re
 import shutil
 import signal
 import socket
@@ -16,6 +17,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from collections import deque
@@ -24,7 +26,7 @@ from pathlib import Path
 
 
 SERVER_NAME = "codex-replacer"
-SERVER_VERSION = "1.1.0"
+SERVER_VERSION = "1.2.0"
 DEFAULT_DIRECTORY = "/home/mark"
 MAX_CAPTURE_BYTES = 4 * 1024 * 1024
 
@@ -304,8 +306,134 @@ class BrowserClient:
         self.tools = None
 
 
+class HeadedChatGPTClient:
+    """Private Playwright MCP client attached to the normal headed Chromium session.
+
+    This client is intentionally not exposed as a general-purpose browser. It exists
+    only so purpose-built ChatGPT account tools can operate in the user's persistent,
+    authenticated browser without weakening the sandboxed browser MCP.
+    """
+
+    def __init__(self):
+        self.process = None
+        self.next_id = 1
+        self.lock = threading.Lock()
+
+    def _ensure_browser_service(self):
+        completed = subprocess.run(
+            ["systemctl", "--user", "start", "codex-chatgpt-browser.service"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                "Could not start codex-chatgpt-browser.service: "
+                + (completed.stderr.strip() or completed.stdout.strip() or "unknown systemd error")
+            )
+
+        deadline = time.time() + 15
+        last_error = None
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen("http://127.0.0.1:9222/json/version", timeout=2) as response:
+                    if response.status == 200:
+                        return
+            except Exception as error:
+                last_error = error
+            time.sleep(0.25)
+        raise RuntimeError(f"Headed ChatGPT browser CDP endpoint did not become ready: {last_error}")
+
+    def _start(self):
+        self.close()
+        self._ensure_browser_service()
+        image = os.environ.get("CODEX_REPLACER_BROWSER_IMAGE", "markshaw-private-mcp_browser:latest")
+        self.process = subprocess.Popen(
+            [
+                "docker", "run", "--rm", "-i", "--network", "host",
+                "--entrypoint", "node", image,
+                "/app/cli.js",
+                "--cdp-endpoint", "http://127.0.0.1:9222",
+                "--caps", "vision",
+                "--image-responses", "omit",
+                "--snapshot-boxes",
+                "--codegen", "none",
+                "--timeout-action", "10000",
+                "--timeout-navigation", "90000",
+                "--timeout-settle", "750",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=sys.stderr,
+            text=True,
+            bufsize=1,
+        )
+        self._request("initialize", {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": f"{SERVER_NAME}-headed-chatgpt", "version": SERVER_VERSION},
+        })
+        self._notify("notifications/initialized", {})
+
+    def _ensure(self):
+        if self.process is None or self.process.poll() is not None:
+            self._start()
+
+    def _write(self, message):
+        self.process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+        self.process.stdin.flush()
+
+    def _notify(self, method, params):
+        self._write({"jsonrpc": "2.0", "method": method, "params": params})
+
+    def _request(self, method, params):
+        request_id = self.next_id
+        self.next_id += 1
+        self._write({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+        while True:
+            line = self.process.stdout.readline()
+            if not line:
+                raise RuntimeError("The headed ChatGPT browser MCP connection closed unexpectedly.")
+            response = json.loads(line)
+            if response.get("id") != request_id:
+                continue
+            if "error" in response:
+                raise RuntimeError(response["error"].get("message", "Headed ChatGPT browser MCP error."))
+            return response.get("result", {})
+
+    def call(self, name, arguments=None):
+        with self.lock:
+            for attempt in range(2):
+                try:
+                    self._ensure()
+                    result = self._request("tools/call", {"name": name, "arguments": arguments or {}})
+                    if result.get("isError"):
+                        text = "\n".join(
+                            item.get("text", "")
+                            for item in result.get("content", [])
+                            if item.get("type") == "text"
+                        ).strip()
+                        raise RuntimeError(text or f"{name} failed in headed ChatGPT browser.")
+                    return result
+                except Exception:
+                    self.close()
+                    if attempt:
+                        raise
+
+    def close(self):
+        if self.process is not None and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+        self.process = None
+
+
 PROCESS_MANAGER = ProcessManager()
 BROWSER_CLIENT = BrowserClient()
+CHATGPT_BROWSER_CLIENT = HeadedChatGPTClient()
 
 
 def handle_system_info(_arguments):
@@ -574,6 +702,8 @@ def handle_host_exec(arguments):
     as_root = bool(arguments.get("asRoot", False))
     launch = ["/bin/bash", "-lc", command]
     if as_root:
+        # Passwordless sudo is deliberately available to this private operator.
+        # Use env so caller-supplied variables survive sudo's env_reset policy.
         env_args = [f"{key}={value}" for key, value in process_env.items()]
         launch = ["sudo", "-n", "env", *env_args, "/bin/bash", "-lc", command]
     try:
@@ -736,6 +866,217 @@ def tool(name, title, description, schema, handler, hints):
     }
 
 
+def _mcp_text(result):
+    return "\n".join(
+        item.get("text", "")
+        for item in (result or {}).get("content", [])
+        if item.get("type") == "text"
+    )
+
+
+def _snapshot_page_url(snapshot):
+    match = re.search(r"- Page URL:\s*(https://chatgpt\.com/[^\s]*)", snapshot or "", re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def _snapshot_ref(snapshot, patterns):
+    for pattern in patterns:
+        match = re.search(pattern, snapshot or "", re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _chatgpt_snapshot(depth=14):
+    snapshot = _mcp_text(CHATGPT_BROWSER_CLIENT.call("browser_snapshot", {"depth": depth}))
+    if re.search(r"Just a moment\.\.\.|cf-chl|Cloudflare|HTTP status:\s*403", snapshot, re.IGNORECASE):
+        raise RuntimeError(
+            "The normal headed Chromium session is unexpectedly seeing a Cloudflare challenge. "
+            "Do not use a challenge-bypass proxy; inspect the real browser session instead."
+        )
+    return snapshot
+
+
+def _chatgpt_authentication_required(snapshot):
+    return bool(
+        re.search(r'- button "Log in" \[ref=', snapshot or "", re.IGNORECASE)
+        or re.search(r"Get responses tailored to you", snapshot or "", re.IGNORECASE)
+    )
+
+
+def _chatgpt_composer_ref(snapshot):
+    return _snapshot_ref(snapshot, [
+        r'textbox "Chat with ChatGPT"[^\n]*\[ref=([^\]]+)\]',
+        r'textbox "Message ChatGPT"[^\n]*\[ref=([^\]]+)\]',
+        r'textbox "Ask anything"[^\n]*\[ref=([^\]]+)\]',
+        r'textbox "Message"[^\n]*\[ref=([^\]]+)\]',
+        r'textbox [^\n]*\[ref=([^\]]+)\]',
+    ])
+
+
+def handle_chatgpt_browser_status(_arguments):
+    try:
+        snapshot = _chatgpt_snapshot(depth=8)
+        url = _snapshot_page_url(snapshot)
+        authenticated = not _chatgpt_authentication_required(snapshot)
+        return tool_result({
+            "reachable": True,
+            "authenticated": authenticated,
+            "url": url,
+            "mode": "headed-cdp",
+            "cdpEndpoint": "http://127.0.0.1:9222",
+        })
+    except Exception as error:
+        return tool_result({
+            "reachable": False,
+            "authenticated": False,
+            "url": None,
+            "mode": "headed-cdp",
+            "error": str(error),
+        }, message=str(error), is_error=True)
+
+
+def handle_chatgpt_start_chat(arguments):
+    message = str(arguments.get("message") or "").strip()
+    if not message:
+        return tool_result({"created": False}, message="message is required.", is_error=True)
+    if len(message) > 50000:
+        return tool_result({"created": False}, message="message must be 50,000 characters or fewer.", is_error=True)
+
+    project = str(arguments.get("project") or "").strip()
+    project_url = str(arguments.get("projectUrl") or "").strip()
+    submit = arguments.get("submit", True) is not False
+
+    if project_url:
+        try:
+            parsed = urllib.parse.urlparse(project_url)
+        except Exception:
+            parsed = None
+        if not parsed or parsed.scheme != "https" or parsed.hostname != "chatgpt.com":
+            return tool_result({"created": False}, message="projectUrl must be an https://chatgpt.com URL.", is_error=True)
+
+    try:
+        initial_url = project_url or "https://chatgpt.com/"
+        CHATGPT_BROWSER_CLIENT.call("browser_tabs", {"action": "new", "url": initial_url})
+        CHATGPT_BROWSER_CLIENT.call("browser_wait_for", {"time": 1.5})
+        snapshot = _chatgpt_snapshot()
+
+        if _chatgpt_authentication_required(snapshot):
+            return tool_result({
+                "created": False,
+                "submitted": False,
+                "authenticationRequired": True,
+                "project": project or None,
+                "projectUrl": project_url or None,
+                "chatUrl": None,
+                "browserUrl": _snapshot_page_url(snapshot),
+                "mode": "headed-cdp",
+            }, message=(
+                "The headed Chromium bridge reached ChatGPT without a Cloudflare challenge, but this dedicated "
+                "browser profile is not signed in. Complete the one-time ChatGPT sign-in in the Codex Replacer "
+                "desktop Chromium window, then retry chatgpt_start_chat."
+            ), is_error=True)
+
+        if project and not project_url:
+            escaped = re.escape(project)
+            project_ref = _snapshot_ref(snapshot, [
+                rf'(?:link|button) "{escaped}" \[ref=([^\]]+)\]',
+                rf'(?:link|button) "[^"]*{escaped}[^"]*" \[ref=([^\]]+)\]',
+            ])
+            if not project_ref:
+                found = _mcp_text(CHATGPT_BROWSER_CLIENT.call("browser_find", {"text": project}))
+                project_ref = _snapshot_ref(found, [
+                    rf'(?:link|button) "[^"]*{escaped}[^"]*" \[ref=([^\]]+)\]',
+                    r'\[ref=([^\]]+)\]',
+                ])
+            if not project_ref:
+                raise RuntimeError(f'Could not find ChatGPT Project "{project}" in the authenticated sidebar.')
+            CHATGPT_BROWSER_CLIENT.call("browser_click", {
+                "target": project_ref,
+                "element": f'ChatGPT Project {project}',
+            })
+            CHATGPT_BROWSER_CLIENT.call("browser_wait_for", {"time": 1.5})
+            snapshot = _chatgpt_snapshot()
+
+        if project or project_url:
+            composer_ref = _chatgpt_composer_ref(snapshot)
+            if not composer_ref:
+                new_chat_ref = _snapshot_ref(snapshot, [
+                    r'button "New chat" \[ref=([^\]]+)\]',
+                    r'link "New chat" \[ref=([^\]]+)\]',
+                    r'button "Chat" \[ref=([^\]]+)\]',
+                    r'link "Chat" \[ref=([^\]]+)\]',
+                    r'button "Start (?:a )?new chat[^"]*" \[ref=([^\]]+)\]',
+                ])
+                if not new_chat_ref:
+                    raise RuntimeError("Could not find a new-chat control inside the requested ChatGPT Project.")
+                CHATGPT_BROWSER_CLIENT.call("browser_click", {
+                    "target": new_chat_ref,
+                    "element": "new chat control in requested ChatGPT Project",
+                })
+                CHATGPT_BROWSER_CLIENT.call("browser_wait_for", {"time": 1.5})
+                snapshot = _chatgpt_snapshot()
+
+        composer_ref = _chatgpt_composer_ref(snapshot)
+        if not composer_ref:
+            raise RuntimeError("Could not locate the ChatGPT message composer in the headed browser.")
+
+        CHATGPT_BROWSER_CLIENT.call("browser_fill_form", {
+            "fields": [{
+                "name": "ChatGPT message",
+                "type": "textbox",
+                "target": composer_ref,
+                "element": "ChatGPT message composer",
+                "value": message,
+            }],
+        })
+
+        if submit:
+            CHATGPT_BROWSER_CLIENT.call("browser_press_key", {"key": "Enter"})
+            snapshot = None
+            for _ in range(5):
+                CHATGPT_BROWSER_CLIENT.call("browser_wait_for", {"time": 1})
+                snapshot = _chatgpt_snapshot(depth=10)
+                chat_url = _snapshot_page_url(snapshot)
+                if chat_url and "/c/" in chat_url:
+                    break
+        else:
+            snapshot = _chatgpt_snapshot(depth=10)
+
+        chat_url = _snapshot_page_url(snapshot)
+        created = bool(submit and chat_url and "/c/" in chat_url)
+        data = {
+            "created": created,
+            "submitted": submit,
+            "authenticationRequired": False,
+            "project": project or None,
+            "projectUrl": project_url or None,
+            "chatUrl": chat_url if created else None,
+            "browserUrl": chat_url,
+            "mode": "headed-cdp",
+        }
+        if submit and not created:
+            return tool_result(
+                data,
+                message="The handoff message was submitted, but a saved ChatGPT conversation URL could not be confirmed.",
+                is_error=True,
+            )
+        if created:
+            return tool_result(data, message=f"Created ChatGPT chat: {chat_url}")
+        return tool_result(data, message="The handoff message is filled into the headed ChatGPT composer for review.")
+    except Exception as error:
+        return tool_result({
+            "created": False,
+            "submitted": False,
+            "authenticationRequired": False,
+            "project": project or None,
+            "projectUrl": project_url or None,
+            "chatUrl": None,
+            "mode": "headed-cdp",
+            "error": str(error),
+        }, message=str(error), is_error=True)
+
+
 def handle_prepare_chat_handoff(arguments):
     objective = str(arguments.get("objective") or "").strip()
     current_state = str(arguments.get("currentState") or "").strip()
@@ -799,6 +1140,8 @@ COMMON_COMMAND_PROPERTIES = {
 
 DIRECT_TOOLS = dict([
     tool("prepare_chat_handoff", "Prepare chat handoff", "Use this proactively when the current conversation is becoming long or context-risky. It formats a complete continuation summary for a new chat before context is exhausted.", object_schema({"objective": string(), "currentState": string(), "completed": {"type": "array", "items": {"type": "string"}}, "pending": {"type": "array", "items": {"type": "string"}}, "importantContext": {"type": "array", "items": {"type": "string"}}, "exactReferences": {"type": "array", "items": {"type": "string"}}, "blockers": {"type": "array", "items": {"type": "string"}}, "constraints": {"type": "array", "items": {"type": "string"}}, "nextActions": {"type": "array", "items": {"type": "string"}}}, ["objective", "currentState"]), handle_prepare_chat_handoff, annotations(True, False, False)),
+    tool("chatgpt_browser_status", "Inspect ChatGPT browser", "Check whether the dedicated normal headed Chromium session for ChatGPT is reachable and authenticated. This does not expose general control of that browser.", object_schema(), handle_chatgpt_browser_status, annotations(True, False, True)),
+    tool("chatgpt_start_chat", "Start ChatGPT chat", "Create a new ChatGPT conversation through the user's persistent headed Chromium session, optionally inside an existing ChatGPT Project, seed it with a message, submit it, and return the resulting conversation URL. Use this only when the user explicitly asks to start, hand off, or continue work in another ChatGPT chat.", object_schema({"message": string("First message to place in the new chat."), "project": string("Optional exact ChatGPT Project name."), "projectUrl": string("Optional exact https://chatgpt.com project URL; prefer when known."), "submit": {"type": "boolean", "default": True}}, ["message"]), handle_chatgpt_start_chat, annotations(False, False, True)),
     tool("system_info", "Inspect VM", "Use this when you need the dedicated Codex Replacer VM identity, Mark's guest execution context, or installed development tools.", object_schema(), handle_system_info, annotations(True, False, False)),
     tool("fs_stat", "Inspect path", "Use this when you need metadata, ownership, permissions, timestamps, link target, or an optional SHA-256 hash for any host path.", object_schema({"path": string(), "hash": {"type": "boolean", "default": False}}, ["path"]), handle_fs_stat, annotations(True, False, False)),
     tool("fs_list", "List files", "Use this when you need to list any host directory, optionally recursively.", object_schema({"path": string(), "recursive": {"type": "boolean", "default": False}, "maxDepth": {"type": "integer", "minimum": 0, "maximum": 100}, "maxEntries": {"type": "integer", "minimum": 1, "maximum": 10000}}, ["path"]), handle_fs_list, annotations(True, False, False)),
@@ -849,7 +1192,10 @@ def handle_request(message):
     if method == "tools/list":
         tools = [entry["descriptor"] for entry in DIRECT_TOOLS.values()]
         try:
-            tools.extend(BROWSER_CLIENT.list_tools())
+            tools.extend(
+                item for item in BROWSER_CLIENT.list_tools()
+                if item.get("name") not in DIRECT_TOOLS
+            )
         except Exception as error:
             sys.stderr.write(f"Visual browser tools are temporarily unavailable: {error}\n")
         return {"jsonrpc": "2.0", "id": request_id, "result": {"tools": tools}}
@@ -889,6 +1235,7 @@ def handle_request(message):
 def shutdown(_signal_number=None, _frame=None):
     PROCESS_MANAGER.stop_all()
     BROWSER_CLIENT.close()
+    CHATGPT_BROWSER_CLIENT.close()
     raise SystemExit(0)
 
 

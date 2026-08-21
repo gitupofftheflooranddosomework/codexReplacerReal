@@ -42,15 +42,10 @@ try {
   child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} })}\n`);
   const listed = await request("tools/list");
   const names = listed.tools.map((tool) => tool.name);
-  const required = ["browser_navigate", "browser_snapshot", "browser_take_screenshot", "browser_mouse_click_xy", "chatgpt_start_chat"];
+  const required = ["browser_navigate", "browser_snapshot", "browser_take_screenshot", "browser_mouse_click_xy"];
   const forbidden = ["browser_evaluate", "browser_run_code_unsafe", "browser_network_request", "browser_network_requests"];
   if (required.some((name) => !names.includes(name))) throw new Error("One or more required browser tools are missing.");
   if (forbidden.some((name) => names.includes(name))) throw new Error("One or more blocked browser tools were exposed.");
-
-  const invalidChatStart = await request("tools/call", { name: "chatgpt_start_chat", arguments: { message: "   " } });
-  if (invalidChatStart.isError !== true || !JSON.stringify(invalidChatStart).includes("message is required")) {
-    throw new Error("chatgpt_start_chat did not reject an empty seed message locally.");
-  }
 
   const navigation = await request("tools/call", { name: "browser_navigate", arguments: { url: "https://example.com/" } });
   if (navigation.isError) throw new Error("Navigation failed.");

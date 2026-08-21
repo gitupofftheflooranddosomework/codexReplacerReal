@@ -1,0 +1,14 @@
+[Unit]
+Description=Codex Replacer persistent headed ChatGPT browser
+After=graphical-session.target
+
+[Service]
+Type=simple
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=%h/.Xauthority
+ExecStart=/usr/bin/chromium --user-data-dir=%h/.local/share/codex-replacer/chatgpt-browser --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --no-first-run --no-default-browser-check https://chatgpt.com/
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
