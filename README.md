@@ -27,7 +27,9 @@ Install/reinstall the headed browser service with:
 
 The dedicated Chromium profile requires a one-time interactive ChatGPT sign-in. Authentication then persists in that profile across MCP/service restarts.
 
-`chatgpt_browser_status` reports whether the headed browser is reachable and authenticated without creating a chat.
+`chatgpt_browser_status` reports whether the headed browser is reachable and authenticated without creating a chat. `chatgpt_auth_begin` can initiate only user-approved `passkey` or `phone_prompt` authentication flows; it deliberately has no input for passwords, OTPs, backup codes, or MFA secrets.
+
+The Chromium profile is mode `0700`, systemd linger is enabled where available, the CDP endpoint remains bound to `127.0.0.1`, and the service uses the same on-disk profile across browser/MCP restarts. `--password-store=basic` avoids tying persisted Chromium cookies to an interactive desktop keyring that may not be unlocked when the service starts after reboot.
 
 ## Why not FlareSolverr
 

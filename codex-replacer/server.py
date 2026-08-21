@@ -26,7 +26,7 @@ from pathlib import Path
 
 
 SERVER_NAME = "codex-replacer"
-SERVER_VERSION = "1.2.0"
+SERVER_VERSION = "1.3.0"
 DEFAULT_DIRECTORY = "/home/mark"
 MAX_CAPTURE_BYTES = 4 * 1024 * 1024
 
@@ -914,22 +914,218 @@ def _chatgpt_composer_ref(snapshot):
     ])
 
 
+def _headed_browser_tabs():
+    listing = _mcp_text(CHATGPT_BROWSER_CLIENT.call("browser_tabs", {"action": "list"}))
+    tabs = []
+    for line in listing.splitlines():
+        match = re.match(r"-\s*(\d+):\s*(?:\(current\)\s*)?\[(.*?)\]\((https?://[^)]+)\)", line.strip())
+        if match:
+            tabs.append({"index": int(match.group(1)), "title": match.group(2), "url": match.group(3)})
+    return tabs
+
+
+def _select_chatgpt_tab(create=True):
+    for tab in _headed_browser_tabs():
+        try:
+            parsed = urllib.parse.urlparse(tab["url"])
+        except Exception:
+            continue
+        if parsed.hostname == "chatgpt.com":
+            CHATGPT_BROWSER_CLIENT.call("browser_tabs", {"action": "select", "index": tab["index"]})
+            CHATGPT_BROWSER_CLIENT.call("browser_wait_for", {"time": 0.5})
+            return _chatgpt_snapshot()
+    if not create:
+        return None
+    CHATGPT_BROWSER_CLIENT.call("browser_tabs", {"action": "new", "url": "https://chatgpt.com/"})
+    CHATGPT_BROWSER_CLIENT.call("browser_wait_for", {"time": 1.5})
+    return _chatgpt_snapshot()
+
+
+def _close_stale_google_auth_tabs():
+    stale = []
+    for tab in _headed_browser_tabs():
+        try:
+            host = urllib.parse.urlparse(tab["url"]).hostname
+        except Exception:
+            host = None
+        if host == "accounts.google.com":
+            stale.append(tab["index"])
+    for index in sorted(stale, reverse=True):
+        CHATGPT_BROWSER_CLIENT.call("browser_tabs", {"action": "close", "index": index})
+
+
+def _auth_flow(snapshot):
+    text = snapshot or ""
+    if re.search(r"Get responses tailored to you|button \"Log in\"", text, re.IGNORECASE):
+        return "chatgpt_login"
+    if re.search(r"Use your passkey|passkey", text, re.IGNORECASE):
+        return "passkey"
+    if re.search(r"Check your phone|Google sent a notification", text, re.IGNORECASE):
+        return "phone_prompt"
+    if re.search(r"Google Authenticator", text, re.IGNORECASE):
+        return "authenticator"
+    if re.search(r"text message with a 6-digit verification code|2-Step Verification phone", text, re.IGNORECASE):
+        return "sms"
+    if re.search(r"backup code", text, re.IGNORECASE):
+        return "backup_code"
+    if re.search(r"Enter your password", text, re.IGNORECASE):
+        return "password"
+    if re.search(r"Sign in with Google|Email or phone", text, re.IGNORECASE):
+        return "google_login"
+    return "unknown"
+
+
+def _click_snapshot_control(snapshot, patterns, element):
+    ref = _snapshot_ref(snapshot, patterns)
+    if not ref:
+        return False
+    CHATGPT_BROWSER_CLIENT.call("browser_click", {"target": ref, "element": element})
+    CHATGPT_BROWSER_CLIENT.call("browser_wait_for", {"time": 1.0})
+    return True
+
+
+def _headed_snapshot_until(patterns, timeout=8.0, depth=14):
+    deadline = time.time() + timeout
+    latest = ""
+    while time.time() < deadline:
+        latest = _mcp_text(CHATGPT_BROWSER_CLIENT.call("browser_snapshot", {"depth": depth}))
+        if any(re.search(pattern, latest, re.IGNORECASE) for pattern in patterns):
+            return latest
+        CHATGPT_BROWSER_CLIENT.call("browser_wait_for", {"time": 0.5})
+    return latest
+
+
+def handle_chatgpt_auth_begin(arguments):
+    method = str(arguments.get("method") or "passkey").strip().lower()
+    if method not in {"passkey", "phone_prompt"}:
+        return tool_result(
+            {"started": False, "method": method},
+            message="method must be passkey or phone_prompt. Passwords, OTPs, backup codes, and MFA secrets are intentionally not accepted by this tool.",
+            is_error=True,
+        )
+    account_email = str(arguments.get("accountEmail") or "").strip()
+    try:
+        _close_stale_google_auth_tabs()
+        snapshot = _select_chatgpt_tab(create=True)
+        if not _chatgpt_authentication_required(snapshot):
+            return tool_result({
+                "started": False,
+                "authenticated": True,
+                "method": method,
+                "actionRequired": None,
+                "url": _snapshot_page_url(snapshot),
+            }, message="The headed ChatGPT browser is already authenticated.")
+
+        if not re.search(r"Log in or sign up", snapshot, re.IGNORECASE):
+            _click_snapshot_control(snapshot, [
+                r'button "Log in" \[ref=([^\]]+)\]',
+            ], "ChatGPT Log in")
+            snapshot = _chatgpt_snapshot()
+
+        if re.search(r"Continue with Google", snapshot, re.IGNORECASE):
+            _click_snapshot_control(snapshot, [
+                r'(?:link|button) "Continue with Google" \[ref=([^\]]+)\]',
+            ], "Continue with Google")
+            snapshot = _headed_snapshot_until([
+                r"Email or phone",
+                r"Enter your password",
+                r"Use your passkey",
+                r"Check your phone",
+            ], timeout=10.0)
+
+        if account_email and re.search(r"Email or phone", snapshot, re.IGNORECASE):
+            email_ref = _snapshot_ref(snapshot, [r'textbox "Email or phone" \[ref=([^\]]+)\]'])
+            if email_ref:
+                CHATGPT_BROWSER_CLIENT.call("browser_type", {
+                    "target": email_ref,
+                    "element": "Google account email",
+                    "text": account_email,
+                    "submit": True,
+                })
+                snapshot = _headed_snapshot_until([
+                    r"Enter your password",
+                    r"Use your passkey",
+                    r"Do you have your phone",
+                    r"Google Authenticator",
+                ], timeout=10.0)
+
+        if re.search(r"Enter your password", snapshot, re.IGNORECASE):
+            _click_snapshot_control(snapshot, [
+                r'(?:button|link) "Try another way" \[ref=([^\]]+)\]',
+            ], "Try another way")
+            snapshot = _headed_snapshot_until([
+                r"Use your passkey",
+                r"Do you have your phone",
+                r"Google Authenticator",
+                r"backup code",
+            ], timeout=10.0)
+
+        if method == "passkey" and re.search(r"Use your passkey", snapshot, re.IGNORECASE):
+            _click_snapshot_control(snapshot, [
+                r'(?:button|link) "Use your passkey" \[ref=([^\]]+)\]',
+            ], "Use your passkey")
+            snapshot = _headed_snapshot_until([
+                r"passkey",
+                r"QR",
+                r"Check your phone",
+                r"Choose where to save",
+            ], timeout=6.0)
+        elif method == "phone_prompt" and re.search(r"Do you have your phone\?|Check your phone", snapshot, re.IGNORECASE):
+            yes_ref = _snapshot_ref(snapshot, [r'button "Yes" \[ref=([^\]]+)\]'])
+            if yes_ref:
+                CHATGPT_BROWSER_CLIENT.call("browser_click", {"target": yes_ref, "element": "Send Google phone prompt"})
+                CHATGPT_BROWSER_CLIENT.call("browser_wait_for", {"time": 1.5})
+                snapshot = _mcp_text(CHATGPT_BROWSER_CLIENT.call("browser_snapshot", {"depth": 14}))
+
+        flow = _auth_flow(snapshot)
+        action = {
+            "passkey": "Approve the passkey request on a trusted device or scan the cross-device QR code if Google presents one.",
+            "phone_prompt": "Approve the Google sign-in notification on a trusted phone.",
+            "google_login": "Google account identification is still required.",
+            "password": "Choose Try another way; this MCP never accepts Google passwords.",
+            "authenticator": "Use a different approved sign-in method; this MCP never accepts authenticator codes.",
+            "sms": "Use a different approved sign-in method; this MCP never accepts SMS verification codes.",
+            "backup_code": "Use a different approved sign-in method; this MCP never accepts backup codes.",
+            "unknown": "Complete the visible Google approval step in the headed browser.",
+        }.get(flow, "Complete the visible Google approval step.")
+        return tool_result({
+            "started": True,
+            "authenticated": False,
+            "method": method,
+            "flow": flow,
+            "actionRequired": action,
+            "persistentProfile": str(Path.home() / ".local/share/codex-replacer/chatgpt-browser"),
+        }, message=f"Authentication flow started. Current step: {flow}. {action}")
+    except Exception as error:
+        return tool_result({
+            "started": False,
+            "authenticated": False,
+            "method": method,
+            "error": str(error),
+        }, message=str(error), is_error=True)
+
+
 def handle_chatgpt_browser_status(_arguments):
     try:
-        snapshot = _chatgpt_snapshot(depth=8)
+        snapshot = _select_chatgpt_tab(create=True)
         url = _snapshot_page_url(snapshot)
         authenticated = not _chatgpt_authentication_required(snapshot)
+        profile = Path.home() / ".local/share/codex-replacer/chatgpt-browser"
         return tool_result({
             "reachable": True,
             "authenticated": authenticated,
+            "authFlow": None if authenticated else _auth_flow(snapshot),
             "url": url,
             "mode": "headed-cdp",
             "cdpEndpoint": "http://127.0.0.1:9222",
+            "persistentProfile": str(profile),
+            "profileExists": profile.is_dir(),
         })
     except Exception as error:
         return tool_result({
             "reachable": False,
             "authenticated": False,
+            "authFlow": None,
             "url": None,
             "mode": "headed-cdp",
             "error": str(error),
@@ -1141,6 +1337,7 @@ COMMON_COMMAND_PROPERTIES = {
 DIRECT_TOOLS = dict([
     tool("prepare_chat_handoff", "Prepare chat handoff", "Use this proactively when the current conversation is becoming long or context-risky. It formats a complete continuation summary for a new chat before context is exhausted.", object_schema({"objective": string(), "currentState": string(), "completed": {"type": "array", "items": {"type": "string"}}, "pending": {"type": "array", "items": {"type": "string"}}, "importantContext": {"type": "array", "items": {"type": "string"}}, "exactReferences": {"type": "array", "items": {"type": "string"}}, "blockers": {"type": "array", "items": {"type": "string"}}, "constraints": {"type": "array", "items": {"type": "string"}}, "nextActions": {"type": "array", "items": {"type": "string"}}}, ["objective", "currentState"]), handle_prepare_chat_handoff, annotations(True, False, False)),
     tool("chatgpt_browser_status", "Inspect ChatGPT browser", "Check whether the dedicated normal headed Chromium session for ChatGPT is reachable and authenticated. This does not expose general control of that browser.", object_schema(), handle_chatgpt_browser_status, annotations(True, False, True)),
+    tool("chatgpt_auth_begin", "Begin ChatGPT authentication", "Start or resume the normal Google authentication flow for the persistent headed ChatGPT browser using only user-approved passkey or phone-prompt methods. This tool intentionally cannot accept passwords, one-time codes, backup codes, passkey secrets, or MFA secrets.", object_schema({"method": {"type": "string", "enum": ["passkey", "phone_prompt"], "default": "passkey"}, "accountEmail": string("Optional Google account email used only to fill the account identifier field.")}), handle_chatgpt_auth_begin, annotations(False, False, True)),
     tool("chatgpt_start_chat", "Start ChatGPT chat", "Create a new ChatGPT conversation through the user's persistent headed Chromium session, optionally inside an existing ChatGPT Project, seed it with a message, submit it, and return the resulting conversation URL. Use this only when the user explicitly asks to start, hand off, or continue work in another ChatGPT chat.", object_schema({"message": string("First message to place in the new chat."), "project": string("Optional exact ChatGPT Project name."), "projectUrl": string("Optional exact https://chatgpt.com project URL; prefer when known."), "submit": {"type": "boolean", "default": True}}, ["message"]), handle_chatgpt_start_chat, annotations(False, False, True)),
     tool("system_info", "Inspect VM", "Use this when you need the dedicated Codex Replacer VM identity, Mark's guest execution context, or installed development tools.", object_schema(), handle_system_info, annotations(True, False, False)),
     tool("fs_stat", "Inspect path", "Use this when you need metadata, ownership, permissions, timestamps, link target, or an optional SHA-256 hash for any host path.", object_schema({"path": string(), "hash": {"type": "boolean", "default": False}}, ["path"]), handle_fs_stat, annotations(True, False, False)),

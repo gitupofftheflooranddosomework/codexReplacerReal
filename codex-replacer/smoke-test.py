@@ -83,13 +83,19 @@ def main():
         required = {
             "fs_read", "fs_write", "fs_search", "host_exec", "process_start",
             "git", "github", "docker", "browser_navigate", "browser_take_screenshot",
-            "prepare_chat_handoff", "chatgpt_start_chat", "chatgpt_browser_status",
+            "prepare_chat_handoff", "chatgpt_start_chat", "chatgpt_browser_status", "chatgpt_auth_begin",
         }
         missing = sorted(required - names)
         if missing:
             raise RuntimeError(f"Missing tools: {missing}")
         if name_list.count("chatgpt_start_chat") != 1:
             raise RuntimeError("chatgpt_start_chat must be exposed exactly once.")
+        if name_list.count("chatgpt_auth_begin") != 1:
+            raise RuntimeError("chatgpt_auth_begin must be exposed exactly once.")
+        auth_tool = next(item for item in tools if item["name"] == "chatgpt_auth_begin")
+        auth_methods = auth_tool.get("inputSchema", {}).get("properties", {}).get("method", {}).get("enum", [])
+        if auth_methods != ["passkey", "phone_prompt"]:
+            raise RuntimeError(f"chatgpt_auth_begin exposed unexpected methods: {auth_methods}")
         invalid_chat_start = client.request("tools/call", {
             "name": "chatgpt_start_chat",
             "arguments": {"message": "   "},
