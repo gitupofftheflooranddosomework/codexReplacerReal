@@ -1,0 +1,22 @@
+[Unit]
+Description=Codex six-KVM job scheduler and browser dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=CODEX_LAB_SCHEDULER_HOST=192.168.122.1
+Environment=CODEX_LAB_SCHEDULER_PORT=8766
+Environment=CODEX_LAB_SCHEDULER_DB=/tank/vm/codex-lab/scheduler.sqlite3
+Environment=CODEX_LAB_DASHBOARD_AUTH=/tank/vm/codex-lab/dashboard-auth.json
+Environment=CODEX_LAB_DASHBOARD_SESSION_SECONDS=43200
+Environment=CODEX_LAB_VM_MAX_STATIONS=6
+Environment=CODEX_LAB_SCHEDULER_TRUSTED_CLIENTS=192.168.122.1,192.168.122.225
+Environment=CODEX_LAB_SCHEDULER_KNOWN_HOSTS=/home/mark/.ssh/codex_lab_scheduler_known_hosts
+ExecStart=/usr/bin/python3 /tank/vm/codex-lab/scheduler.py
+Restart=always
+RestartSec=1
+Nice=-5
+
+[Install]
+WantedBy=default.target

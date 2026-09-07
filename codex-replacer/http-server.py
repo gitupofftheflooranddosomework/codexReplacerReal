@@ -211,6 +211,7 @@ class HTTPServer(ThreadingHTTPServer):
 def cleanup():
     server.PROCESS_MANAGER.stop_all()
     server.BROWSER_CLIENT.close()
+    server.KVM_BROWSER_POOL.close()
     server.CHATGPT_BROWSER_CLIENT.close()
 
 
@@ -234,6 +235,32 @@ def warm_dependencies():
             "elapsedMs": round((time.monotonic() - started) * 1000, 2),
         }
     sys.stderr.write(json.dumps(event, separators=(",", ":")) + "\n")
+    sys.stderr.flush()
+
+    kvm_started = time.monotonic()
+    try:
+        workers = server.KVM_BROWSER_POOL.warm()
+        ready = sum(1 for worker in workers if worker.get("ready"))
+        kvm_event = {
+            "time": server.now_iso(),
+            "event": "mcp_dependency_warmed" if ready == len(workers) else "mcp_dependency_warm_partial",
+            "dependency": "kvm_worker_browsers",
+            "ready": ready,
+            "workers": len(workers),
+            "elapsedMs": round((time.monotonic() - kvm_started) * 1000, 2),
+        }
+        failures = [worker for worker in workers if not worker.get("ready")]
+        if failures:
+            kvm_event["failures"] = failures
+    except Exception as error:
+        kvm_event = {
+            "time": server.now_iso(),
+            "event": "mcp_dependency_warm_failed",
+            "dependency": "kvm_worker_browsers",
+            "error": str(error),
+            "elapsedMs": round((time.monotonic() - kvm_started) * 1000, 2),
+        }
+    sys.stderr.write(json.dumps(kvm_event, separators=(",", ":")) + "\n")
     sys.stderr.flush()
 
 

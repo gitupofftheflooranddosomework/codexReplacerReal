@@ -1,0 +1,20 @@
+[Unit]
+Description=Codex KVM worker visible browser desktop
+After=network-online.target codex-worker-identity.service
+Wants=network-online.target codex-worker-identity.service
+
+[Service]
+Type=simple
+User=mark
+Group=mark
+Environment=HOME=/home/mark
+Environment=DISPLAY=:99
+ExecStart=/usr/local/libexec/codex-worker-desktop
+Restart=always
+RestartSec=1
+KillMode=control-group
+TimeoutStopSec=10
+Nice=-2
+
+[Install]
+WantedBy=multi-user.target

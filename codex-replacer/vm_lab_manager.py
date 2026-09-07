@@ -15,8 +15,8 @@ STATE_FILE = ROOT / "state.json"
 AUDIT_FILE = ROOT / "sign-in-out.jsonl"
 SHEET_FILE = ROOT / "SIGN-IN-OUT.md"
 LOCK_FILE = ROOT / ".lock"
-MAX_STATIONS = max(1, min(int(os.environ.get("CODEX_VM_LAB_MAX_STATIONS", "4")), 8))
-PREWARM = max(0, min(int(os.environ.get("CODEX_VM_LAB_PREWARM", "4")), MAX_STATIONS))
+MAX_STATIONS = max(1, min(int(os.environ.get("CODEX_VM_LAB_MAX_STATIONS", "6")), 8))
+PREWARM = max(0, min(int(os.environ.get("CODEX_VM_LAB_PREWARM", "6")), MAX_STATIONS))
 HOME_SERVER = os.environ.get("CODEX_VM_LAB_HOST", "home-server")
 HOME_KEY = os.environ.get("CODEX_VM_LAB_HOME_KEY", "/home/mark/.ssh/id_ed25519_home_server")
 GUEST_KEY = os.environ.get("CODEX_VM_LAB_GUEST_KEY", "/home/mark/.ssh/id_ed25519_codex_lab_vm")
@@ -70,8 +70,8 @@ def run(args, timeout=120):
 def ssh_host(command, timeout=120):
     return run(["ssh","-i",HOME_KEY,"-o","IdentitiesOnly=yes","-o","BatchMode=yes",HOME_SERVER,command], timeout)
 
-def ssh_guest(station, command, timeout=120):
-    return run(["ssh","-i",GUEST_KEY,"-o","IdentitiesOnly=yes","-o","BatchMode=yes","-o",f"UserKnownHostsFile={KNOWN_HOSTS}","-o","StrictHostKeyChecking=accept-new","-o","ConnectTimeout=5",f"mark@{ip_for(station)}",command], timeout)
+def ssh_guest(station, command, timeout=120, input_text=None):
+    return subprocess.run(["ssh","-i",GUEST_KEY,"-o","IdentitiesOnly=yes","-o","BatchMode=yes","-o",f"UserKnownHostsFile={KNOWN_HOSTS}","-o","StrictHostKeyChecking=accept-new","-o","ConnectTimeout=5",f"mark@{ip_for(station)}",command], input=input_text, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
 
 def public_key():
     p=Path(GUEST_KEY+".pub")
@@ -110,15 +110,79 @@ def host_status():
         if len(parts)>=5: rows[int(parts[0])]={"name":parts[1],"ip":parts[2],"state":parts[3],"autostart":parts[4]}
     return rows
 
+def _remote_exclusive_lease(station):
+    result = ssh_guest(
+        station,
+        "cat /home/mark/.local/share/codex-worker/exclusive.lock 2>/dev/null",
+        5,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def _mark_free(record, reason, released_at=None):
+    old = record.copy()
+    record.update({
+        "status": "free", "leaseId": None, "owner": None, "project": None,
+        "acquiredAt": None, "expiresAt": None,
+        "releasedAt": iso(released_at or now()), "releaseReason": reason,
+    })
+    return old
+
+
+def reconcile_lost_leases(state):
+    recovered = []
+    for record in state.setdefault("stations", {}).values():
+        if record.get("status") != "leased":
+            continue
+        remote = _remote_exclusive_lease(record["station"])
+        if remote and remote.get("leaseId") == record.get("leaseId"):
+            continue
+        old = _mark_free(record, "remote-lock-lost")
+        recovered.append(old)
+        audit(
+            "auto_sign_out",
+            station=old.get("station"), leaseId=old.get("leaseId"),
+            owner=old.get("owner"), project=old.get("project"), reason="remote-lock-lost",
+        )
+    if recovered:
+        save_state(state)
+    return recovered
+
+
 def expire(state):
-    expired=[]; current=now()
-    for r in state.setdefault("stations",{}).values():
-        if r.get("status")!="leased" or not r.get("expiresAt"): continue
-        try: due=datetime.fromisoformat(r["expiresAt"])
-        except Exception: continue
-        if due <= current:
-            old=r.copy(); r.update({"status":"free","leaseId":None,"owner":None,"project":None,"acquiredAt":None,"expiresAt":None,"releasedAt":iso(current),"releaseReason":"expired"}); expired.append(old); audit("auto_sign_out",station=old["station"],leaseId=old.get("leaseId"),owner=old.get("owner"),project=old.get("project")); reset_station(old["station"])
+    expired = []
+    current = now()
+    for record in state.setdefault("stations", {}).values():
+        if record.get("status") != "leased" or not record.get("expiresAt"):
+            continue
+        try:
+            due = datetime.fromisoformat(record["expiresAt"])
+        except Exception:
+            continue
+        if due > current:
+            continue
+        result = ssh_guest(
+            record["station"],
+            "rm -f /home/mark/.local/share/codex-worker/exclusive.lock",
+            8,
+        )
+        if result.returncode != 0:
+            continue
+        old = _mark_free(record, "expired", current)
+        expired.append(old)
+        audit(
+            "auto_sign_out", station=old.get("station"), leaseId=old.get("leaseId"),
+            owner=old.get("owner"), project=old.get("project"), reason="expired",
+        )
+    if expired:
+        save_state(state)
     return expired
+
 
 def acquire(owner, project=None, ttl_minutes=180):
     owner=str(owner or "").strip()
@@ -126,10 +190,40 @@ def acquire(owner, project=None, ttl_minutes=180):
     ttl=max(15,min(int(ttl_minutes),1440)); lock,state=locked_state()
     try:
         expire(state)
+        reconcile_lost_leases(state)
         for s in range(1,MAX_STATIONS+1):
             r=record_for(state,s)
             if r.get("status")=="leased": continue
-            ensure_station(s); lease=str(uuid.uuid4()); t=now(); r.update({"status":"leased","leaseId":lease,"owner":owner,"project":project or None,"acquiredAt":iso(t),"expiresAt":iso(t+timedelta(minutes=ttl)),"releasedAt":None,"releaseReason":None}); save_state(state); audit("sign_in",station=s,leaseId=lease,owner=owner,project=project or None,ttlMinutes=ttl); return r.copy()
+            ensure_station(s)
+            repair = ssh_guest(
+                s,
+                "mkdir -p /home/mark/.local/share/codex-worker && flock -n /home/mark/.local/share/codex-worker/claim.lock sh -c 'test ! -e /home/mark/.local/share/codex-worker/scheduler.lock && rm -f /home/mark/.local/share/codex-worker/exclusive.lock'",
+                5,
+            )
+            if repair.returncode != 0:
+                continue
+            lease = str(uuid.uuid4())
+            t = now()
+            expires = t + timedelta(minutes=ttl)
+            lock_payload = json.dumps({
+                "leaseId": lease, "owner": owner, "project": project or None,
+                "acquiredAt": iso(t), "expiresAt": iso(expires),
+            }, separators=(",", ":"))
+            lock_command = (
+                "mkdir -p /home/mark/.local/share/codex-worker && "
+                "flock -n /home/mark/.local/share/codex-worker/claim.lock sh -c 'test ! -e /home/mark/.local/share/codex-worker/scheduler.lock && test ! -e /home/mark/.local/share/codex-worker/exclusive.lock && cat > /home/mark/.local/share/codex-worker/exclusive.lock'"
+            )
+            lock_result = ssh_guest(s, lock_command, 8, input_text=lock_payload)
+            if lock_result.returncode != 0:
+                continue
+            r.update({
+                "status": "leased", "leaseId": lease, "owner": owner,
+                "project": project or None, "acquiredAt": iso(t),
+                "expiresAt": iso(expires), "releasedAt": None, "releaseReason": None,
+            })
+            save_state(state)
+            audit("sign_in", station=s, leaseId=lease, owner=owner, project=project or None, ttlMinutes=ttl)
+            return r.copy()
         raise RuntimeError(f"All {MAX_STATIONS} full-VM lab stations are leased")
     finally: unlock(lock)
 
@@ -140,28 +234,84 @@ def find_active(state, lease_id=None, station=None):
         if station is not None and int(r.get("station",0))==int(station): return r
     raise KeyError("Active full-VM lab lease not found")
 
-def release(lease_id=None, station=None, reason="released", recycle=True):
-    lock,state=locked_state()
+def validate_lease(lease_id, station=None):
+    lock, state = locked_state()
     try:
-        r=find_active(state,lease_id,station); old=r.copy(); s=int(r["station"]); r.update({"status":"free","leaseId":None,"owner":None,"project":None,"acquiredAt":None,"expiresAt":None,"releasedAt":iso(),"releaseReason":reason}); save_state(state); audit("sign_out",station=s,leaseId=old.get("leaseId"),owner=old.get("owner"),project=old.get("project"),reason=reason,recycle=bool(recycle))
-    finally: unlock(lock)
-    if recycle: reset_station(s)
+        expire(state)
+        reconcile_lost_leases(state)
+        record = find_active(state, lease_id=lease_id)
+        if station is not None and int(record.get("station", 0)) != int(station):
+            raise KeyError(f"Lease {lease_id} belongs to station {record.get('station')}, not station {station}")
+        remote = _remote_exclusive_lease(record["station"])
+        if not remote or remote.get("leaseId") != lease_id:
+            old = _mark_free(record, "remote-lock-lost")
+            save_state(state)
+            audit(
+                "auto_sign_out", station=old.get("station"), leaseId=old.get("leaseId"),
+                owner=old.get("owner"), project=old.get("project"), reason="remote-lock-lost",
+            )
+            raise KeyError(f"Lease {lease_id} no longer owns worker {old.get('station')}")
+        return record.copy()
+    finally:
+        unlock(lock)
+
+
+def release(lease_id=None, station=None, reason="released", recycle=False):
+    lock, state = locked_state()
+    try:
+        record = find_active(state, lease_id, station)
+        old = record.copy()
+        station_number = int(record["station"])
+        clear = ssh_guest(
+            station_number,
+            "rm -f /home/mark/.local/share/codex-worker/exclusive.lock",
+            8,
+        )
+        if clear.returncode != 0:
+            raise RuntimeError(
+                f"Could not clear exclusive lock on worker {station_number}: "
+                f"{(clear.stderr or clear.stdout).strip()}"
+            )
+        _mark_free(record, reason)
+        save_state(state)
+        audit(
+            "sign_out", station=station_number, leaseId=old.get("leaseId"),
+            owner=old.get("owner"), project=old.get("project"), reason=reason,
+            recycle=bool(recycle),
+        )
+    finally:
+        unlock(lock)
+    if recycle:
+        reset_station(station_number)
     return old
 
+
 def execute(command, lease_id=None, station=None, cwd="/workspace", timeout=120, env=None, as_root=False, max_bytes=1048576):
-    lock,state=locked_state()
-    try: expire(state); r=find_active(state,lease_id,station).copy()
-    finally: unlock(lock)
-    env_prefix=" ".join(f"{shlex.quote(str(k))}={shlex.quote(str(v))}" for k,v in (env or {}).items())
-    body=f"cd {shlex.quote(cwd)} && " + ((env_prefix+" ") if env_prefix else "") + command
-    if as_root: body="sudo -n bash -lc "+shlex.quote(body)
-    result=ssh_guest(r["station"],body,max(1,min(int(timeout),86400))); limit=max(1024,min(int(max_bytes),8388608)); out=result.stdout.encode(); err=result.stderr.encode()
-    return {"station":r["station"],"name":r["name"],"ip":r["ip"],"leaseId":r["leaseId"],"owner":r["owner"],"project":r.get("project"),"exitCode":result.returncode,"stdout":out[:limit].decode(errors="replace"),"stderr":err[:limit].decode(errors="replace"),"truncated":len(out)>limit or len(err)>limit}
+    record = validate_lease(lease_id, station)
+    env_prefix = " ".join(
+        f"{shlex.quote(str(k))}={shlex.quote(str(v))}" for k, v in (env or {}).items()
+    )
+    body = f"cd {shlex.quote(cwd)} && " + ((env_prefix + " ") if env_prefix else "") + command
+    if as_root:
+        body = "sudo -n bash -lc " + shlex.quote(body)
+    result = ssh_guest(record["station"], body, max(1, min(int(timeout), 86400)))
+    limit = max(1024, min(int(max_bytes), 8388608))
+    out = result.stdout.encode()
+    err = result.stderr.encode()
+    return {
+        "station": record["station"], "name": record["name"], "ip": record["ip"],
+        "leaseId": record["leaseId"], "owner": record["owner"],
+        "project": record.get("project"), "exitCode": result.returncode,
+        "stdout": out[:limit].decode(errors="replace"),
+        "stderr": err[:limit].decode(errors="replace"),
+        "truncated": len(out) > limit or len(err) > limit,
+    }
+
 
 def list_stations(audit_lines=12):
     lock,state=locked_state()
     try:
-        expire(state); status=host_status(); rows=[]
+        expire(state); reconcile_lost_leases(state); status=host_status(); rows=[]
         for s in range(1,MAX_STATIONS+1):
             r=record_for(state,s).copy(); r.update(status.get(s,{"state":"absent","autostart":"no"})); rows.append(r)
         save_state(state)
@@ -171,12 +321,12 @@ def list_stations(audit_lines=12):
         for line in AUDIT_FILE.read_text().splitlines()[-int(audit_lines):]:
             try: recent.append(json.loads(line))
             except Exception: pass
-    return {"maxStations":MAX_STATIONS,"prewarmStations":PREWARM,"stations":rows,"recentSignInOut":recent,"sheet":str(SHEET_FILE)}
+    return {"maxStations":MAX_STATIONS,"prewarmStations":PREWARM,"stations":[dict(x, browserUrl=f"https://browser{x['station']}.home.markshaw.ca/") for x in rows],"recentSignInOut":recent,"sheet":str(SHEET_FILE),"dashboardUrl":"https://browser.home.markshaw.ca/"}
 
 def collect():
     lock,state=locked_state()
-    try: expired=expire(state); save_state(state)
+    try: expired=expire(state); recovered=reconcile_lost_leases(state); save_state(state)
     finally: unlock(lock)
     ensured=[]
     for s in range(1,PREWARM+1): ensured.append(ensure_station(s))
-    return {"expiredLeases":[x.get("leaseId") for x in expired],"prewarmed":ensured}
+    return {"expiredLeases":[x.get("leaseId") for x in expired],"recoveredLeases":[x.get("leaseId") for x in recovered],"prewarmed":ensured}

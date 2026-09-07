@@ -1,0 +1,36 @@
+# Insert inside the home.markshaw.ca / *.home.markshaw.ca site block.
+# Authentication/session state is owned by the private scheduler at 192.168.122.1:8766.
+@codexbrowser host browser.home.markshaw.ca
+handle @codexbrowser {
+    route {
+        @login path /login /login/*
+        handle @login {
+            reverse_proxy http://192.168.122.1:8766
+        }
+        forward_auth http://192.168.122.1:8766 {
+            uri /auth/check
+        }
+        handle_path /vm1/* { reverse_proxy http://192.168.122.230:6080 }
+        handle_path /vm2/* { reverse_proxy http://192.168.122.231:6080 }
+        handle_path /vm3/* { reverse_proxy http://192.168.122.232:6080 }
+        handle_path /vm4/* { reverse_proxy http://192.168.122.233:6080 }
+        handle_path /vm5/* { reverse_proxy http://192.168.122.234:6080 }
+        handle_path /vm6/* { reverse_proxy http://192.168.122.235:6080 }
+        handle_path /controller/* { reverse_proxy http://192.168.122.225:6080 }
+        handle { reverse_proxy http://192.168.122.1:8766 }
+    }
+}
+@codexbrowser1 host browser1.home.markshaw.ca
+handle @codexbrowser1 { redir "https://browser.home.markshaw.ca/vm1/vnc.html?autoconnect=1&resize=scale&path=vm1/websockify" 302 }
+@codexbrowser2 host browser2.home.markshaw.ca
+handle @codexbrowser2 { redir "https://browser.home.markshaw.ca/vm2/vnc.html?autoconnect=1&resize=scale&path=vm2/websockify" 302 }
+@codexbrowser3 host browser3.home.markshaw.ca
+handle @codexbrowser3 { redir "https://browser.home.markshaw.ca/vm3/vnc.html?autoconnect=1&resize=scale&path=vm3/websockify" 302 }
+@codexbrowser4 host browser4.home.markshaw.ca
+handle @codexbrowser4 { redir "https://browser.home.markshaw.ca/vm4/vnc.html?autoconnect=1&resize=scale&path=vm4/websockify" 302 }
+@codexbrowser5 host browser5.home.markshaw.ca
+handle @codexbrowser5 { redir "https://browser.home.markshaw.ca/vm5/vnc.html?autoconnect=1&resize=scale&path=vm5/websockify" 302 }
+@codexbrowser6 host browser6.home.markshaw.ca
+handle @codexbrowser6 { redir "https://browser.home.markshaw.ca/vm6/vnc.html?autoconnect=1&resize=scale&path=vm6/websockify" 302 }
+@codexbrowsercontroller host browser-controller.home.markshaw.ca
+handle @codexbrowsercontroller { redir "https://browser.home.markshaw.ca/controller/vnc.html?autoconnect=1&resize=scale&path=controller/websockify" 302 }

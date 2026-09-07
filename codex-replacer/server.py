@@ -27,10 +27,11 @@ from pathlib import Path
 
 import lab_manager
 import vm_lab_manager
+import vm_job_scheduler
 
 
 SERVER_NAME = "codex-replacer"
-SERVER_VERSION = "1.9.0"
+SERVER_VERSION = "2.0.0"
 DEFAULT_DIRECTORY = "/home/mark"
 MAX_CAPTURE_BYTES = 1 * 1024 * 1024
 HOST_EXEC_FOREGROUND_SECONDS = max(1, min(int(os.environ.get("CODEX_REPLACER_HOST_EXEC_FOREGROUND_SECONDS", "20")), 90))
@@ -382,6 +383,249 @@ class BrowserClient:
         self.tools = None
 
 
+class KvmWorkerBrowserClient:
+    """Persistent browser MCP client attached to one visible KVM Chromium via SSH CDP tunnel."""
+
+    def __init__(self, station):
+        self.station = int(station)
+        self.process = None
+        self.tunnel_process = None
+        self.local_port = None
+        self.next_id = 1
+        self.lock = threading.Lock()
+
+    @property
+    def worker_ip(self):
+        return f"192.168.122.{229 + self.station}"
+
+    @property
+    def endpoint(self):
+        if self.local_port is None:
+            raise RuntimeError(f"KVM worker {self.station} CDP tunnel is not initialized.")
+        return f"http://127.0.0.1:{self.local_port}"
+
+    def _allocate_local_port(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])
+        finally:
+            sock.close()
+
+    def _stop_tunnel(self):
+        if self.tunnel_process is not None and self.tunnel_process.poll() is None:
+            self.tunnel_process.terminate()
+            try:
+                self.tunnel_process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.tunnel_process.kill()
+        self.tunnel_process = None
+        self.local_port = None
+
+    def _start_tunnel(self):
+        self._stop_tunnel()
+        self.local_port = self._allocate_local_port()
+        key = os.environ.get("CODEX_VM_LAB_GUEST_KEY", "/home/mark/.ssh/id_ed25519_codex_lab_vm")
+        known_hosts = os.environ.get("CODEX_VM_LAB_KNOWN_HOSTS", "/home/mark/.ssh/codex_lab_known_hosts")
+        self.tunnel_process = subprocess.Popen(
+            [
+                "ssh", "-N", "-i", key,
+                "-o", "IdentitiesOnly=yes",
+                "-o", "BatchMode=yes",
+                "-o", f"UserKnownHostsFile={known_hosts}",
+                "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "ExitOnForwardFailure=yes",
+                "-o", "ServerAliveInterval=30",
+                "-o", "ServerAliveCountMax=3",
+                "-L", f"127.0.0.1:{self.local_port}:127.0.0.1:9222",
+                f"mark@{self.worker_ip}",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=sys.stderr,
+        )
+        deadline = time.monotonic() + 5
+        last_error = None
+        while time.monotonic() < deadline:
+            if self.tunnel_process.poll() is not None:
+                raise RuntimeError(f"SSH CDP tunnel to KVM worker {self.station} exited early.")
+            try:
+                with urllib.request.urlopen(self.endpoint + "/json/version", timeout=0.5) as response:
+                    if response.status == 200:
+                        return
+            except Exception as error:
+                last_error = error
+                time.sleep(0.05)
+        self._stop_tunnel()
+        raise RuntimeError(f"KVM worker {self.station} Chromium CDP tunnel did not become ready: {last_error}")
+
+    def _ensure_endpoint(self):
+        if self.tunnel_process is None or self.tunnel_process.poll() is not None or self.local_port is None:
+            self._start_tunnel()
+            return
+        try:
+            with urllib.request.urlopen(self.endpoint + "/json/version", timeout=1) as response:
+                if response.status == 200:
+                    return
+        except Exception:
+            self._start_tunnel()
+            return
+        raise RuntimeError(f"KVM worker {self.station} visible Chromium is not ready through its SSH tunnel.")
+
+    def _start(self):
+        self.close()
+        self._start_tunnel()
+        image = os.environ.get("CODEX_REPLACER_BROWSER_IMAGE", "markshaw-private-mcp_browser:latest")
+        self.process = subprocess.Popen(
+            [
+                "docker", "run", "--rm", "-i", "--network", "host",
+                "--entrypoint", "node", image,
+                "/app/cli.js",
+                "--cdp-endpoint", self.endpoint,
+                "--caps", "vision",
+                "--image-responses", "allow",
+                "--snapshot-boxes",
+                "--codegen", "none",
+                "--timeout-action", "10000",
+                "--timeout-navigation", "90000",
+                "--timeout-settle", "750",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=sys.stderr,
+            text=True,
+            bufsize=1,
+        )
+        self._request("initialize", {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": f"{SERVER_NAME}-kvm-browser-{self.station}", "version": SERVER_VERSION},
+        })
+        self._notify("notifications/initialized", {})
+
+    def _ensure(self):
+        if self.process is None or self.process.poll() is not None:
+            self._start()
+        else:
+            self._ensure_endpoint()
+
+    def _write(self, message):
+        self.process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+        self.process.stdin.flush()
+
+    def _notify(self, method, params):
+        self._write({"jsonrpc": "2.0", "method": method, "params": params})
+
+    def _request(self, method, params):
+        request_id = self.next_id
+        self.next_id += 1
+        self._write({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+        while True:
+            line = self.process.stdout.readline()
+            if not line:
+                raise RuntimeError(f"KVM worker {self.station} browser MCP connection closed unexpectedly.")
+            response = json.loads(line)
+            if response.get("id") != request_id:
+                continue
+            if "error" in response:
+                raise RuntimeError(response["error"].get("message", "KVM browser MCP error."))
+            return response.get("result", {})
+
+    def call(self, name, arguments):
+        with self.lock:
+            for attempt in range(2):
+                try:
+                    self._ensure()
+                    return self._request("tools/call", {"name": name, "arguments": arguments})
+                except Exception:
+                    self.close()
+                    if attempt:
+                        raise
+
+    def close(self):
+        if self.process is not None and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+        self.process = None
+        self._stop_tunnel()
+
+
+class KvmWorkerBrowserPool:
+    def __init__(self, stations=6):
+        self.clients = {station: KvmWorkerBrowserClient(station) for station in range(1, stations + 1)}
+        self.descriptors = None
+        self.lock = threading.Lock()
+
+    def tool_descriptors(self):
+        with self.lock:
+            if self.descriptors is not None:
+                return self.descriptors
+            descriptors = []
+            for original in BROWSER_CLIENT.list_tools():
+                name = original.get("name") or ""
+                if not name.startswith("browser_"):
+                    continue
+                item = json.loads(json.dumps(original))
+                item["name"] = "vm_" + name
+                item["description"] = (
+                    f"{original.get('description') or name} Operates the persistent visible Chromium on one of the six KVM workers; "
+                    "set station=1..6. The same browser is viewable at browserN.home.markshaw.ca."
+                )
+                schema = item.setdefault("inputSchema", {"type": "object"})
+                properties = schema.setdefault("properties", {})
+                properties["station"] = {
+                    "type": "integer", "minimum": 1, "maximum": 6,
+                    "description": "KVM worker station whose visible browser should be controlled."
+                }
+                properties["leaseId"] = {
+                    "type": "string",
+                    "description": "Active exclusive vm_lab_acquire lease for this station, preventing cross-agent browser collisions."
+                }
+                required = list(schema.get("required") or [])
+                for required_name in ("leaseId", "station"):
+                    if required_name not in required:
+                        required.insert(0, required_name)
+                schema["required"] = required
+                descriptors.append(item)
+            self.descriptors = descriptors
+            return descriptors
+
+    def warm(self):
+        def warm_one(item):
+            station, client = item
+            with client.lock:
+                try:
+                    client._ensure()
+                    return {"station": station, "ready": True, "endpoint": client.endpoint}
+                except Exception as error:
+                    client.close()
+                    return {"station": station, "ready": False, "error": str(error)}
+
+        with ThreadPoolExecutor(max_workers=len(self.clients)) as pool:
+            return list(pool.map(warm_one, self.clients.items()))
+
+    def call(self, name, arguments):
+        station = int(arguments.get("station", 0))
+        if station not in self.clients:
+            raise ValueError("station must be between 1 and 6")
+        lease_id = str(arguments.get("leaseId") or "").strip()
+        if not lease_id:
+            raise ValueError("leaseId from vm_lab_acquire is required for KVM browser control")
+        vm_lab_manager.validate_lease(lease_id, station)
+        original = name[3:] if name.startswith("vm_") else name
+        browser_arguments = dict(arguments)
+        browser_arguments.pop("station", None)
+        browser_arguments.pop("leaseId", None)
+        return self.clients[station].call(original, browser_arguments)
+
+    def close(self):
+        for client in self.clients.values():
+            client.close()
+
+
 class HeadedChatGPTClient:
     """Private Playwright MCP client attached to the normal headed Chromium session.
 
@@ -509,6 +753,7 @@ class HeadedChatGPTClient:
 
 PROCESS_MANAGER = ProcessManager()
 BROWSER_CLIENT = BrowserClient()
+KVM_BROWSER_POOL = KvmWorkerBrowserPool(6)
 CHATGPT_BROWSER_CLIENT = HeadedChatGPTClient()
 
 
@@ -938,7 +1183,7 @@ def handle_vm_lab_release(arguments):
         lease_id=arguments.get("leaseId"),
         station=arguments.get("station"),
         reason=arguments.get("reason", "released"),
-        recycle=arguments.get("recycle", True),
+        recycle=arguments.get("recycle", False),
     ))
 
 
@@ -957,6 +1202,40 @@ def handle_vm_lab_exec(arguments):
 
 def handle_vm_lab_gc(_arguments):
     return tool_result(vm_lab_manager.collect())
+
+
+def handle_vm_job_submit(arguments):
+    return tool_result(vm_job_scheduler.submit(arguments))
+
+
+def handle_vm_job_submit_batch(arguments):
+    return tool_result(vm_job_scheduler.submit_many(
+        arguments["owner"],
+        arguments["jobs"],
+        arguments.get("project"),
+    ))
+
+
+def handle_vm_job_status(arguments):
+    return tool_result(vm_job_scheduler.status(
+        arguments["jobId"],
+        arguments.get("maxOutputBytes", 65536),
+    ))
+
+
+def handle_vm_job_list(arguments):
+    return tool_result(vm_job_scheduler.list_jobs(
+        arguments.get("status"),
+        arguments.get("limit", 50),
+    ))
+
+
+def handle_vm_job_cancel(arguments):
+    return tool_result(vm_job_scheduler.cancel(arguments["jobId"]))
+
+
+def handle_vm_worker_status(_arguments):
+    return tool_result(vm_job_scheduler.workers())
 
 
 def command_tool(program, arguments):
@@ -1504,9 +1783,9 @@ CONVERSATION_CONTINUITY_INSTRUCTIONS = (
     "Before context exhaustion, use prepare_chat_handoff and present its complete handoff to the user. The handoff must preserve the objective, exact current state, completed work, pending work, blockers, constraints, "
     "and concrete references such as repositories, branches, PRs, run IDs, paths, URLs, commands, services, and test results. Do not wait until the platform refuses another message. "
     "If the user explicitly asks to create the next chat and chatgpt_start_chat is available, seed that new chat with the generated handoff; otherwise output the handoff for the user to use. "
-    "Performance rule: treat the main Codex Replacer VM as the interactive control plane, not the build farm. Keep short inspection, filesystem, Git, GitHub, and orchestration calls on the main VM, but offload CPU-heavy or long-running builds, test suites, compilers, recursive validators/scans, Docker builds, package builds, PDF/link validation, and similar work to the full-VM lab whenever the work can run from a committed or otherwise transferable revision. "
-    "Use vm_lab_acquire/vm_lab_exec for CPU-heavy work and lab_acquire/lab_exec for lightweight isolated work. For repository work in a full VM, clone or fetch the needed revision into /workspace and run the expensive command there; use the main github tool for GitHub API/PR operations if gh authentication is not present inside the lab VM. "
-    "Do not run an expensive build on the main VM merely because host_exec is convenient. The exception is work that genuinely depends on unsynced main-VM state and cannot safely be transferred first. "
+    "Performance rule: treat the main Codex Replacer VM as the interactive control plane, not the build farm. Keep short inspection, filesystem, Git, GitHub, and orchestration calls on the main VM. For transferable CPU-heavy or long-running builds, test suites, compilers, recursive validators/scans, Docker builds, package builds, PDF/link validation, and similar work, use vm_job_submit. When two or more independent heavy tasks are available, prefer vm_job_submit_batch so one MCP call can fill all six workers immediately. The homeserver scheduler chooses workers automatically and runs up to six independent heavy jobs concurrently. Poll with vm_job_status and never resubmit a running job just to check it. "
+    "The six KVM workers are persistent computers with visible Chromium desktops. Use vm_worker_status for worker/browser health and direct the human to https://browser.home.markshaw.ca for the six-screen dashboard when useful. For interactive browser work, first call vm_lab_acquire with your stable agent name, then use the returned station and leaseId with vm_browser_* tools; always release the lease when finished. This permits six independent visible browser agents at once without cross-agent clicking/type collisions. vm_lab_exec can use the same lease for shell work. The lightweight Docker lab is legacy/on-demand and should not be preferred over the KVM scheduler. "
+    "For repository scheduler jobs, prefer repoUrl plus revision for a committed/pushed revision so the worker can prepare its own isolated checkout. Use the main github tool for GitHub API/PR operations if gh authentication is not present inside a worker. Do not run an expensive build on the main VM merely because host_exec is convenient. The exception is work that genuinely depends on unsynced main-VM state and cannot safely be transferred first. "
     "Parallelism rule: issue independent read-only checks concurrently or combine them into one short shell/API call when safe instead of paying serial tool round trips. Never poll by sleeping in a foreground tool call; continue other useful work and poll later. "
     "Browser hygiene rule: reuse the current relevant tab/profile instead of opening duplicate tabs, and close pages/tabs when their task is complete. Do not leave dozens of finished directory, form, search, or test pages open indefinitely because Chromium renderer accumulation consumes memory and process slots shared by other chats. "
     "Use a stable agent name, never use a station leased by another agent, and always call the matching lab_release or vm_lab_release when finished. "
@@ -1543,7 +1822,7 @@ DIRECT_TOOLS = dict([
     tool("fs_move", "Move path", "Use this when you need to move or rename a file or directory anywhere Mark can access.", object_schema({"source": string(), "destination": string()}, ["source", "destination"]), handle_fs_move, annotations(False, True, False)),
     tool("fs_delete", "Delete path", "Use this when you need to permanently delete a file or directory Mark can access.", object_schema({"path": string(), "recursive": {"type": "boolean", "default": False}}, ["path"]), handle_fs_delete, annotations(False, True, False)),
     tool("image_view", "View image", "Use this when you need to visually inspect an image file from any host path.", object_schema({"path": string(), "maxBytes": {"type": "integer", "minimum": 1, "maximum": 52428800}}, ["path"]), handle_image_view, annotations(True, False, False)),
-    tool("host_exec", "Execute VM command", "Use this for unrestricted shell access inside the dedicated Codex Replacer control VM. Runs as Mark by default; set asRoot=true for passwordless root execution when privileged filesystem, networking, package, service, mount, device, firewall, or system operations are needed. Keep this tool for short interactive/orchestration work; offload CPU-heavy builds, broad test suites, compilers, recursive validators/scans, Docker builds, and similar work to vm_lab_acquire/vm_lab_exec whenever transferable. Do not use sleep to wait in the foreground. Leading waits and commands that exceed the short foreground budget are automatically promoted to a persistent process session; if running=true is returned, continue with process_poll using sessionId and do not rerun the command.", object_schema({"command": string(), "cwd": string(), "timeout": {"type": "integer", "minimum": 1, "maximum": 86400}, "stdin": string(), "env": {"type": "object", "additionalProperties": {"type": ["string", "number", "boolean"]}}, "asRoot": {"type": "boolean", "default": False}, "maxOutputBytes": {"type": "integer", "minimum": 1024, "maximum": 33554432}}, ["command"]), handle_host_exec, annotations(False, True, True)),
+    tool("host_exec", "Execute VM command", "Use this for unrestricted shell access inside the dedicated Codex Replacer control VM. Runs as Mark by default; set asRoot=true for passwordless root execution when privileged filesystem, networking, package, service, mount, device, firewall, or system operations are needed. Keep this tool for short interactive/orchestration work; offload transferable CPU-heavy builds, broad test suites, compilers, recursive validators/scans, Docker builds, and similar work to vm_job_submit so the six-KVM scheduler can run them concurrently. Do not use sleep to wait in the foreground. Leading waits and commands that exceed the short foreground budget are automatically promoted to a persistent process session; if running=true is returned, continue with process_poll using sessionId and do not rerun the command.", object_schema({"command": string(), "cwd": string(), "timeout": {"type": "integer", "minimum": 1, "maximum": 86400}, "stdin": string(), "env": {"type": "object", "additionalProperties": {"type": ["string", "number", "boolean"]}}, "asRoot": {"type": "boolean", "default": False}, "maxOutputBytes": {"type": "integer", "minimum": 1024, "maximum": 33554432}}, ["command"]), handle_host_exec, annotations(False, True, True)),
     tool("process_start", "Start host process", "Use this when you need to start a long-running or interactive command as Mark and continue it across later tool calls.", object_schema({"command": string(), "cwd": string(), "interactive": {"type": "boolean", "default": False}, "env": {"type": "object", "additionalProperties": {"type": ["string", "number", "boolean"]}}}, ["command"]), handle_process_start, annotations(False, True, True)),
     tool("process_poll", "Read process output", "Use this when you need new output or completion state from a previously started process.", object_schema({"sessionId": string(), "afterSequence": {"type": "integer", "minimum": 0, "default": 0}}, ["sessionId"]), handle_process_poll, annotations(True, False, False)),
     tool("process_write", "Write process input", "Use this when you need to send text or terminal input to a running process.", object_schema({"sessionId": string(), "data": string()}, ["sessionId", "data"]), handle_process_write, annotations(False, True, True)),
@@ -1556,9 +1835,15 @@ DIRECT_TOOLS = dict([
     tool("lab_gc", "Maintain computer lab", "Release expired lightweight lab leases and ensure the configured prewarmed container workstation pool is ready.", object_schema(), handle_lab_gc, annotations(False, True, False)),
     tool("vm_lab_list", "List full-VM lab", "Show full KVM lab computers, active leases, VM state, and recent sign-in/sign-out activity.", object_schema({"auditLines": {"type": "integer", "minimum": 0, "maximum": 100, "default": 12}}), handle_vm_lab_list, annotations(True, False, False)),
     tool("vm_lab_acquire", "Sign into full VM", "Lease a clean full KVM workstation for an agent/project. Use this by default for CPU-heavy builds, broad test suites, compilers, recursive validators/scans, Docker-in-VM, risky dependency work, or other expensive work that can be run from a transferable repository revision. This keeps the main Codex VM responsive for all chats.", object_schema({"owner": string("Agent name signing into the workstation."), "project": string("Optional project or repository being worked on."), "ttlMinutes": {"type": "integer", "minimum": 15, "maximum": 1440, "default": 180}}, ["owner"]), handle_vm_lab_acquire, annotations(False, False, False)),
-    tool("vm_lab_release", "Sign out of full VM", "Release a full KVM lab workstation and record the sign-out. By default the VM is recycled from the golden image so the next agent receives a clean computer.", object_schema({"leaseId": string(), "station": {"type": "integer", "minimum": 1, "maximum": 8}, "reason": string(), "recycle": {"type": "boolean", "default": True}}), handle_vm_lab_release, annotations(False, True, False)),
+    tool("vm_lab_release", "Sign out of full VM", "Release an exclusive full KVM workstation lease. The computer stays running and preserves its browser/profile by default for speed; set recycle=true only when a full reimage is actually required.", object_schema({"leaseId": string(), "station": {"type": "integer", "minimum": 1, "maximum": 8}, "reason": string(), "recycle": {"type": "boolean", "default": False}}), handle_vm_lab_release, annotations(False, True, False)),
     tool("vm_lab_exec", "Run command in full VM", "Run a shell command inside a currently leased full KVM lab workstation. Identify it by leaseId or station.", object_schema({"command": string(), "leaseId": string(), "station": {"type": "integer", "minimum": 1, "maximum": 8}, "cwd": string("Directory inside the full VM; defaults to /workspace."), "timeout": {"type": "integer", "minimum": 1, "maximum": 86400, "default": 120}, "env": {"type": "object", "additionalProperties": {"type": ["string", "number", "boolean"]}}, "asRoot": {"type": "boolean", "default": False}, "maxOutputBytes": {"type": "integer", "minimum": 1024, "maximum": 8388608, "default": 1048576}}, ["command"]), handle_vm_lab_exec, annotations(False, True, True)),
     tool("vm_lab_gc", "Maintain full-VM lab", "Release expired full-VM leases and ensure the configured prewarmed KVM workstation pool is ready.", object_schema(), handle_vm_lab_gc, annotations(False, True, False)),
+    tool("vm_job_submit", "Schedule KVM job", "Submit a long or CPU-heavy command to the central six-KVM scheduler. It immediately chooses a free persistent worker or queues the job, returns a jobId, and does not hold the MCP request open for the job duration. Prefer repoUrl+revision when the work can run from a committed revision.", object_schema({"owner": string("Stable agent name."), "project": string(), "command": string(), "cwd": string("Worker cwd; defaults to /workspace. With repoUrl this can be a path inside the cloned repository."), "timeout": {"type": "integer", "minimum": 1, "maximum": 86400, "default": 3600}, "jobClass": {"type": "string", "enum": ["cpu", "io", "browser", "test", "build"], "default": "cpu"}, "repoUrl": string(), "revision": string(), "env": {"type": "object", "additionalProperties": {"type": ["string", "number", "boolean"]}}}, ["owner", "command"]), handle_vm_job_submit, annotations(False, True, True)),
+    tool("vm_job_submit_batch", "Schedule KVM job batch", "Submit 2-48 independent heavy jobs in one MCP call. The central scheduler immediately fans them across every free KVM worker, up to all six at once, and queues the remainder. Prefer this over serial vm_job_submit calls when work can be parallelized.", object_schema({"owner": string("Stable agent name applied to every job."), "project": string("Default project for jobs that do not override it."), "jobs": {"type": "array", "minItems": 1, "maxItems": 48, "items": {"type": "object", "properties": {"command": string(), "project": string(), "cwd": string(), "timeout": {"type": "integer", "minimum": 1, "maximum": 86400, "default": 3600}, "jobClass": {"type": "string", "enum": ["cpu", "io", "browser", "test", "build"], "default": "cpu"}, "repoUrl": string(), "revision": string(), "env": {"type": "object", "additionalProperties": {"type": ["string", "number", "boolean"]}}}, "required": ["command"], "additionalProperties": False}}}, ["owner", "jobs"]), handle_vm_job_submit_batch, annotations(False, True, True)),
+    tool("vm_job_status", "Read KVM job", "Read scheduler state plus recent stdout/stderr for a previously submitted KVM job. Poll this instead of resubmitting the command.", object_schema({"jobId": string(), "maxOutputBytes": {"type": "integer", "minimum": 1024, "maximum": 1048576, "default": 65536}}, ["jobId"]), handle_vm_job_status, annotations(True, False, False)),
+    tool("vm_job_list", "List KVM jobs", "List recent scheduled KVM jobs across all six workers.", object_schema({"status": {"type": "string", "enum": ["queued", "running", "succeeded", "failed", "timed_out", "canceled"]}, "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50}}), handle_vm_job_list, annotations(True, False, False)),
+    tool("vm_job_cancel", "Cancel KVM job", "Cancel a queued or running KVM scheduler job by jobId.", object_schema({"jobId": string()}, ["jobId"]), handle_vm_job_cancel, annotations(False, True, False)),
+    tool("vm_worker_status", "Inspect KVM workers", "Show live health, load, browser readiness, active jobs, and dashboard URLs for all six persistent KVM worker computers.", object_schema(), handle_vm_worker_status, annotations(True, False, False)),
     tool("git", "Run git", "Use this when you need unrestricted git operations as Mark in any repository.", object_schema(COMMON_COMMAND_PROPERTIES), lambda arguments: command_tool("git", arguments), annotations(False, True, True)),
     tool("github", "Run GitHub CLI", "Use this when you need unrestricted GitHub operations as Mark through the authenticated gh CLI.", object_schema(COMMON_COMMAND_PROPERTIES), lambda arguments: command_tool("gh", arguments), annotations(False, True, True)),
     tool("docker", "Run Docker", "Use this when you need unrestricted Docker or Docker Compose operations inside the dedicated Codex Replacer VM.", object_schema(COMMON_COMMAND_PROPERTIES), lambda arguments: command_tool("docker", arguments), annotations(False, True, True)),
@@ -1603,6 +1888,7 @@ def handle_request(message):
                 item for item in BROWSER_CLIENT.list_tools()
                 if item.get("name") not in DIRECT_TOOLS
             )
+            tools.extend(KVM_BROWSER_POOL.tool_descriptors())
         except Exception as error:
             sys.stderr.write(f"Visual browser tools are temporarily unavailable: {error}\n")
         return {"jsonrpc": "2.0", "id": request_id, "result": {"tools": tools}}
@@ -1613,6 +1899,11 @@ def handle_request(message):
         try:
             if name in DIRECT_TOOLS:
                 result = DIRECT_TOOLS[name]["handler"](arguments)
+            elif name and name.startswith("vm_browser_"):
+                vm_browser_names = {item["name"] for item in KVM_BROWSER_POOL.tool_descriptors()}
+                if name not in vm_browser_names:
+                    raise KeyError(f"Unknown KVM browser tool: {name}")
+                result = KVM_BROWSER_POOL.call(name, arguments)
             else:
                 browser_names = {item["name"] for item in BROWSER_CLIENT.list_tools()}
                 if name not in browser_names:

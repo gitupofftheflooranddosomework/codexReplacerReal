@@ -66,7 +66,7 @@ This separates server-side execution time from ChatGPT reasoning/tool-transport 
 
 ### Isolated Streamable HTTP transport
 
-Codex Replacer 1.6 runs the privileged MCP server as its own persistent, loopback-only HTTP service on `127.0.0.1:8791/mcp`. The OpenAI tunnel client connects to that URL instead of owning `server.py` as one shared stdio child.
+Codex Replacer 2.0 runs the privileged MCP server as its own persistent, loopback-only HTTP service on `127.0.0.1:8791/mcp`. The OpenAI tunnel client connects to that URL instead of owning `server.py` as one shared stdio child.
 
 This matters under many simultaneous chats: expiring or abandoning one MCP connection no longer closes the stdin/stdout pipes underneath every other chat. The tunnel can reconnect independently while the local MCP service, background process sessions, and unrelated HTTP requests remain alive.
 
@@ -86,7 +86,7 @@ This matters under many simultaneous chats: expiring or abandoning one MCP conne
 
 `http-concurrency-test.py` runs eight one-second commands in parallel and deliberately abandons a long HTTP request; a second request must still complete while the abandoned command is running.
 
-The main Codex Replacer VM is intentionally treated as a latency-sensitive control plane. Expensive transferable repo work should run in the full-VM lab instead of competing with every chat for the control VM's 8 vCPUs. Four full VMs are now prewarmed so heavy jobs do not pay the roughly 20-second on-demand creation path for stations 3-4.
+The main Codex Replacer VM is intentionally treated as a latency-sensitive control plane. Expensive transferable work is submitted to the homeserver scheduler, which distributes it over six persistent KVM workers so the controller stays responsive even when many chats are active.
 
 ### Control-VM runtime tuning
 
@@ -101,32 +101,95 @@ The live Codex Replacer VM is tuned for interactive latency as well as throughpu
 
 ## Codex computer lab
 
-For lightweight parallel product work, Codex Replacer exposes a small leased workstation pool backed by isolated Docker containers on the control VM. CPU-heavy work should use the separate full-KVM lab on the parent homeserver described below, so expensive builds do not compete with interactive MCP traffic for the control VM's 8 vCPUs.
+Codex Replacer 2.0 uses a **six-computer persistent KVM lab** as its primary parallel-work backend. The older Docker workstation pool still exists for lightweight compatibility/on-demand isolation, but it is not prewarmed and should not be used for CPU-heavy work.
 
-Current defaults:
+### Six persistent KVM computers
 
-- 4 prewarmed workstations
-- 6 maximum active workstations on the current 8-vCPU / 16-GiB Codex VM
-- 2 vCPU and 2 GiB RAM limit per workstation
-- workspaces stored on `/tank/codex-lab`
-- current human-readable sign-in sheet: `/tank/codex-lab/SIGN-IN-OUT.md`
-- append-only audit log: `/tank/codex-lab/sign-in-out.jsonl`
-- released/expired workspaces are archived under `/tank/codex-lab/archives` instead of being deleted
-- leases default to 180 minutes and are capped at 24 hours
+The parent homeserver keeps six full KVM workstations powered on and ready:
 
-MCP workflow:
+| Station | VM | IP | Direct browser |
+|---:|---|---|---|
+| 1 | `codex-lab-vm-01` | `192.168.122.230` | `https://browser1.home.markshaw.ca/` |
+| 2 | `codex-lab-vm-02` | `192.168.122.231` | `https://browser2.home.markshaw.ca/` |
+| 3 | `codex-lab-vm-03` | `192.168.122.232` | `https://browser3.home.markshaw.ca/` |
+| 4 | `codex-lab-vm-04` | `192.168.122.233` | `https://browser4.home.markshaw.ca/` |
+| 5 | `codex-lab-vm-05` | `192.168.122.234` | `https://browser5.home.markshaw.ca/` |
+| 6 | `codex-lab-vm-06` | `192.168.122.235` | `https://browser6.home.markshaw.ca/` |
 
-1. `lab_acquire` with the agent name and project.
-2. `lab_exec` using the returned lease ID.
-3. `lab_release` when work is complete.
-4. `lab_list` shows who has each station and recent sign-in/out activity.
-5. `lab_gc` releases expired leases and restores the prewarmed pool.
+Each worker is a **full Debian 12 Linux workstation** sized at **4 vCPU, 8 GiB RAM and a 100 GiB thin qcow2 disk**. The workers are persistent computers rather than browser appliances or disposable containers. They expose normal SSH/shell execution to agents, keep `/workspace` and build caches across ordinary release/reacquisition, and run Docker locally. The workstation image includes Git/Git LFS, GCC/G++, Clang/GDB, CMake/Ninja, Python/pip/venv/pipx, the existing Node/npm runtime, Go, Rust/Cargo, Java, PHP/Composer, Docker, database clients, tmux/screen, shell/network/debug tooling, plus a visible terminal/file-manager desktop layer. Chromium/noVNC is only one capability of the workstation.
 
-`codex-lab-gc.timer` runs maintenance every 15 minutes and also repopulates the prewarmed pool after boot.
+The browser/workstation golden image is `codex-lab-base-browser-v2.qcow2`. `lab/worker-workstation/bootstrap.sh` is the idempotent workstation provisioning source used for both the current six VMs and future golden-image rebuilds. The visible Openbox desktop includes a lightweight panel and launchers for a terminal, file manager, and Chromium. A clone derives its hostname from the deterministic station MAC and generates fresh SSH host keys on first boot, so provisioning a new station is normally only **qcow2 overlay + virt-install + boot** rather than a per-VM guestfs customization pass.
 
-The worker image is built from `lab/Dockerfile` as `codex-lab-worker:bookworm` and includes Node.js, Python, Git/GitHub CLI, build-essential, ripgrep, rsync, curl, and common archive utilities. Agents can use root inside their leased container when a project needs extra packages without modifying the main Codex VM.
+### Watch all six computers
 
-To apply the durable service settings on a Codex VM:
+`https://browser.home.markshaw.ca/` is the authenticated six-screen dashboard. Its **Live six-VM status** strip updates every two seconds with per-worker CPU, RAM, root-disk usage, uptime, Linux-workstation readiness, Docker readiness, browser readiness, active lease/job state, plus shared scheduler capacity/free/busy/queued counts. The six live noVNC desktops remain directly below the status strip. The dashboard uses its own HTML login page rather than HTTP Basic Auth: username `mark`, a salted PBKDF2-SHA256 password verifier stored in `/tank/vm/codex-lab/dashboard-auth.json` with mode `0600`, 12-hour signed sessions in a host-only `Secure; HttpOnly; SameSite=Strict` cookie, login throttling, and a built-in password-change page. Password changes rotate the session secret and invalidate other sessions. Plaintext passwords are never stored in the auth file.
+
+The legacy direct hostnames `browser1.home.markshaw.ca` through `browser6.home.markshaw.ca` and `browser-controller.home.markshaw.ca` only redirect to canonical paths on `browser.home.markshaw.ca`. This keeps the auth cookie scoped to one hostname instead of sending it to unrelated `*.home.markshaw.ca` services. For administrative recovery, `lab/reset-dashboard-auth.py --generate` can reset the `mark` login and invalidate all existing sessions if the password is forgotten again.
+
+The dashboard and worker views are protected by the scheduler's signed-session login gate through Caddy `forward_auth`; there is no HTTP Basic Auth popup. The noVNC/CDP endpoints themselves stay on the private libvirt network; CDP remains loopback-only inside each worker and controller automation reaches it through per-worker SSH tunnels. The central scheduler listens only on `192.168.122.1:8766` and is not directly exposed on the home LAN. The Caddy route source is retained as `lab/Caddyfile.browser-login.snippet` so the live proxy configuration can be reconstructed without storing credentials.
+
+For interactive browser automation, an agent first calls `vm_lab_acquire` with its stable agent name. It then supplies the returned `station` and `leaseId` to the `vm_browser_*` tools. There are 26 KVM-browser actions mirroring the normal browser toolset (`vm_browser_navigate`, `vm_browser_snapshot`, `vm_browser_click`, `vm_browser_type`, screenshots, tabs, mouse actions, etc.). Each station has its own persistent browser-MCP/CDP connection, so **six independent visible browser agents can operate concurrently**. The exclusive lease prevents two agents from clicking or typing in the same worker at once.
+
+Ordinary sign-out uses `vm_lab_release` without reimaging. `recycle=true` is reserved for the cases where a genuinely clean workstation is required.
+
+### Central job scheduler
+
+Long or CPU-heavy transferable work should use `vm_job_submit` instead of running on the controller. When two or more independent heavy tasks exist, agents should use `vm_job_submit_batch`; dispatch is automatic, so agents do not pick station numbers and one batch can fill all six KVMs in a single MCP round trip. The scheduler is a persistent homeserver user service:
+
+- service: `codex-lab-scheduler.service`
+- listener: `192.168.122.1:8766` on the private libvirt network
+- database: `/tank/vm/codex-lab/scheduler.sqlite3`
+- source: `lab/scheduler.py`
+- one heavy scheduled job per KVM worker at a time
+- FIFO queue when all six workers are busy
+- least-recently-used free-worker selection
+- transient per-job systemd units on the worker at nice level 5 / CPUWeight 80
+- durable stdout/stderr and exit status under the worker's `~/.local/share/codex-worker/jobs/`
+- persistent per-worker Git mirror cache so repeated repository jobs avoid full network/object downloads
+- reciprocal lock files so scheduler jobs and exclusive interactive/browser leases can never collide on the same worker
+
+MCP scheduler tools:
+
+- `vm_job_submit` — enqueue one build/test/scan/other expensive command and return immediately with `jobId`; the caller never chooses a VM.
+- `vm_job_submit_batch` — submit up to 48 independent heavy jobs in one MCP call; the scheduler immediately fills all free workers (up to all six) and queues the remainder.
+- `vm_job_status` — read state and recent stdout/stderr; use this to poll instead of resubmitting work.
+- `vm_job_list` — inspect recent jobs across all six workers.
+- `vm_job_cancel` — cancel queued/running work.
+- `vm_worker_status` — show all six workers, load/memory, browser readiness, active job and browser URLs.
+
+When work is tied to a repository, pass `repoUrl` and `revision` whenever practical. The worker maintains a mirror cache and creates an isolated checkout for that job. GitHub API/PR actions can remain on the controller; the expensive compiler/test/build workload belongs on a worker.
+
+The scheduler is deliberately independent of the OpenAI tunnel/MCP process. That means a future second or third controller can point at the same scheduler rather than introducing another incompatible worker state database. The present controller is kept single because its 20-request tunnel/MCP queue has remained empty during scheduler load tests; add another controller only when measured control-plane saturation justifies it.
+
+### Storage parallelism
+
+The homeserver has three independent spinning-disk ZFS pools. To avoid making six worker CPUs wait on one RAIDZ queue, KVM storage is striped operationally across the pools with **two workers per pool**:
+
+- stations 1 and 4: `/tank/vm/codex-lab-v2`
+- stations 2 and 5: `/tank2/vm/codex-lab`
+- stations 3 and 6: `/tank3/vm/codex-lab`
+
+Each pool keeps a local copy of the browser-capable golden image, so a worker overlay reads its base from the same physical pool as its writable qcow2. This does not turn HDDs into SSDs, but it gives concurrent builds three independent disk queues instead of one. An SSD/NVMe VM tier remains the largest possible future storage improvement.
+
+### Lightweight compatibility lab
+
+The Docker lab (`lab_acquire`, `lab_exec`, `lab_release`) remains available for small isolated tasks. Its prewarm count is **0** by default under v2.0; this frees controller CPU/RAM for the OpenAI/MCP/browser-control path. Existing `/tank/codex-lab` workspaces/archives are retained.
+
+### Verification
+
+Core controller verification:
+
+```sh
+python3 -m py_compile codex-replacer/server.py codex-replacer/http-server.py codex-replacer/vm_lab_manager.py codex-replacer/vm_job_scheduler.py lab/scheduler.py
+python3 codex-replacer/concurrency-test.py
+python3 codex-replacer/http-concurrency-test.py
+python3 codex-replacer/host-exec-promotion-test.py
+python3 codex-replacer/smoke-test.py
+python3 lab/scheduler-smoke-test.py --jobs 6 --sleep 2
+python3 lab/scheduler-smoke-test.py --jobs 12 --sleep 2
+```
+
+To apply the durable controller service settings:
 
 ```sh
 mkdir -p ~/.config/systemd/user/codex-replacer.service.d
@@ -139,18 +202,6 @@ systemctl --user daemon-reload
 systemctl --user enable --now codex-replacer-mcp.service codex-lab-gc.timer
 ```
 
-The tunnel profile must use `mcp.server_urls` with `channel: main` and `url: http://127.0.0.1:8791/mcp`, then `codex-replacer.service` can be restarted. Keep the profile credential reference unchanged.
+The tunnel profile uses `mcp.server_urls` with `channel: main` and `url: http://127.0.0.1:8791/mcp`. Keep the profile credential reference unchanged.
 
-### Full KVM computer lab
-
-For heavier or riskier work, Codex Replacer also exposes a full-VM lab backed by libvirt on the parent homeserver:
-
-- `vm_lab_list` — show full VM stations and the sign-in/out ledger.
-- `vm_lab_acquire` — lease a clean VM to an agent/project.
-- `vm_lab_exec` — run work in the leased VM.
-- `vm_lab_release` — sign out and normally recycle the VM from the golden image.
-- `vm_lab_gc` — release expired leases and maintain the prewarmed pool.
-
-The current default is **4 prewarmed VMs / 4 maximum**, each **4 vCPU, 8 GiB RAM, 100 GiB thin disk**, using `192.168.122.230` through `.233`. All four stations stay prewarmed; recycled sign-out restores a clean VM from the golden image and brings it back ready for the next agent. The golden image includes Git, GitHub CLI, Python, Node 24, npm, Docker, qemu-guest-agent, sudo, and `/workspace`.
-
-The full-VM ledger is `/tank/codex-lab-vm/SIGN-IN-OUT.md`; its append-only audit log is `/tank/codex-lab-vm/sign-in-out.jsonl`. VM provisioning on the homeserver is handled by `lab/vm-labctl.sh` and `/tank/vm/codex-lab/vm-labctl.sh`.
+The full-VM sign-in/out ledger remains `/tank/codex-lab-vm/SIGN-IN-OUT.md`, with append-only audit log `/tank/codex-lab-vm/sign-in-out.jsonl`. VM provisioning on the homeserver is handled by `lab/vm-labctl.sh` and `/tank/vm/codex-lab/vm-labctl.sh`.
