@@ -14,6 +14,7 @@ import os
 import signal
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
@@ -213,6 +214,29 @@ def cleanup():
     server.CHATGPT_BROWSER_CLIENT.close()
 
 
+def warm_dependencies():
+    started = time.monotonic()
+    try:
+        tools = server.BROWSER_CLIENT.list_tools()
+        event = {
+            "time": server.now_iso(),
+            "event": "mcp_dependency_warmed",
+            "dependency": "visual_browser",
+            "toolCount": len(tools),
+            "elapsedMs": round((time.monotonic() - started) * 1000, 2),
+        }
+    except Exception as error:
+        event = {
+            "time": server.now_iso(),
+            "event": "mcp_dependency_warm_failed",
+            "dependency": "visual_browser",
+            "error": str(error),
+            "elapsedMs": round((time.monotonic() - started) * 1000, 2),
+        }
+    sys.stderr.write(json.dumps(event, separators=(",", ":")) + "\n")
+    sys.stderr.flush()
+
+
 def main():
     if HOST not in {"127.0.0.1", "::1", "localhost"}:
         raise SystemExit(
@@ -245,6 +269,7 @@ def main():
         + "\n"
     )
     sys.stderr.flush()
+    threading.Thread(target=warm_dependencies, daemon=True, name="dependency-warmup").start()
     try:
         httpd.serve_forever(poll_interval=0.2)
     finally:

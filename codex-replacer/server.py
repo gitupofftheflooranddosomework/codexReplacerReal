@@ -30,7 +30,7 @@ import vm_lab_manager
 
 
 SERVER_NAME = "codex-replacer"
-SERVER_VERSION = "1.8.0"
+SERVER_VERSION = "1.9.0"
 DEFAULT_DIRECTORY = "/home/mark"
 MAX_CAPTURE_BYTES = 1 * 1024 * 1024
 HOST_EXEC_FOREGROUND_SECONDS = max(1, min(int(os.environ.get("CODEX_REPLACER_HOST_EXEC_FOREGROUND_SECONDS", "20")), 90))
@@ -1508,6 +1508,7 @@ CONVERSATION_CONTINUITY_INSTRUCTIONS = (
     "Use vm_lab_acquire/vm_lab_exec for CPU-heavy work and lab_acquire/lab_exec for lightweight isolated work. For repository work in a full VM, clone or fetch the needed revision into /workspace and run the expensive command there; use the main github tool for GitHub API/PR operations if gh authentication is not present inside the lab VM. "
     "Do not run an expensive build on the main VM merely because host_exec is convenient. The exception is work that genuinely depends on unsynced main-VM state and cannot safely be transferred first. "
     "Parallelism rule: issue independent read-only checks concurrently or combine them into one short shell/API call when safe instead of paying serial tool round trips. Never poll by sleeping in a foreground tool call; continue other useful work and poll later. "
+    "Browser hygiene rule: reuse the current relevant tab/profile instead of opening duplicate tabs, and close pages/tabs when their task is complete. Do not leave dozens of finished directory, form, search, or test pages open indefinitely because Chromium renderer accumulation consumes memory and process slots shared by other chats. "
     "Use a stable agent name, never use a station leased by another agent, and always call the matching lab_release or vm_lab_release when finished. "
     "Transport resilience rule: never use foreground sleep commands to wait for a future check. Use process_start/process_poll, continue other useful work, and poll the session later. host_exec automatically promotes leading waits of a few seconds and commands that exceed its short foreground budget into persistent process sessions; when it returns running=true, use process_poll with the returned sessionId and never rerun that command. "
     "If any write or mutating tool call ends with an uncertain transport error, do not blindly retry it because it may already have executed; inspect the target state first, then retry only if still needed."

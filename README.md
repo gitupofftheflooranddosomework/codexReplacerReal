@@ -81,6 +81,8 @@ This matters under many simultaneous chats: expiring or abandoning one MCP conne
 - foreground `host_exec` has a **20-second interactive budget**; if a command is still running, it is kept alive as a managed process and the tool returns a `sessionId` immediately for `process_poll` instead of blocking the chat
 - `host_exec` commands containing an early `sleep` of 3 seconds or more are promoted immediately instead of burning a foreground request waiting for a timer
 - managed host commands run at nice level 5 so CPU-heavy builds/scans do not starve the MCP/tunnel control path when many chats are active
+- visual-browser tool discovery is prewarmed in the background when the persistent MCP service starts, removing the roughly one-second cold browser-tool setup from the first browser-heavy chat
+- agents are instructed to reuse/close browser tabs so long-lived Chromium profiles do not grow unbounded and consume shared memory/process slots
 
 `http-concurrency-test.py` runs eight one-second commands in parallel and deliberately abandons a long HTTP request; a second request must still complete while the abandoned command is running.
 
