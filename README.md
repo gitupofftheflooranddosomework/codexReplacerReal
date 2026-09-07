@@ -40,10 +40,11 @@ FlareSolverr describes itself as a proxy for bypassing Cloudflare/DDoS-GUARD cha
 Run:
 
 ```sh
-python3 -m py_compile codex-replacer/server.py codex-replacer/lab_manager.py codex-replacer/smoke-test.py codex-replacer/concurrency-test.py
+python3 -m py_compile codex-replacer/server.py codex-replacer/http-server.py codex-replacer/lab_manager.py codex-replacer/smoke-test.py codex-replacer/concurrency-test.py codex-replacer/http-concurrency-test.py
 python3 codex-replacer/concurrency-test.py
+python3 codex-replacer/http-concurrency-test.py
 python3 codex-replacer/smoke-test.py
-systemd-analyze --user verify codex-replacer/systemd/codex-chatgpt-browser.service codex-replacer/systemd/codex-lab-gc.service codex-replacer/systemd/codex-lab-gc.timer
+systemd-analyze --user verify codex-replacer/systemd/codex-replacer-mcp.service codex-replacer/systemd/codex-chatgpt-browser.service codex-replacer/systemd/codex-lab-gc.service codex-replacer/systemd/codex-lab-gc.timer
 ```
 
 ## Parallel MCP dispatcher
@@ -61,6 +62,23 @@ Codex Replacer 1.4 processes independent MCP requests concurrently instead of se
 - each completed MCP request writes an `mcp_request_completed` timing record to the service journal with method, tool, status, and elapsed milliseconds
 
 This separates server-side execution time from ChatGPT reasoning/tool-transport time when diagnosing slow turns.
+
+### Isolated Streamable HTTP transport
+
+Codex Replacer 1.6 runs the privileged MCP server as its own persistent, loopback-only HTTP service on `127.0.0.1:8791/mcp`. The OpenAI tunnel client connects to that URL instead of owning `server.py` as one shared stdio child.
+
+This matters under many simultaneous chats: expiring or abandoning one MCP connection no longer closes the stdin/stdout pipes underneath every other chat. The tunnel can reconnect independently while the local MCP service, background process sessions, and unrelated HTTP requests remain alive.
+
+- local MCP service: `codex-replacer-mcp.service`
+- endpoint: `http://127.0.0.1:8791/mcp`
+- health: `http://127.0.0.1:8791/healthz`
+- the privileged endpoint binds only to loopback and rejects non-loopback browser origins
+- HTTP requests are handled concurrently; the MCP/tunnel concurrency ceiling remains 20
+- tunnel MCP connection maximum TTL is 30 minutes, but correctness no longer depends on keeping one connection alive indefinitely
+- commands expected to exceed about 60 seconds should normally use `process_start` / `process_poll` instead of a synchronous `host_exec` request
+- mutating calls are never assumed safe to retry after an uncertain transport failure; inspect state first because the operation may already have completed
+
+`http-concurrency-test.py` runs eight one-second commands in parallel and deliberately abandons a long HTTP request; a second request must still complete while the abandoned command is running.
 
 ## Codex computer lab
 
@@ -93,13 +111,16 @@ To apply the durable service settings on a Codex VM:
 
 ```sh
 mkdir -p ~/.config/systemd/user/codex-replacer.service.d
+cp codex-replacer/systemd/codex-replacer-mcp.service ~/.config/systemd/user/
 cp codex-replacer/systemd/codex-replacer-performance.conf ~/.config/systemd/user/codex-replacer.service.d/20-performance.conf
+cp codex-replacer/systemd/codex-replacer-http-transport.conf ~/.config/systemd/user/codex-replacer.service.d/30-http-mcp.conf
 cp codex-replacer/systemd/codex-lab-gc.service ~/.config/systemd/user/
 cp codex-replacer/systemd/codex-lab-gc.timer ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now codex-lab-gc.timer
-systemctl --user restart codex-replacer.service
+systemctl --user enable --now codex-replacer-mcp.service codex-lab-gc.timer
 ```
+
+The tunnel profile must use `mcp.server_urls` with `channel: main` and `url: http://127.0.0.1:8791/mcp`, then `codex-replacer.service` can be restarted. Keep the profile credential reference unchanged.
 
 ### Full KVM computer lab
 

@@ -30,7 +30,7 @@ import vm_lab_manager
 
 
 SERVER_NAME = "codex-replacer"
-SERVER_VERSION = "1.5.0"
+SERVER_VERSION = "1.6.0"
 DEFAULT_DIRECTORY = "/home/mark"
 MAX_CAPTURE_BYTES = 1 * 1024 * 1024
 
@@ -1406,7 +1406,9 @@ CONVERSATION_CONTINUITY_INSTRUCTIONS = (
     "If the user explicitly asks to create the next chat and chatgpt_start_chat is available, seed that new chat with the generated handoff; otherwise output the handoff for the user to use. "
     "Computer-lab rule: for parallel product work, prefer a leased lab station instead of stacking every build on the main Codex VM. "
     "Use lab_acquire/lab_exec for fast lightweight isolation. Use vm_lab_acquire/vm_lab_exec for heavy builds, Docker-in-VM, risky dependency work, or stronger isolation. "
-    "Use a stable agent name, never use a station leased by another agent, and always call the matching lab_release or vm_lab_release when finished."
+    "Use a stable agent name, never use a station leased by another agent, and always call the matching lab_release or vm_lab_release when finished. "
+    "Transport resilience rule: prefer process_start/process_poll for host commands expected to run longer than about 60 seconds instead of holding a synchronous host_exec request open. "
+    "If any write or mutating tool call ends with an uncertain transport error, do not blindly retry it because it may already have executed; inspect the target state first, then retry only if still needed."
 )
 
 
@@ -1438,7 +1440,7 @@ DIRECT_TOOLS = dict([
     tool("fs_move", "Move path", "Use this when you need to move or rename a file or directory anywhere Mark can access.", object_schema({"source": string(), "destination": string()}, ["source", "destination"]), handle_fs_move, annotations(False, True, False)),
     tool("fs_delete", "Delete path", "Use this when you need to permanently delete a file or directory Mark can access.", object_schema({"path": string(), "recursive": {"type": "boolean", "default": False}}, ["path"]), handle_fs_delete, annotations(False, True, False)),
     tool("image_view", "View image", "Use this when you need to visually inspect an image file from any host path.", object_schema({"path": string(), "maxBytes": {"type": "integer", "minimum": 1, "maximum": 52428800}}, ["path"]), handle_image_view, annotations(True, False, False)),
-    tool("host_exec", "Execute VM command", "Use this for unrestricted shell access inside the dedicated Codex Replacer VM. Runs as Mark by default; set asRoot=true for passwordless root execution when privileged filesystem, networking, package, service, mount, device, firewall, or system operations are needed.", object_schema({"command": string(), "cwd": string(), "timeout": {"type": "integer", "minimum": 1, "maximum": 86400}, "stdin": string(), "env": {"type": "object", "additionalProperties": {"type": ["string", "number", "boolean"]}}, "asRoot": {"type": "boolean", "default": False}, "maxOutputBytes": {"type": "integer", "minimum": 1024, "maximum": 33554432}}, ["command"]), handle_host_exec, annotations(False, True, True)),
+    tool("host_exec", "Execute VM command", "Use this for unrestricted shell access inside the dedicated Codex Replacer VM. Runs as Mark by default; set asRoot=true for passwordless root execution when privileged filesystem, networking, package, service, mount, device, firewall, or system operations are needed. Prefer process_start/process_poll instead when the command is expected to run longer than about 60 seconds, so one chat does not hold a synchronous transport request open unnecessarily.", object_schema({"command": string(), "cwd": string(), "timeout": {"type": "integer", "minimum": 1, "maximum": 86400}, "stdin": string(), "env": {"type": "object", "additionalProperties": {"type": ["string", "number", "boolean"]}}, "asRoot": {"type": "boolean", "default": False}, "maxOutputBytes": {"type": "integer", "minimum": 1024, "maximum": 33554432}}, ["command"]), handle_host_exec, annotations(False, True, True)),
     tool("process_start", "Start host process", "Use this when you need to start a long-running or interactive command as Mark and continue it across later tool calls.", object_schema({"command": string(), "cwd": string(), "interactive": {"type": "boolean", "default": False}, "env": {"type": "object", "additionalProperties": {"type": ["string", "number", "boolean"]}}}, ["command"]), handle_process_start, annotations(False, True, True)),
     tool("process_poll", "Read process output", "Use this when you need new output or completion state from a previously started process.", object_schema({"sessionId": string(), "afterSequence": {"type": "integer", "minimum": 0, "default": 0}}, ["sessionId"]), handle_process_poll, annotations(True, False, False)),
     tool("process_write", "Write process input", "Use this when you need to send text or terminal input to a running process.", object_schema({"sessionId": string(), "data": string()}, ["sessionId", "data"]), handle_process_write, annotations(False, True, True)),
@@ -1541,22 +1543,20 @@ def shutdown(_signal_number=None, _frame=None):
     raise SystemExit(0)
 
 
-def _process_message(message):
+def process_request(message):
     started = time.monotonic()
     method = message.get("method")
     tool_name = (message.get("params") or {}).get("name") if method == "tools/call" else None
     status = "ok"
     try:
-        response = handle_request(message)
-        if response is not None:
-            send_message(response)
+        return handle_request(message)
     except Exception as error:
         status = "error"
-        send_message({
+        return {
             "jsonrpc": "2.0",
             "id": message.get("id"),
             "error": {"code": -32603, "message": f"Internal error: {error}"},
-        })
+        }
     finally:
         event = {
             "time": now_iso(),
@@ -1570,6 +1570,12 @@ def _process_message(message):
         with LOG_LOCK:
             sys.stderr.write(json.dumps(event, separators=(",", ":")) + "\n")
             sys.stderr.flush()
+
+
+def _process_message(message):
+    response = process_request(message)
+    if response is not None:
+        send_message(response)
 
 def main():
     signal.signal(signal.SIGTERM, shutdown)

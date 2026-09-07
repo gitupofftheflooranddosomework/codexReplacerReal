@@ -1,8 +1,15 @@
+[Unit]
+Description=Codex Replacer persistent local MCP service
+After=network-online.target docker.service
+Wants=network-online.target
+
 [Service]
+Type=simple
+WorkingDirectory=/home/mark/docker/markshaw-private-mcp/codex-replacer
 Environment=CODEX_REPLACER_MAX_WORKERS=20
-Environment=MCP_MAX_CONCURRENT_REQUESTS=20
-Environment=CONTROL_PLANE_MAX_INFLIGHT_REQUESTS=20
-Environment=MCP_CONNECTION_MAX_TTL=30m
+Environment=CODEX_REPLACER_HTTP_HOST=127.0.0.1
+Environment=CODEX_REPLACER_HTTP_PORT=8791
+Environment=CODEX_REPLACER_HTTP_PATH=/mcp
 Environment=CODEX_LAB_MAX_STATIONS=6
 Environment=CODEX_LAB_PREWARM_STATIONS=4
 Environment=CODEX_LAB_ROOT=/tank/codex-lab
@@ -14,3 +21,11 @@ Environment=CODEX_VM_LAB_HOME_KEY=/home/mark/.ssh/id_ed25519_home_server
 Environment=CODEX_VM_LAB_GUEST_KEY=/home/mark/.ssh/id_ed25519_codex_lab_vm
 Environment=CODEX_VM_LAB_KNOWN_HOSTS=/home/mark/.ssh/codex_lab_known_hosts
 Environment=CODEX_VM_LAB_CTL=/tank/vm/codex-lab/vm-labctl.sh
+ExecStart=/usr/bin/python3 /home/mark/docker/markshaw-private-mcp/codex-replacer/http-server.py
+Restart=always
+RestartSec=2
+TimeoutStopSec=30
+UMask=0077
+
+[Install]
+WantedBy=default.target
