@@ -101,7 +101,7 @@ The live Codex Replacer VM is tuned for interactive latency as well as throughpu
 
 ## Codex computer lab
 
-Codex Replacer 2.0 uses a **six-computer persistent KVM lab** as its primary parallel-work backend. The older Docker workstation pool still exists for lightweight compatibility/on-demand isolation, but it is not prewarmed and should not be used for CPU-heavy work.
+Codex Replacer 2.1 uses a **six-computer persistent KVM lab** as its primary parallel-work backend. The older Docker workstation pool still exists for lightweight compatibility/on-demand isolation, but it is not prewarmed and should not be used for CPU-heavy work.
 
 ### Six persistent KVM computers
 
@@ -122,9 +122,13 @@ The browser/workstation golden image is `codex-lab-base-browser-v2.qcow2`. `lab/
 
 ### Watch all six computers
 
-`https://browser.home.markshaw.ca/` is the authenticated six-screen dashboard. Its **Live six-VM status** strip updates every two seconds with per-worker CPU, RAM, root-disk usage, uptime, Linux-workstation readiness, Docker readiness, browser readiness, active lease/job state, plus shared scheduler capacity/free/busy/queued counts. The six live noVNC desktops remain directly below the status strip. The dashboard uses its own HTML login page rather than HTTP Basic Auth: username `mark`, a salted PBKDF2-SHA256 password verifier stored in `/tank/vm/codex-lab/dashboard-auth.json` with mode `0600`, 12-hour signed sessions in a host-only `Secure; HttpOnly; SameSite=Strict` cookie, login throttling, and a built-in password-change page. Password changes rotate the session secret and invalidate other sessions. Plaintext passwords are never stored in the auth file.
+`https://browser.home.markshaw.ca/` is the authenticated six-screen operations dashboard. It updates every two seconds and has three layers: **scheduler health/throughput**, **per-VM identity/status/controls**, and the six live noVNC desktops. Every VM card shows CPU, RAM, root-disk usage, uptime, Linux/Docker/browser readiness, active job or interactive lease, elapsed time, and the stable `owner` bot/agent name. Scheduled jobs and interactive leases can also carry `chatLabel` and `chatUrl`; when a real `https://chatgpt.com/...` URL is supplied, the VM card exposes an **open chat** link. The MCP tunnel does not expose a ChatGPT conversation ID automatically, so agents are instructed to pass real chat metadata when available and never invent it. The dashboard uses its own HTML login page rather than HTTP Basic Auth: username `mark`, a salted PBKDF2-SHA256 password verifier stored in `/tank/vm/codex-lab/dashboard-auth.json` with mode `0600`, 12-hour signed sessions in a host-only `Secure; HttpOnly; SameSite=Strict` cookie, login throttling, and a built-in password-change page. Password changes rotate the session secret and invalidate other sessions. Plaintext passwords are never stored in the auth file.
 
 The legacy direct hostnames `browser1.home.markshaw.ca` through `browser6.home.markshaw.ca` and `browser-controller.home.markshaw.ca` only redirect to canonical paths on `browser.home.markshaw.ca`. This keeps the auth cookie scoped to one hostname instead of sending it to unrelated `*.home.markshaw.ca` services. For administrative recovery, `lab/reset-dashboard-auth.py --generate` can reset the `mark` login and invalidate all existing sessions if the password is forgotten again.
+
+Each VM card has direct operational controls: **Desktop**, **Terminal** (launches an `xterm` on that VM's visible desktop), **Job logs** for the active scheduled job, **Restart browser**, **Cancel job**, and **Release lease**. Mutating dashboard actions are POST-only and require the signed dashboard session plus its CSRF token. Job-log responses are deliberately redacted to owner/project/chat/status/timestamps plus stdout/stderr; stored commands and environment variables are not returned to the human dashboard endpoint.
+
+The scheduler metrics panel shows loop health/age/error count, 5-minute jobs/minute throughput, queue-delay average/p95, 1-hour success rate, six-worker utilization, runtime average/p95, oldest queued age, and a live inline **SVG** history covering the last 30 minutes. The SVG renders completed jobs/minute as bars, failed jobs as an overlay, and average queue delay as a line. Metrics are derived from the existing SQLite job history, so they survive scheduler restarts; process-loop health is live runtime state.
 
 The dashboard and worker views are protected by the scheduler's signed-session login gate through Caddy `forward_auth`; there is no HTTP Basic Auth popup. The noVNC/CDP endpoints themselves stay on the private libvirt network; CDP remains loopback-only inside each worker and controller automation reaches it through per-worker SSH tunnels. The central scheduler listens only on `192.168.122.1:8766` and is not directly exposed on the home LAN. The Caddy route source is retained as `lab/Caddyfile.browser-login.snippet` so the live proxy configuration can be reconstructed without storing credentials.
 
@@ -155,7 +159,9 @@ MCP scheduler tools:
 - `vm_job_status` — read state and recent stdout/stderr; use this to poll instead of resubmitting work.
 - `vm_job_list` — inspect recent jobs across all six workers.
 - `vm_job_cancel` — cancel queued/running work.
-- `vm_worker_status` — show all six workers, load/memory, browser readiness, active job and browser URLs.
+- `vm_worker_status` — show all six workers, CPU/load/memory/disk, workstation/Docker/browser readiness, active job/lease ownership, scheduler health/throughput metrics, and browser URLs.
+
+Attribution fields on `vm_job_submit`, `vm_job_submit_batch`, and `vm_lab_acquire` are `owner` (required stable bot name), `project`, optional `chatLabel`, and optional `chatUrl`. The exact chat URL is intentionally optional because current MCP requests do not carry a trustworthy ChatGPT conversation ID automatically.
 
 When work is tied to a repository, pass `repoUrl` and `revision` whenever practical. The worker maintains a mirror cache and creates an isolated checkout for that job. GitHub API/PR actions can remain on the controller; the expensive compiler/test/build workload belongs on a worker.
 

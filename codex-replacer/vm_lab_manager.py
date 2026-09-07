@@ -128,6 +128,7 @@ def _mark_free(record, reason, released_at=None):
     old = record.copy()
     record.update({
         "status": "free", "leaseId": None, "owner": None, "project": None,
+        "chatLabel": None, "chatUrl": None,
         "acquiredAt": None, "expiresAt": None,
         "releasedAt": iso(released_at or now()), "releaseReason": reason,
     })
@@ -184,7 +185,7 @@ def expire(state):
     return expired
 
 
-def acquire(owner, project=None, ttl_minutes=180):
+def acquire(owner, project=None, ttl_minutes=180, chat_label=None, chat_url=None):
     owner=str(owner or "").strip()
     if not owner: raise ValueError("owner is required")
     ttl=max(15,min(int(ttl_minutes),1440)); lock,state=locked_state()
@@ -207,6 +208,8 @@ def acquire(owner, project=None, ttl_minutes=180):
             expires = t + timedelta(minutes=ttl)
             lock_payload = json.dumps({
                 "leaseId": lease, "owner": owner, "project": project or None,
+                "chatLabel": str(chat_label or "").strip() or None,
+                "chatUrl": str(chat_url or "").strip() or None,
                 "acquiredAt": iso(t), "expiresAt": iso(expires),
             }, separators=(",", ":"))
             lock_command = (
@@ -218,11 +221,16 @@ def acquire(owner, project=None, ttl_minutes=180):
                 continue
             r.update({
                 "status": "leased", "leaseId": lease, "owner": owner,
-                "project": project or None, "acquiredAt": iso(t),
+                "project": project or None,
+                "chatLabel": str(chat_label or "").strip() or None,
+                "chatUrl": str(chat_url or "").strip() or None,
+                "acquiredAt": iso(t),
                 "expiresAt": iso(expires), "releasedAt": None, "releaseReason": None,
             })
             save_state(state)
-            audit("sign_in", station=s, leaseId=lease, owner=owner, project=project or None, ttlMinutes=ttl)
+            audit("sign_in", station=s, leaseId=lease, owner=owner, project=project or None,
+                  chatLabel=str(chat_label or "").strip() or None,
+                  chatUrl=str(chat_url or "").strip() or None, ttlMinutes=ttl)
             return r.copy()
         raise RuntimeError(f"All {MAX_STATIONS} full-VM lab stations are leased")
     finally: unlock(lock)
@@ -301,7 +309,8 @@ def execute(command, lease_id=None, station=None, cwd="/workspace", timeout=120,
     return {
         "station": record["station"], "name": record["name"], "ip": record["ip"],
         "leaseId": record["leaseId"], "owner": record["owner"],
-        "project": record.get("project"), "exitCode": result.returncode,
+        "project": record.get("project"), "chatLabel": record.get("chatLabel"),
+        "chatUrl": record.get("chatUrl"), "exitCode": result.returncode,
         "stdout": out[:limit].decode(errors="replace"),
         "stderr": err[:limit].decode(errors="replace"),
         "truncated": len(out) > limit or len(err) > limit,

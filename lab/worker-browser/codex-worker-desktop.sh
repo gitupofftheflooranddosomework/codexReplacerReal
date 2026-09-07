@@ -36,7 +36,7 @@ pids+=("$!")
 chromium \
   --user-data-dir="$PROFILE_DIR" \
   --password-store=basic \
-  --remote-debugging-address=0.0.0.0 \
+  --remote-debugging-address=127.0.0.1 \
   --remote-debugging-port=9222 \
   --remote-allow-origins='*' \
   --no-first-run \

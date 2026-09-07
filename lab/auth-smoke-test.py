@@ -37,7 +37,9 @@ def main():
             new_cookie=headers['Set-Cookie'].split(';',1)[0]
             conn.request('GET','/auth/check',headers={'Cookie':cookie}); status,_,_=response_body(conn.getresponse()); assert status==302
             conn.request('GET','/auth/check',headers={'Cookie':new_cookie}); status,_,_=response_body(conn.getresponse()); assert status==204
-            print('{"ok":true,"login":true,"secureCookie":true,"passwordChange":true,"sessionRotation":true}')
+            conn.request('GET','/',headers={'Cookie':new_cookie}); status,_,body=response_body(conn.getresponse()); assert status==200 and 'throughput-svg' in body and 'Cancel job' in body
+            conn.request('POST','/control/worker/1/launch-terminal',body=b'{}',headers={'Cookie':new_cookie,'Content-Type':'application/json'}); status,_,_=response_body(conn.getresponse()); assert status==403
+            print('{"ok":true,"login":true,"secureCookie":true,"passwordChange":true,"sessionRotation":true,"dashboardControls":true,"csrfControls":true}')
         finally:
             conn.close(); server.shutdown(); server.server_close(); thread.join(timeout=2)
 if __name__=='__main__': main()

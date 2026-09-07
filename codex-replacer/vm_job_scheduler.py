@@ -27,6 +27,8 @@ def submit(arguments):
     payload = {
         "owner": arguments["owner"],
         "project": arguments.get("project"),
+        "chatLabel": arguments.get("chatLabel"),
+        "chatUrl": arguments.get("chatUrl"),
         "command": arguments["command"],
         "cwd": arguments.get("cwd", "/workspace"),
         "env": arguments.get("env") or {},
@@ -38,7 +40,7 @@ def submit(arguments):
     return request("POST", "/api/jobs", payload, timeout=15)
 
 
-def submit_many(owner, jobs, project=None):
+def submit_many(owner, jobs, project=None, chat_label=None, chat_url=None):
     if not isinstance(jobs, list) or not jobs:
         raise ValueError("jobs must be a non-empty array")
     if len(jobs) > 48:
@@ -51,6 +53,10 @@ def submit_many(owner, jobs, project=None):
         payload["owner"] = owner
         if project and not payload.get("project"):
             payload["project"] = project
+        if chat_label and not payload.get("chatLabel"):
+            payload["chatLabel"] = chat_label
+        if chat_url and not payload.get("chatUrl"):
+            payload["chatUrl"] = chat_url
         return submit(payload)
 
     with ThreadPoolExecutor(max_workers=min(12, len(jobs))) as pool:

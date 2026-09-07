@@ -40,6 +40,16 @@ LOGIN_LOCK = threading.Lock()
 LOGIN_ATTEMPTS = {}
 CPU_LOCK = threading.Lock()
 CPU_SAMPLES = {}
+SCHEDULER_HEALTH_LOCK = threading.Lock()
+SCHEDULER_HEALTH = {
+    "startedEpoch": time.time(),
+    "lastLoopEpoch": 0.0,
+    "lastDispatchEpoch": 0.0,
+    "loops": 0,
+    "errors": 0,
+    "lastError": None,
+    "lastErrorEpoch": None,
+}
 STOP = threading.Event()
 WAKE = threading.Event()
 
@@ -270,6 +280,8 @@ def db():
           finished_at TEXT,
           owner TEXT NOT NULL,
           project TEXT,
+          chat_label TEXT,
+          chat_url TEXT,
           job_class TEXT NOT NULL,
           command TEXT NOT NULL,
           cwd TEXT NOT NULL,
@@ -285,7 +297,14 @@ def db():
         )
         """
     )
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+    if "chat_label" not in columns:
+        conn.execute("ALTER TABLE jobs ADD COLUMN chat_label TEXT")
+    if "chat_url" not in columns:
+        conn.execute("ALTER TABLE jobs ADD COLUMN chat_url TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs(status, created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_finished ON jobs(finished_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_station_started ON jobs(station, started_at)")
     conn.commit()
     return conn
 
@@ -328,12 +347,127 @@ def job_row(row):
         out["env"] = json.loads(out.pop("env_json", "{}"))
     except Exception:
         out["env"] = {}
+    out["chatLabel"] = out.pop("chat_label", None)
+    out["chatUrl"] = out.pop("chat_url", None)
     station = out.get("station")
     if station:
         out["worker"] = worker_name(station)
         out["workerIp"] = worker_ip(station)
         out["browserUrl"] = browser_url(station)
     return out
+
+
+def public_job(row):
+    job = job_row(row) if not isinstance(row, dict) or "env_json" in row else dict(row)
+    if not job:
+        return None
+    keep = (
+        "id", "created_at", "updated_at", "started_at", "finished_at", "owner", "project",
+        "chatLabel", "chatUrl", "job_class", "status", "station", "worker", "workerIp",
+        "browserUrl", "exit_code", "error",
+    )
+    return {key: job.get(key) for key in keep if key in job}
+
+
+def parse_time(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value)).timestamp()
+    except Exception:
+        return None
+
+
+def percentile(values, p):
+    values = sorted(float(value) for value in values if value is not None)
+    if not values:
+        return None
+    if len(values) == 1:
+        return values[0]
+    position = (len(values) - 1) * float(p)
+    lower = int(position)
+    upper = min(lower + 1, len(values) - 1)
+    fraction = position - lower
+    return values[lower] * (1.0 - fraction) + values[upper] * fraction
+
+
+def scheduler_metrics(conn, now_epoch=None):
+    now_epoch = float(now_epoch or time.time())
+    rows = [dict(row) for row in conn.execute(
+        "SELECT created_at,started_at,finished_at,status,station FROM jobs WHERE created_at >= ? ORDER BY created_at",
+        (datetime.fromtimestamp(now_epoch - 86400, timezone.utc).isoformat(),),
+    )]
+    windows = {}
+    for label, seconds in (("5m", 300), ("1h", 3600), ("24h", 86400)):
+        cutoff = now_epoch - seconds
+        created = [row for row in rows if (parse_time(row.get("created_at")) or 0) >= cutoff]
+        finished = [row for row in rows if row.get("finished_at") and (parse_time(row.get("finished_at")) or 0) >= cutoff]
+        succeeded = sum(row.get("status") == "succeeded" for row in finished)
+        failed = sum(row.get("status") in ("failed", "timed_out", "canceled") for row in finished)
+        queue_ms = []
+        runtime_ms = []
+        busy_seconds = 0.0
+        for row in created:
+            created_ts = parse_time(row.get("created_at"))
+            started_ts = parse_time(row.get("started_at"))
+            finished_ts = parse_time(row.get("finished_at"))
+            if created_ts is not None and started_ts is not None:
+                queue_ms.append(max(0.0, (started_ts - created_ts) * 1000.0))
+            if started_ts is not None:
+                end_ts = finished_ts if finished_ts is not None else now_epoch
+                runtime_ms.append(max(0.0, (end_ts - started_ts) * 1000.0))
+                busy_seconds += max(0.0, min(now_epoch, end_ts) - max(cutoff, started_ts))
+        windows[label] = {
+            "submitted": len(created),
+            "completed": len(finished),
+            "succeeded": succeeded,
+            "failed": failed,
+            "successRatePercent": round(100.0 * succeeded / len(finished), 1) if finished else None,
+            "jobsPerMinute": round(len(finished) / max(1.0, seconds / 60.0), 3),
+            "avgQueueMs": round(sum(queue_ms) / len(queue_ms), 1) if queue_ms else None,
+            "p95QueueMs": round(percentile(queue_ms, 0.95), 1) if queue_ms else None,
+            "avgRuntimeMs": round(sum(runtime_ms) / len(runtime_ms), 1) if runtime_ms else None,
+            "p95RuntimeMs": round(percentile(runtime_ms, 0.95), 1) if runtime_ms else None,
+            "workerUtilizationPercent": round(100.0 * busy_seconds / (seconds * MAX_STATIONS), 1),
+        }
+    history = []
+    start_minute = int((now_epoch - 29 * 60) // 60) * 60
+    for index in range(30):
+        bucket_start = start_minute + index * 60
+        bucket_end = bucket_start + 60
+        completed_rows = [row for row in rows if row.get("finished_at") and bucket_start <= (parse_time(row.get("finished_at")) or 0) < bucket_end]
+        queue_values = []
+        for row in rows:
+            created_ts = parse_time(row.get("created_at"))
+            started_ts = parse_time(row.get("started_at"))
+            if created_ts is not None and started_ts is not None and bucket_start <= started_ts < bucket_end:
+                queue_values.append(max(0.0, (started_ts - created_ts) * 1000.0))
+        history.append({
+            "time": datetime.fromtimestamp(bucket_start, timezone.utc).isoformat(),
+            "completed": len(completed_rows),
+            "failed": sum(row.get("status") in ("failed", "timed_out", "canceled") for row in completed_rows),
+            "avgQueueMs": round(sum(queue_values) / len(queue_values), 1) if queue_values else 0.0,
+        })
+    queued = [row for row in rows if row.get("status") == "queued"]
+    oldest_queued_ms = None
+    if queued:
+        oldest = min(parse_time(row.get("created_at")) or now_epoch for row in queued)
+        oldest_queued_ms = round(max(0.0, (now_epoch - oldest) * 1000.0), 1)
+    with SCHEDULER_HEALTH_LOCK:
+        health = dict(SCHEDULER_HEALTH)
+    loop_age_ms = round(max(0.0, (now_epoch - float(health.get("lastLoopEpoch") or now_epoch)) * 1000.0), 1)
+    return {
+        "loopHealthy": bool(health.get("lastLoopEpoch")) and loop_age_ms < max(5000.0, POLL_SECONDS * 6000.0),
+        "loopAgeMs": loop_age_ms,
+        "uptimeSeconds": round(max(0.0, now_epoch - float(health.get("startedEpoch") or now_epoch)), 1),
+        "loops": int(health.get("loops") or 0),
+        "errors": int(health.get("errors") or 0),
+        "lastError": health.get("lastError"),
+        "lastErrorAt": datetime.fromtimestamp(health["lastErrorEpoch"], timezone.utc).isoformat() if health.get("lastErrorEpoch") else None,
+        "oldestQueuedMs": oldest_queued_ms,
+        "windows": windows,
+        "history": history,
+    }
 
 
 def active_counts(conn):
@@ -533,10 +667,19 @@ def dispatch(conn):
 def scheduler_loop():
     conn = db()
     while not STOP.is_set():
+        with SCHEDULER_HEALTH_LOCK:
+            SCHEDULER_HEALTH["lastLoopEpoch"] = time.time()
+            SCHEDULER_HEALTH["loops"] += 1
         try:
             reconcile_running(conn)
             dispatch(conn)
+            with SCHEDULER_HEALTH_LOCK:
+                SCHEDULER_HEALTH["lastDispatchEpoch"] = time.time()
         except Exception as exc:
+            with SCHEDULER_HEALTH_LOCK:
+                SCHEDULER_HEALTH["errors"] += 1
+                SCHEDULER_HEALTH["lastError"] = str(exc)[:1000]
+                SCHEDULER_HEALTH["lastErrorEpoch"] = time.time()
             print(json.dumps({"event": "scheduler_error", "time": now_iso(), "error": str(exc)}), flush=True)
         WAKE.wait(POLL_SECONDS)
         WAKE.clear()
@@ -567,6 +710,7 @@ printf 'BROWSER '; (ss -ltn | grep -q ':6080 ' && ss -ltn | grep -q ':9222 ') &&
 printf 'DOCKER '; systemctl is-active --quiet docker && echo 1 || echo 0
 printf 'WORKSTATION '; test -e /var/lib/codex-worker-workstation-v1 && echo 1 || echo 0
 printf 'EXCLUSIVE '; test -e /home/mark/.local/share/codex-worker/exclusive.lock && echo 1 || echo 0
+printf 'LEASE64 '; if [ -s /home/mark/.local/share/codex-worker/exclusive.lock ]; then base64 -w0 /home/mark/.local/share/codex-worker/exclusive.lock; fi; echo
 printf 'SCHEDULER '; test -e /home/mark/.local/share/codex-worker/scheduler.lock && echo 1 || echo 0'''
     r = ssh(station, command, timeout=5)
     if r.returncode != 0:
@@ -603,6 +747,12 @@ printf 'SCHEDULER '; test -e /home/mark/.local/share/codex-worker/scheduler.lock
     workstation_ready = values.get("WORKSTATION") == "1"
     docker_ready = values.get("DOCKER") == "1"
     browser_ready = values.get("BROWSER") == "1"
+    lease = None
+    if values.get("LEASE64"):
+        try:
+            lease = json.loads(base64.b64decode(values["LEASE64"]).decode("utf-8"))
+        except Exception:
+            lease = {"invalid": True}
     out.update({
         "ready": True,
         "hostname": values.get("HOST") or worker_name(station),
@@ -610,6 +760,7 @@ printf 'SCHEDULER '; test -e /home/mark/.local/share/codex-worker/scheduler.lock
         "workstationReady": workstation_ready,
         "dockerReady": docker_ready,
         "exclusive": values.get("EXCLUSIVE") == "1",
+        "lease": lease,
         "schedulerBusy": values.get("SCHEDULER") == "1",
         "load1": float(load[0]) if load else None,
         "load5": float(load[1]) if len(load) > 1 else None,
@@ -629,9 +780,10 @@ printf 'SCHEDULER '; test -e /home/mark/.local/share/codex-worker/scheduler.lock
 def state_payload():
     with DB_LOCK:
         conn = db()
-        active = {int(row["station"]): job_row(row) for row in conn.execute("SELECT * FROM jobs WHERE status='running' AND station IS NOT NULL")}
-        recent = [job_row(row) for row in conn.execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT 20")]
+        active = {int(row["station"]): public_job(row) for row in conn.execute("SELECT * FROM jobs WHERE status='running' AND station IS NOT NULL")}
+        recent = [public_job(row) for row in conn.execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT 20")]
         queued = conn.execute("SELECT COUNT(*) FROM jobs WHERE status='queued'").fetchone()[0]
+        metrics = scheduler_metrics(conn)
         conn.close()
     with ThreadPoolExecutor(max_workers=MAX_STATIONS) as pool:
         workers = list(pool.map(lambda station: worker_probe(station, active.get(station)), range(1, MAX_STATIONS + 1)))
@@ -646,9 +798,10 @@ def state_payload():
         "queuedJobs": queued,
         "workers": workers,
         "recentJobs": recent,
+        "metrics": metrics,
         "scheduler": {
             "mode": "automatic-six-way",
-            "healthy": ready == MAX_STATIONS and workstation_ready == MAX_STATIONS,
+            "healthy": ready == MAX_STATIONS and workstation_ready == MAX_STATIONS and metrics.get("loopHealthy", False),
             "capacity": MAX_STATIONS,
             "ready": ready,
             "workstationsReady": workstation_ready,
@@ -671,6 +824,8 @@ def submit_job(payload):
     env = payload.get("env") if isinstance(payload.get("env"), dict) else {}
     record = (
         job_id, stamp, stamp, owner, str(payload.get("project") or "") or None,
+        str(payload.get("chatLabel") or "").strip() or None,
+        str(payload.get("chatUrl") or "").strip() or None,
         str(payload.get("jobClass") or "cpu"), command, str(payload.get("cwd") or "/workspace"),
         json.dumps(env, separators=(",", ":")), max(1, min(int(payload.get("timeout", 3600)), 86400)),
         str(payload.get("repoUrl") or "") or None, str(payload.get("revision") or "") or None, "queued",
@@ -678,7 +833,7 @@ def submit_job(payload):
     with DB_LOCK:
         conn = db()
         conn.execute(
-            "INSERT INTO jobs(id,created_at,updated_at,owner,project,job_class,command,cwd,env_json,timeout_seconds,repo_url,revision,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO jobs(id,created_at,updated_at,owner,project,chat_label,chat_url,job_class,command,cwd,env_json,timeout_seconds,repo_url,revision,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             record,
         )
         conn.commit()
@@ -738,33 +893,121 @@ def cancel_job(job_id):
         return out
 
 
-def dashboard_html():
+def dashboard_job(job_id, max_bytes=32768):
+    job = get_job(str(job_id), include_tail=True, max_bytes=max_bytes)
+    if not job:
+        return None
+    public = public_job(job)
+    public["stdoutTail"] = job.get("stdoutTail", "")
+    public["stderrTail"] = job.get("stderrTail", "")
+    return public
+
+
+def worker_control(station, action):
+    station = int(station)
+    if not 1 <= station <= MAX_STATIONS:
+        raise ValueError(f"station must be 1..{MAX_STATIONS}")
+    if action == "cancel-job":
+        with DB_LOCK:
+            conn = db()
+            row = conn.execute("SELECT id FROM jobs WHERE station=? AND status='running' ORDER BY started_at DESC LIMIT 1", (station,)).fetchone()
+            conn.close()
+        if not row:
+            return {"ok": True, "station": station, "action": action, "message": "No running scheduled job."}
+        job = cancel_job(row["id"])
+        return {"ok": True, "station": station, "action": action, "job": public_job(job) if job else None}
+    if action == "release-lease":
+        before = ssh(station, "cat /home/mark/.local/share/codex-worker/exclusive.lock 2>/dev/null || true", timeout=5)
+        lease = None
+        if before.stdout.strip():
+            try:
+                lease = json.loads(before.stdout)
+            except Exception:
+                lease = {"raw": before.stdout.strip()[:500]}
+        result = ssh(
+            station,
+            "mkdir -p /home/mark/.local/share/codex-worker; flock -n /home/mark/.local/share/codex-worker/claim.lock sh -c 'rm -f /home/mark/.local/share/codex-worker/exclusive.lock'",
+            timeout=6,
+        )
+        if result.returncode != 0:
+            raise RuntimeError((result.stderr or result.stdout).strip() or "Could not release interactive lease.")
+        WAKE.set()
+        return {"ok": True, "station": station, "action": action, "lease": lease}
+    if action == "launch-terminal":
+        command = (
+            "setsid -f env DISPLAY=:99 xterm -fa Monospace -fs 11 -geometry 120x38+24+52 "
+            f"-title {shlex.quote('Codex Worker ' + str(station) + ' Terminal')} >/dev/null 2>&1"
+        )
+        result = ssh(station, command, timeout=6)
+        if result.returncode != 0:
+            raise RuntimeError((result.stderr or result.stdout).strip() or "Could not launch terminal.")
+        return {"ok": True, "station": station, "action": action, "browserUrl": browser_url(station)}
+    if action == "restart-browser":
+        result = ssh(station, "sudo systemctl restart codex-worker-desktop.service", timeout=12)
+        if result.returncode != 0:
+            raise RuntimeError((result.stderr or result.stdout).strip() or "Could not restart browser desktop.")
+        return {"ok": True, "station": station, "action": action, "browserUrl": browser_url(station)}
+    raise ValueError(f"unknown worker action: {action}")
+
+
+def dashboard_html(session):
     fleet = "".join(f"""
       <article class="fleet-node" id="fleet-{i}">
         <div class="fleet-head"><span class="dot"></span><strong>VM {i}</strong><span class="fleet-state">checking</span></div>
+        <div class="identity"><strong class="identity-owner">Idle</strong><span class="identity-project">No bot assigned</span><a class="identity-chat" target="_blank" rel="noreferrer" hidden>open chat</a></div>
         <div class="meters"><div><span>CPU</span><b class="cpu">—</b></div><div><span>RAM</span><b class="ram">—</b></div><div><span>Disk</span><b class="disk">—</b></div></div>
         <div class="services"><span class="svc workstation">Linux</span><span class="svc docker">Docker</span><span class="svc browser">Browser</span></div>
         <div class="fleet-job">No active job</div>
+        <div class="node-actions">
+          <a class="mini" target="_blank" href="/vm{i}/vnc.html?autoconnect=1&resize=scale&path=vm{i}/websockify">Desktop</a>
+          <button class="mini terminal" data-station="{i}" data-action="launch-terminal">Terminal</button>
+          <button class="mini logs" data-station="{i}" data-view="logs" hidden>Job logs</button>
+          <button class="mini restart" data-station="{i}" data-action="restart-browser">Restart browser</button>
+          <button class="mini danger cancel" data-station="{i}" data-action="cancel-job" hidden>Cancel job</button>
+          <button class="mini danger release" data-station="{i}" data-action="release-lease" hidden>Release lease</button>
+        </div>
       </article>""" for i in range(1, MAX_STATIONS + 1))
     cards = "".join(f"""
       <section class="worker" id="worker-{i}">
-        <header><span class="dot"></span><strong>Worker {i}</strong><span class="meta">loading…</span><a target="_blank" href="/vm{i}/vnc.html?autoconnect=1&resize=scale&path=vm{i}/websockify">open</a></header>
+        <header><span class="dot"></span><strong>Worker {i}</strong><span class="meta">loading…</span><a target="_blank" href="/vm{i}/vnc.html?autoconnect=1&resize=scale&path=vm{i}/websockify">full screen</a></header>
         <iframe src="/vm{i}/vnc.html?autoconnect=1&resize=scale&path=vm{i}/websockify" loading="eager" title="Codex worker {i}"></iframe>
-        <footer class="job">No active job</footer>
+        <footer><span class="job">No active job</span><span class="who"></span></footer>
       </section>""" for i in range(1, MAX_STATIONS + 1))
+    csrf_json = json.dumps(str(session.get("csrf") or ""))
     return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Codex KVM Lab</title><style>
-:root{{color-scheme:dark;background:#0b0d10;color:#e7edf5;font-family:Inter,system-ui,sans-serif}}*{{box-sizing:border-box}}body{{margin:0;background:#0b0d10}}nav{{position:sticky;top:0;z-index:9;background:#11161def;padding:10px 14px;backdrop-filter:blur(10px);display:flex;gap:14px;align-items:center;border-bottom:1px solid #27303a}}nav h1{{font-size:16px;margin:0}}#summary{{font-size:12px;color:#aab6c3}}#dispatch{{font-size:11px;padding:4px 8px;border:1px solid #31503d;border-radius:999px;background:#153221;color:#9ef0bd}}nav a{{color:#9dc9ff;text-decoration:none}}nav .spacer{{margin-left:auto}}.ops{{padding:12px 10px 2px}}.ops-title{{display:flex;align-items:center;gap:10px;margin:0 2px 9px}}.ops-title h2{{font-size:13px;margin:0}}.ops-title span{{font-size:11px;color:#8190a0}}.fleet{{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px}}.fleet-node{{background:#11161d;border:1px solid #27303a;border-radius:10px;padding:9px;min-width:0}}.fleet-head{{display:flex;gap:6px;align-items:center;font-size:12px}}.fleet-state{{margin-left:auto;color:#8795a5;font-size:10px}}.dot{{width:8px;height:8px;border-radius:50%;background:#7d8793;flex:0 0 auto}}.ready .dot{{background:#36d37e;box-shadow:0 0 8px #36d37e88}}.busy .dot{{background:#ffc857;box-shadow:0 0 8px #ffc85788}}.down .dot{{background:#ff5d6c}}.installing .dot{{background:#5ba7ff;box-shadow:0 0 8px #5ba7ff88}}.meters{{display:grid;grid-template-columns:repeat(3,1fr);gap:5px;margin-top:8px}}.meters div{{background:#0b0f14;border-radius:6px;padding:5px}}.meters span{{display:block;color:#728090;font-size:8px;text-transform:uppercase;letter-spacing:.06em}}.meters b{{font-size:11px}}.services{{display:flex;gap:4px;flex-wrap:wrap;margin-top:7px}}.svc{{font-size:8px;border:1px solid #3a4654;border-radius:999px;padding:2px 5px;color:#7e8b99}}.svc.ok{{border-color:#2c6a49;color:#8edcae;background:#173122}}.fleet-job{{font-size:9px;color:#8593a3;margin-top:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}main{{padding:10px;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}}.worker{{background:#11161d;border:1px solid #27303a;border-radius:10px;overflow:hidden;min-width:0}}header{{height:34px;display:flex;align-items:center;gap:8px;padding:0 10px;font-size:12px}}header a{{margin-left:auto;color:#9dc9ff;text-decoration:none}}.meta{{color:#8f9daa;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}iframe{{display:block;width:100%;aspect-ratio:16/10;border:0;background:#050607}}footer{{height:34px;padding:8px 10px;font-size:11px;color:#aab6c3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;border-top:1px solid #202832}}@media(max-width:1350px){{.fleet{{grid-template-columns:repeat(3,1fr)}}}}@media(max-width:1200px){{main{{grid-template-columns:repeat(2,minmax(0,1fr))}}}}@media(max-width:760px){{.fleet{{grid-template-columns:repeat(2,1fr)}}main{{grid-template-columns:1fr}}#dispatch{{display:none}}}}@media(max-width:460px){{.fleet{{grid-template-columns:1fr}}}}
-</style></head><body><nav><h1>Codex KVM Lab</h1><span id="dispatch">AUTO · 6-way scheduler</span><span id="summary">loading…</span><span class="spacer"></span><a href="/controller/vnc.html?autoconnect=1&resize=scale&path=controller/websockify" target="_blank">controller</a><a href="/change-password">password</a><a href="/logout">sign out</a></nav><section class="ops"><div class="ops-title"><h2>Live six-VM status</h2><span id="timestamp">updating…</span></div><div class="fleet">{fleet}</div></section><main>{cards}</main>
+:root{{color-scheme:dark;background:#0b0d10;color:#e7edf5;font-family:Inter,system-ui,sans-serif}}*{{box-sizing:border-box}}body{{margin:0;background:#0b0d10}}button{{font:inherit}}nav{{position:sticky;top:0;z-index:9;background:#11161def;padding:10px 14px;backdrop-filter:blur(10px);display:flex;gap:14px;align-items:center;border-bottom:1px solid #27303a}}nav h1{{font-size:16px;margin:0}}#summary{{font-size:12px;color:#aab6c3}}#dispatch{{font-size:11px;padding:4px 8px;border:1px solid #31503d;border-radius:999px;background:#153221;color:#9ef0bd}}#dispatch.bad{{border-color:#713744;background:#391b23;color:#ffc0c9}}nav a{{color:#9dc9ff;text-decoration:none}}nav .spacer{{margin-left:auto}}.section{{padding:12px 10px 2px}}.section-title{{display:flex;align-items:center;gap:10px;margin:0 2px 9px}}.section-title h2{{font-size:13px;margin:0}}.section-title span{{font-size:11px;color:#8190a0}}.metrics{{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px;margin-bottom:8px}}.metric{{background:#11161d;border:1px solid #27303a;border-radius:10px;padding:10px;min-width:0}}.metric span{{display:block;color:#7e8c9c;font-size:9px;text-transform:uppercase;letter-spacing:.06em}}.metric strong{{display:block;font-size:18px;margin-top:3px}}.metric small{{display:block;color:#8290a0;font-size:9px;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}.metric.good strong{{color:#80e0a8}}.metric.warn strong{{color:#ffd078}}.metric.bad strong{{color:#ff8995}}.graph-wrap{{background:#11161d;border:1px solid #27303a;border-radius:10px;padding:10px}}.graph-head{{display:flex;gap:16px;align-items:center;font-size:10px;color:#8391a1;margin-bottom:4px}}.legend{{display:inline-flex;gap:4px;align-items:center}}.legend i{{width:8px;height:8px;border-radius:2px;background:#3895e8}}.legend.queue i{{background:#45d08b}}.legend.fail i{{background:#e65e70}}#throughput-svg{{display:block;width:100%;height:130px;overflow:visible}}.fleet{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}}.fleet-node{{background:#11161d;border:1px solid #27303a;border-radius:10px;padding:10px;min-width:0}}.fleet-head{{display:flex;gap:6px;align-items:center;font-size:12px}}.fleet-state{{margin-left:auto;color:#8795a5;font-size:10px}}.dot{{width:8px;height:8px;border-radius:50%;background:#7d8793;flex:0 0 auto}}.ready .dot{{background:#36d37e;box-shadow:0 0 8px #36d37e88}}.busy .dot{{background:#ffc857;box-shadow:0 0 8px #ffc85788}}.down .dot{{background:#ff5d6c}}.installing .dot{{background:#5ba7ff;box-shadow:0 0 8px #5ba7ff88}}.identity{{display:grid;grid-template-columns:minmax(0,1fr) auto;column-gap:8px;margin-top:8px;padding:7px;background:#0b0f14;border-radius:7px;min-height:47px}}.identity-owner{{font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}.identity-project{{grid-column:1/2;font-size:9px;color:#8795a5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}.identity-chat{{grid-column:2;grid-row:1/3;align-self:center;color:#8fc5ff;font-size:9px;text-decoration:none}}.meters{{display:grid;grid-template-columns:repeat(3,1fr);gap:5px;margin-top:8px}}.meters div{{background:#0b0f14;border-radius:6px;padding:5px}}.meters span{{display:block;color:#728090;font-size:8px;text-transform:uppercase;letter-spacing:.06em}}.meters b{{font-size:11px}}.services{{display:flex;gap:4px;flex-wrap:wrap;margin-top:7px}}.svc{{font-size:8px;border:1px solid #3a4654;border-radius:999px;padding:2px 5px;color:#7e8b99}}.svc.ok{{border-color:#2c6a49;color:#8edcae;background:#173122}}.fleet-job{{font-size:9px;color:#8593a3;margin-top:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}.node-actions{{display:flex;gap:5px;flex-wrap:wrap;margin-top:8px}}.mini{{appearance:none;border:1px solid #344354;background:#151c25;color:#b9d6f5;border-radius:6px;padding:5px 7px;font-size:9px;text-decoration:none;cursor:pointer}}.mini:hover{{background:#1c2734}}.mini:disabled{{opacity:.4;cursor:not-allowed}}.mini.danger{{border-color:#65343e;color:#ffb5bf;background:#2a171b}}main{{padding:10px;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}}.worker{{background:#11161d;border:1px solid #27303a;border-radius:10px;overflow:hidden;min-width:0}}header{{height:34px;display:flex;align-items:center;gap:8px;padding:0 10px;font-size:12px}}header a{{margin-left:auto;color:#9dc9ff;text-decoration:none}}.meta{{color:#8f9daa;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}iframe{{display:block;width:100%;aspect-ratio:16/10;border:0;background:#050607}}footer{{min-height:34px;padding:7px 10px;font-size:10px;color:#aab6c3;display:flex;justify-content:space-between;gap:10px;border-top:1px solid #202832}}footer span{{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}footer .who{{color:#8fc5ff}}#toast{{position:fixed;right:16px;bottom:16px;z-index:20;max-width:360px;background:#16202b;border:1px solid #3a4a5c;border-radius:9px;padding:10px 12px;font-size:11px;box-shadow:0 12px 40px #0008;display:none}}#toast.bad{{border-color:#7d3947;background:#32191e;color:#ffc5cc}}.modal{{position:fixed;inset:0;z-index:30;background:#000a;display:none;place-items:center;padding:20px}}.modal.open{{display:grid}}.modal-card{{width:min(980px,100%);max-height:88vh;background:#0e141b;border:1px solid #344252;border-radius:12px;box-shadow:0 24px 80px #000c;overflow:hidden;display:flex;flex-direction:column}}.modal-head{{display:flex;gap:10px;align-items:center;padding:10px 12px;border-bottom:1px solid #28323e;font-size:11px}}.modal-head strong{{font-size:12px}}.modal-head .spacer{{flex:1}}.modal pre{{margin:0;padding:12px;overflow:auto;min-height:240px;white-space:pre-wrap;word-break:break-word;font:11px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;color:#cdd8e4}}.stderr{{color:#ffabb5}}@media(max-width:1350px){{.metrics{{grid-template-columns:repeat(3,1fr)}}}}@media(max-width:1200px){{main{{grid-template-columns:repeat(2,minmax(0,1fr))}}}}@media(max-width:900px){{.fleet{{grid-template-columns:repeat(2,1fr)}}}}@media(max-width:760px){{.metrics{{grid-template-columns:repeat(2,1fr)}}.fleet{{grid-template-columns:1fr}}main{{grid-template-columns:1fr}}#dispatch{{display:none}}}}@media(max-width:460px){{.metrics{{grid-template-columns:1fr}}}}
+</style></head><body><nav><h1>Codex KVM Lab</h1><span id="dispatch">AUTO · 6-way scheduler</span><span id="summary">loading…</span><span class="spacer"></span><a href="/controller/vnc.html?autoconnect=1&resize=scale&path=controller/websockify" target="_blank">controller</a><a href="/change-password">password</a><a href="/logout">sign out</a></nav>
+<section class="section"><div class="section-title"><h2>Scheduler health & throughput</h2><span id="timestamp">updating…</span></div><div class="metrics">
+<div class="metric" id="m-health"><span>Scheduler</span><strong>—</strong><small>loop health</small></div>
+<div class="metric" id="m-throughput"><span>Throughput</span><strong>—</strong><small>jobs/min · 5m</small></div>
+<div class="metric" id="m-queue"><span>Queue p95</span><strong>—</strong><small>start delay · 5m</small></div>
+<div class="metric" id="m-success"><span>Success</span><strong>—</strong><small>completed · 1h</small></div>
+<div class="metric" id="m-util"><span>Worker utilization</span><strong>—</strong><small>six VMs · 5m</small></div>
+<div class="metric" id="m-runtime"><span>Runtime p95</span><strong>—</strong><small>job duration · 1h</small></div>
+</div><div class="graph-wrap"><div class="graph-head"><span>Last 30 minutes</span><span class="legend"><i></i>completed/min</span><span class="legend fail"><i></i>failed</span><span class="legend queue"><i></i>avg queue ms</span></div><svg id="throughput-svg" viewBox="0 0 600 130" preserveAspectRatio="none" aria-label="Scheduler throughput history"></svg></div></section>
+<section class="section"><div class="section-title"><h2>Live six-VM status & controls</h2><span>bot/chat ownership + direct controls</span></div><div class="fleet">{fleet}</div></section><main>{cards}</main><div id="job-modal" class="modal"><section class="modal-card"><div class="modal-head"><strong id="job-modal-title">Job logs</strong><span id="job-modal-meta"></span><span class="spacer"></span><button class="mini" id="job-refresh">Refresh</button><button class="mini" id="job-close">Close</button></div><pre id="job-output">Loading…</pre></section></div><div id="toast"></div>
 <script>
-const pct=v=>v==null?'—':`${{Math.round(v)}}%`;const gib=v=>v==null?'—':`${{Number(v).toFixed(0)}}G`;function uptime(s){{if(!s)return'—';const d=Math.floor(s/86400),h=Math.floor((s%86400)/3600);return d?`${{d}}d ${{h}}h`:`${{h}}h`;}}
-async function refresh(){{try{{const s=await fetch('/state.json',{{cache:'no-store'}}).then(r=>r.json());const sched=s.scheduler||{{}};document.getElementById('summary').textContent=`${{sched.ready??0}}/6 ready · ${{sched.busy??0}} busy · ${{s.queuedJobs}} queued`;document.getElementById('dispatch').textContent=`AUTO · ${{sched.capacity||6}}-way · ${{sched.free??0}} free`;document.getElementById('timestamp').textContent=`updated ${{new Date(s.time).toLocaleTimeString()}}`;for(const w of s.workers){{const busy=!!(w.activeJob||w.exclusive||w.schedulerBusy),installing=w.ready&&!w.workstationReady;const cls=!w.ready?'down':installing?'installing':busy?'busy':'ready';const fleet=document.getElementById(`fleet-${{w.station}}`);fleet.classList.remove('ready','busy','down','installing');fleet.classList.add(cls);fleet.querySelector('.fleet-state').textContent=!w.ready?w.state:installing?'installing':busy?'busy':`ready · ${{uptime(w.uptimeSeconds)}}`;fleet.querySelector('.cpu').textContent=pct(w.cpuPercent);fleet.querySelector('.ram').textContent=pct(w.memUsedPercent);fleet.querySelector('.disk').textContent=pct(w.diskUsedPercent);fleet.querySelector('.workstation').classList.toggle('ok',!!w.workstationReady);fleet.querySelector('.docker').classList.toggle('ok',!!w.dockerReady);fleet.querySelector('.browser').classList.toggle('ok',!!w.browserReady);fleet.querySelector('.fleet-job').textContent=w.activeJob?`${{w.activeJob.owner}} · ${{w.activeJob.project||w.activeJob.job_class||'job'}}`:w.exclusive?'Interactive lease':w.schedulerBusy?'Scheduled job':'No active job';const el=document.getElementById(`worker-${{w.station}}`);el.classList.remove('ready','busy','down','installing');el.classList.add(cls);el.querySelector('.meta').textContent=w.ready?`CPU ${{pct(w.cpuPercent)}} · RAM ${{pct(w.memUsedPercent)}} · ${{gib(w.diskAvailableGiB)}} free`:`${{w.state}}`;el.querySelector('.job').textContent=w.activeJob?`${{w.activeJob.owner}} · ${{w.activeJob.project||''}} · ${{w.activeJob.status}}`:w.exclusive?'Interactive lease':installing?'Linux workstation packages installing':'No active job';}}}}catch(e){{document.getElementById('summary').textContent='status unavailable'}}}}
+const csrf={csrf_json};const NS='http://www.w3.org/2000/svg';let lastState=null;
+const pct=v=>v==null?'—':`${{Math.round(v)}}%`;const gib=v=>v==null?'—':`${{Number(v).toFixed(0)}}G`;const ms=v=>v==null?'—':v<1000?`${{Math.round(v)}}ms`:`${{(v/1000).toFixed(v<10000?1:0)}}s`;function uptime(s){{if(!s)return'—';const d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60);return d?`${{d}}d ${{h}}h`:h?`${{h}}h ${{m}}m`:`${{m}}m`;}}function elapsed(iso){{if(!iso)return'';const sec=Math.max(0,(Date.now()-Date.parse(iso))/1000);return uptime(sec)}}
+function toast(message,bad=false){{const el=document.getElementById('toast');el.textContent=message;el.classList.toggle('bad',bad);el.style.display='block';clearTimeout(el._t);el._t=setTimeout(()=>el.style.display='none',4000)}}
+function validChat(url){{return typeof url==='string'&&(url.startsWith('https://chatgpt.com/')||url.startsWith('https://chat.openai.com/'))}}
+async function action(station,name){{const confirmText=name==='cancel-job'?'Cancel the running job on VM '+station+'?':name==='release-lease'?'Release the interactive bot/browser lease on VM '+station+'?':name==='restart-browser'?'Restart the visible browser desktop on VM '+station+'? This will interrupt any browser automation currently using it.':null;if(confirmText&&!confirm(confirmText))return;try{{const r=await fetch(`/control/worker/${{station}}/${{name}}`,{{method:'POST',headers:{{'X-CSRF-Token':csrf,'Content-Type':'application/json'}},body:'{{}}'}});const d=await r.json();if(!r.ok)throw new Error(d.error||`HTTP ${{r.status}}`);toast(`VM ${{station}}: ${{name.replaceAll('-',' ')}} complete`);if(name==='launch-terminal')window.open(`/vm${{station}}/vnc.html?autoconnect=1&resize=scale&path=vm${{station}}/websockify`,'_blank');setTimeout(refresh,150)}}catch(e){{toast(`VM ${{station}}: ${{e.message}}`,true)}}}}
+let logJobId=null;async function showLogs(station){{const w=(lastState?.workers||[]).find(x=>x.station===station),id=w?.activeJob?.id;if(!id)return toast(`VM ${{station}} has no active scheduled job`,true);logJobId=id;document.getElementById('job-modal').classList.add('open');document.getElementById('job-modal-title').textContent=`VM ${{station}} · ${{w.activeJob.owner||'job'}}`;await refreshLogs()}}async function refreshLogs(){{if(!logJobId)return;const out=document.getElementById('job-output');try{{const r=await fetch(`/dashboard/job/${{encodeURIComponent(logJobId)}}`,{{cache:'no-store'}}),d=await r.json();if(!r.ok)throw new Error(d.error||`HTTP ${{r.status}}`);document.getElementById('job-modal-meta').textContent=`${{d.status||''}} · ${{d.project||d.job_class||''}}`;const stderr=d.stderrTail?`
+
+--- STDERR ---
+${{d.stderrTail}}`:'';out.textContent=(d.stdoutTail||'(no stdout yet)')+stderr}}catch(e){{out.textContent=`Could not load logs: ${{e.message}}`}}}}function closeLogs(){{logJobId=null;document.getElementById('job-modal').classList.remove('open')}}document.addEventListener('click',e=>{{const actionButton=e.target.closest('button[data-action]');if(actionButton)action(Number(actionButton.dataset.station),actionButton.dataset.action);const viewButton=e.target.closest('button[data-view="logs"]');if(viewButton)showLogs(Number(viewButton.dataset.station))}});document.getElementById('job-refresh').addEventListener('click',refreshLogs);document.getElementById('job-close').addEventListener('click',closeLogs);document.getElementById('job-modal').addEventListener('click',e=>{{if(e.target.id==='job-modal')closeLogs()}});
+function metric(id,value,detail,kind=''){{const el=document.getElementById(id);el.classList.remove('good','warn','bad');if(kind)el.classList.add(kind);el.querySelector('strong').textContent=value;el.querySelector('small').textContent=detail}}
+function renderSvg(history){{const svg=document.getElementById('throughput-svg');svg.replaceChildren();if(!history||!history.length)return;const w=600,h=130,pad=8,base=112;const maxJobs=Math.max(1,...history.map(x=>x.completed||0));const maxQueue=Math.max(1,...history.map(x=>x.avgQueueMs||0));const bw=(w-pad*2)/history.length;history.forEach((x,i)=>{{const bh=(x.completed||0)/maxJobs*78;const rect=document.createElementNS(NS,'rect');rect.setAttribute('x',pad+i*bw+1);rect.setAttribute('y',base-bh);rect.setAttribute('width',Math.max(1,bw-2));rect.setAttribute('height',bh);rect.setAttribute('fill','#3895e8');rect.setAttribute('rx','1');svg.appendChild(rect);if(x.failed){{const fh=Math.max(4,Math.min(bh,(x.failed/maxJobs)*78));const fail=document.createElementNS(NS,'rect');fail.setAttribute('x',pad+i*bw+1);fail.setAttribute('y',base-fh);fail.setAttribute('width',Math.max(1,bw-2));fail.setAttribute('height',fh);fail.setAttribute('fill','#e65e70');svg.appendChild(fail)}}}});const points=history.map((x,i)=>`${{pad+i*bw+bw/2}},${{base-(x.avgQueueMs||0)/maxQueue*78}}`).join(' ');const line=document.createElementNS(NS,'polyline');line.setAttribute('points',points);line.setAttribute('fill','none');line.setAttribute('stroke','#45d08b');line.setAttribute('stroke-width','2');line.setAttribute('vector-effect','non-scaling-stroke');svg.appendChild(line);const axis=document.createElementNS(NS,'line');axis.setAttribute('x1',pad);axis.setAttribute('x2',w-pad);axis.setAttribute('y1',base);axis.setAttribute('y2',base);axis.setAttribute('stroke','#344150');axis.setAttribute('stroke-width','1');svg.appendChild(axis)}}
+function updateMetrics(s){{const m=s.metrics||{{}},w5=(m.windows||{{}})['5m']||{{}},w1=(m.windows||{{}})['1h']||{{}};const health=m.loopHealthy&&s.scheduler?.healthy;metric('m-health',health?'Healthy':'Degraded',`${{ms(m.loopAgeMs)}} loop age · ${{m.errors||0}} errors`,health?'good':'bad');metric('m-throughput',`${{Number(w5.jobsPerMinute||0).toFixed(2)}}`,` ${{w5.completed||0}} completed / 5m`,w5.jobsPerMinute>0?'good':'');metric('m-queue',ms(w5.p95QueueMs),`avg ${{ms(w5.avgQueueMs)}} · oldest ${{ms(m.oldestQueuedMs)}}`,(w5.p95QueueMs||0)>3000?'warn':'good');metric('m-success',w1.successRatePercent==null?'—':`${{w1.successRatePercent}}%`,`${{w1.succeeded||0}} ok · ${{w1.failed||0}} failed`,w1.failed?'warn':'good');metric('m-util',`${{w5.workerUtilizationPercent??0}}%`,`${{s.scheduler?.busy??0}} busy · ${{s.scheduler?.free??0}} free`);metric('m-runtime',ms(w1.p95RuntimeMs),`avg ${{ms(w1.avgRuntimeMs)}} · 1h`);renderSvg(m.history)}}
+function updateWorker(w){{const busy=!!(w.activeJob||w.exclusive||w.schedulerBusy),installing=w.ready&&!w.workstationReady,cls=!w.ready?'down':installing?'installing':busy?'busy':'ready';const identity=w.activeJob||w.lease||null;const owner=identity?.owner||(w.schedulerBusy?'Scheduled job':'Idle');const project=identity?.project||identity?.chatLabel||(identity?'No project label':'No bot assigned');const chatUrl=identity?.chatUrl;const fleet=document.getElementById(`fleet-${{w.station}}`);fleet.classList.remove('ready','busy','down','installing');fleet.classList.add(cls);fleet.querySelector('.fleet-state').textContent=!w.ready?w.state:installing?'installing':busy?'busy':`ready · ${{uptime(w.uptimeSeconds)}}`;fleet.querySelector('.cpu').textContent=pct(w.cpuPercent);fleet.querySelector('.ram').textContent=pct(w.memUsedPercent);fleet.querySelector('.disk').textContent=pct(w.diskUsedPercent);fleet.querySelector('.workstation').classList.toggle('ok',!!w.workstationReady);fleet.querySelector('.docker').classList.toggle('ok',!!w.dockerReady);fleet.querySelector('.browser').classList.toggle('ok',!!w.browserReady);fleet.querySelector('.identity-owner').textContent=owner;fleet.querySelector('.identity-project').textContent=project;const chat=fleet.querySelector('.identity-chat');if(validChat(chatUrl)){{chat.href=chatUrl;chat.textContent=identity.chatLabel?'open chat':'chat';chat.hidden=false}}else{{chat.hidden=true;chat.removeAttribute('href')}}const age=w.activeJob?elapsed(w.activeJob.started_at):w.lease?elapsed(w.lease.acquiredAt):'';fleet.querySelector('.fleet-job').textContent=w.activeJob?`${{w.activeJob.job_class||'job'}} · ${{w.activeJob.status}} · ${{age}}`:w.lease?`Interactive/browser lease · ${{age}}`:w.schedulerBusy?'Scheduled job':'No active job';fleet.querySelector('.cancel').hidden=!w.activeJob;fleet.querySelector('.logs').hidden=!w.activeJob;fleet.querySelector('.release').hidden=!w.lease;fleet.querySelector('.terminal').disabled=!w.ready;fleet.querySelector('.restart').disabled=!w.browserReady;const el=document.getElementById(`worker-${{w.station}}`);el.classList.remove('ready','busy','down','installing');el.classList.add(cls);el.querySelector('.meta').textContent=w.ready?`CPU ${{pct(w.cpuPercent)}} · RAM ${{pct(w.memUsedPercent)}} · ${{gib(w.diskAvailableGiB)}} free`:`${{w.state}}`;el.querySelector('.job').textContent=w.activeJob?`${{w.activeJob.project||w.activeJob.job_class||'job'}} · ${{w.activeJob.status}} · ${{age}}`:w.lease?`Interactive lease · ${{w.lease.project||'browser'}} · ${{age}}`:installing?'Linux workstation installing':'No active job';el.querySelector('.who').textContent=identity?.owner||''}}
+async function refresh(){{try{{const s=await fetch('/state.json',{{cache:'no-store'}}).then(r=>{{if(!r.ok)throw new Error(`HTTP ${{r.status}}`);return r.json()}});lastState=s;const sched=s.scheduler||{{}};document.getElementById('summary').textContent=`${{sched.ready??0}}/6 ready · ${{sched.busy??0}} busy · ${{s.queuedJobs}} queued`;const badge=document.getElementById('dispatch');badge.textContent=`AUTO · ${{sched.capacity||6}}-way · ${{sched.free??0}} free`;badge.classList.toggle('bad',!sched.healthy);document.getElementById('timestamp').textContent=`updated ${{new Date(s.time).toLocaleTimeString()}}`;updateMetrics(s);for(const w of s.workers)updateWorker(w)}}catch(e){{document.getElementById('summary').textContent='status unavailable';toast(`Status refresh failed: ${{e.message}}`,true)}}}}
 refresh();setInterval(refresh,2000);
 </script></body></html>"""
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "CodexLabScheduler/2.0"
+    server_version = "CodexLabScheduler/2.1.0"
 
     def log_message(self, fmt, *args):
         print(json.dumps({"time": now_iso(), "event": "http", "client": self.client_ip(), "message": fmt % args}), flush=True)
@@ -864,14 +1107,21 @@ class Handler(BaseHTTPRequestHandler):
                 return self.login_redirect()
             changed = (parse_qs(u.query).get("changed") or [""])[0] == "1"
             return self.send_html(change_password_html(session, success="Password updated. Other signed-in sessions were invalidated." if changed else None))
+        if u.path.startswith("/dashboard/job/"):
+            if not self.session():
+                return self.send_json({"error": "unauthorized"}, 401)
+            job_id = u.path.rsplit("/", 1)[-1]
+            job = dashboard_job(job_id)
+            return self.send_json(job or {"error": "not found"}, 200 if job else 404)
         if u.path == "/state.json":
             if not self.session():
                 return self.send_json({"error": "unauthorized"}, 401)
             return self.send_json(state_payload())
         if u.path == "/":
-            if not self.session():
+            session = self.session()
+            if not session:
                 return self.login_redirect()
-            return self.send_html(dashboard_html())
+            return self.send_html(dashboard_html(session))
         if not u.path.startswith("/api/") or not self.authorized():
             return self.send_json({"error": "unauthorized"}, 401)
         if u.path == "/api/workers":
@@ -926,6 +1176,23 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_html(change_password_html(session, error=str(exc)), 400)
             token, new_session = make_session(config)
             self.send_response(303); self.send_header("Location", "/change-password?changed=1"); self.send_header("Cache-Control", "no-store"); self.set_session(token); self.security_headers(); self.end_headers(); return
+        if u.path.startswith("/control/worker/"):
+            session = self.session()
+            if not session:
+                return self.send_json({"error": "unauthorized"}, 401)
+            csrf = self.headers.get("X-CSRF-Token", "")
+            if not hmac.compare_digest(str(csrf), str(session.get("csrf") or "")):
+                return self.send_json({"error": "invalid csrf token"}, 403)
+            parts = [part for part in u.path.split("/") if part]
+            if len(parts) != 4:
+                return self.send_json({"error": "invalid worker action path"}, 404)
+            try:
+                result = worker_control(int(parts[2]), parts[3])
+                return self.send_json(result, 200)
+            except ValueError as exc:
+                return self.send_json({"error": str(exc)}, 400)
+            except Exception as exc:
+                return self.send_json({"error": str(exc)}, 500)
         if not u.path.startswith("/api/") or not self.authorized():
             return self.send_json({"error": "unauthorized"}, 401)
         try:
