@@ -100,3 +100,17 @@ systemctl --user daemon-reload
 systemctl --user enable --now codex-lab-gc.timer
 systemctl --user restart codex-replacer.service
 ```
+
+### Full KVM computer lab
+
+For heavier or riskier work, Codex Replacer also exposes a full-VM lab backed by libvirt on the parent homeserver:
+
+- `vm_lab_list` — show full VM stations and the sign-in/out ledger.
+- `vm_lab_acquire` — lease a clean VM to an agent/project.
+- `vm_lab_exec` — run work in the leased VM.
+- `vm_lab_release` — sign out and normally recycle the VM from the golden image.
+- `vm_lab_gc` — release expired leases and maintain the prewarmed pool.
+
+The current default is **2 prewarmed VMs / 4 maximum**, each **4 vCPU, 8 GiB RAM, 100 GiB thin disk**, using `192.168.122.230` through `.233`. Stations 3–4 are created on demand and removed after recycled sign-out. The golden image includes Git, GitHub CLI, Python, Node 24, npm, Docker, qemu-guest-agent, sudo, and `/workspace`.
+
+The full-VM ledger is `/tank/codex-lab-vm/SIGN-IN-OUT.md`; its append-only audit log is `/tank/codex-lab-vm/sign-in-out.jsonl`. VM provisioning on the homeserver is handled by `lab/vm-labctl.sh` and `/tank/vm/codex-lab/vm-labctl.sh`.

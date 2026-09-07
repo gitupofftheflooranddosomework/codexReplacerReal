@@ -26,10 +26,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import lab_manager
+import vm_lab_manager
 
 
 SERVER_NAME = "codex-replacer"
-SERVER_VERSION = "1.4.0"
+SERVER_VERSION = "1.5.0"
 DEFAULT_DIRECTORY = "/home/mark"
 MAX_CAPTURE_BYTES = 1 * 1024 * 1024
 
@@ -820,6 +821,44 @@ def handle_lab_gc(_arguments):
     return tool_result(lab_manager.collect())
 
 
+def handle_vm_lab_list(arguments):
+    return tool_result(vm_lab_manager.list_stations(arguments.get("auditLines", 12)))
+
+
+def handle_vm_lab_acquire(arguments):
+    return tool_result(vm_lab_manager.acquire(
+        arguments["owner"],
+        arguments.get("project"),
+        arguments.get("ttlMinutes", 180),
+    ))
+
+
+def handle_vm_lab_release(arguments):
+    return tool_result(vm_lab_manager.release(
+        lease_id=arguments.get("leaseId"),
+        station=arguments.get("station"),
+        reason=arguments.get("reason", "released"),
+        recycle=arguments.get("recycle", True),
+    ))
+
+
+def handle_vm_lab_exec(arguments):
+    return tool_result(vm_lab_manager.execute(
+        arguments["command"],
+        lease_id=arguments.get("leaseId"),
+        station=arguments.get("station"),
+        cwd=arguments.get("cwd", "/workspace"),
+        timeout=arguments.get("timeout", 120),
+        env=arguments.get("env"),
+        as_root=arguments.get("asRoot", False),
+        max_bytes=arguments.get("maxOutputBytes", 1024 * 1024),
+    ))
+
+
+def handle_vm_lab_gc(_arguments):
+    return tool_result(vm_lab_manager.collect())
+
+
 def command_tool(program, arguments):
     return tool_result(run_program(
         program,
@@ -1365,8 +1404,9 @@ CONVERSATION_CONTINUITY_INSTRUCTIONS = (
     "Before context exhaustion, use prepare_chat_handoff and present its complete handoff to the user. The handoff must preserve the objective, exact current state, completed work, pending work, blockers, constraints, "
     "and concrete references such as repositories, branches, PRs, run IDs, paths, URLs, commands, services, and test results. Do not wait until the platform refuses another message. "
     "If the user explicitly asks to create the next chat and chatgpt_start_chat is available, seed that new chat with the generated handoff; otherwise output the handoff for the user to use. "
-    "Computer-lab rule: for heavy or conflicting parallel product work, prefer a leased lab station instead of stacking every build on the main Codex VM. "
-    "Use lab_acquire with a stable agent name before lab_exec, never use a station leased by another agent, and always call lab_release when finished."
+    "Computer-lab rule: for parallel product work, prefer a leased lab station instead of stacking every build on the main Codex VM. "
+    "Use lab_acquire/lab_exec for fast lightweight isolation. Use vm_lab_acquire/vm_lab_exec for heavy builds, Docker-in-VM, risky dependency work, or stronger isolation. "
+    "Use a stable agent name, never use a station leased by another agent, and always call the matching lab_release or vm_lab_release when finished."
 )
 
 
@@ -1408,7 +1448,12 @@ DIRECT_TOOLS = dict([
     tool("lab_acquire", "Sign into lab computer", "Lease an isolated Codex lab workstation for an agent/project. Use a short stable agent name so other agents can see who owns the station.", object_schema({"owner": string("Agent name signing out the workstation, for example BuildMoose-Sol."), "project": string("Optional project or repository being worked on."), "ttlMinutes": {"type": "integer", "minimum": 15, "maximum": 1440, "default": 180}}, ["owner"]), handle_lab_acquire, annotations(False, False, False)),
     tool("lab_release", "Sign out of lab computer", "Release a leased lab workstation and record the sign-out. By default the container is recycled and its prior workspace is archived rather than deleted.", object_schema({"leaseId": string(), "station": {"type": "integer", "minimum": 1, "maximum": 12}, "reason": string(), "recycle": {"type": "boolean", "default": True}}), handle_lab_release, annotations(False, True, False)),
     tool("lab_exec", "Run command in lab computer", "Run a shell command inside a currently leased isolated lab workstation. Identify it by leaseId or station.", object_schema({"command": string(), "leaseId": string(), "station": {"type": "integer", "minimum": 1, "maximum": 12}, "cwd": string("Directory inside the lab computer; defaults to /workspace."), "timeout": {"type": "integer", "minimum": 1, "maximum": 86400, "default": 120}, "env": {"type": "object", "additionalProperties": {"type": ["string", "number", "boolean"]}}, "asRoot": {"type": "boolean", "default": False}, "maxOutputBytes": {"type": "integer", "minimum": 1024, "maximum": 8388608, "default": 1048576}}, ["command"]), handle_lab_exec, annotations(False, True, True)),
-    tool("lab_gc", "Maintain computer lab", "Release expired lab leases and ensure the configured prewarmed workstation pool is ready.", object_schema(), handle_lab_gc, annotations(False, True, False)),
+    tool("lab_gc", "Maintain computer lab", "Release expired lightweight lab leases and ensure the configured prewarmed container workstation pool is ready.", object_schema(), handle_lab_gc, annotations(False, True, False)),
+    tool("vm_lab_list", "List full-VM lab", "Show full KVM lab computers, active leases, VM state, and recent sign-in/sign-out activity.", object_schema({"auditLines": {"type": "integer", "minimum": 0, "maximum": 100, "default": 12}}), handle_vm_lab_list, annotations(True, False, False)),
+    tool("vm_lab_acquire", "Sign into full VM", "Lease a clean full KVM workstation for an agent/project. Prefer this for heavy builds, Docker-in-VM, risky dependency work, or tasks needing stronger isolation than the lightweight lab.", object_schema({"owner": string("Agent name signing into the workstation."), "project": string("Optional project or repository being worked on."), "ttlMinutes": {"type": "integer", "minimum": 15, "maximum": 1440, "default": 180}}, ["owner"]), handle_vm_lab_acquire, annotations(False, False, False)),
+    tool("vm_lab_release", "Sign out of full VM", "Release a full KVM lab workstation and record the sign-out. By default the VM is recycled from the golden image so the next agent receives a clean computer.", object_schema({"leaseId": string(), "station": {"type": "integer", "minimum": 1, "maximum": 8}, "reason": string(), "recycle": {"type": "boolean", "default": True}}), handle_vm_lab_release, annotations(False, True, False)),
+    tool("vm_lab_exec", "Run command in full VM", "Run a shell command inside a currently leased full KVM lab workstation. Identify it by leaseId or station.", object_schema({"command": string(), "leaseId": string(), "station": {"type": "integer", "minimum": 1, "maximum": 8}, "cwd": string("Directory inside the full VM; defaults to /workspace."), "timeout": {"type": "integer", "minimum": 1, "maximum": 86400, "default": 120}, "env": {"type": "object", "additionalProperties": {"type": ["string", "number", "boolean"]}}, "asRoot": {"type": "boolean", "default": False}, "maxOutputBytes": {"type": "integer", "minimum": 1024, "maximum": 8388608, "default": 1048576}}, ["command"]), handle_vm_lab_exec, annotations(False, True, True)),
+    tool("vm_lab_gc", "Maintain full-VM lab", "Release expired full-VM leases and ensure the configured prewarmed KVM workstation pool is ready.", object_schema(), handle_vm_lab_gc, annotations(False, True, False)),
     tool("git", "Run git", "Use this when you need unrestricted git operations as Mark in any repository.", object_schema(COMMON_COMMAND_PROPERTIES), lambda arguments: command_tool("git", arguments), annotations(False, True, True)),
     tool("github", "Run GitHub CLI", "Use this when you need unrestricted GitHub operations as Mark through the authenticated gh CLI.", object_schema(COMMON_COMMAND_PROPERTIES), lambda arguments: command_tool("gh", arguments), annotations(False, True, True)),
     tool("docker", "Run Docker", "Use this when you need unrestricted Docker or Docker Compose operations inside the dedicated Codex Replacer VM.", object_schema(COMMON_COMMAND_PROPERTIES), lambda arguments: command_tool("docker", arguments), annotations(False, True, True)),
