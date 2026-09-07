@@ -40,9 +40,10 @@ FlareSolverr describes itself as a proxy for bypassing Cloudflare/DDoS-GUARD cha
 Run:
 
 ```sh
-python3 -m py_compile codex-replacer/server.py codex-replacer/http-server.py codex-replacer/lab_manager.py codex-replacer/smoke-test.py codex-replacer/concurrency-test.py codex-replacer/http-concurrency-test.py
+python3 -m py_compile codex-replacer/server.py codex-replacer/http-server.py codex-replacer/lab_manager.py codex-replacer/smoke-test.py codex-replacer/concurrency-test.py codex-replacer/http-concurrency-test.py codex-replacer/host-exec-promotion-test.py
 python3 codex-replacer/concurrency-test.py
 python3 codex-replacer/http-concurrency-test.py
+python3 codex-replacer/host-exec-promotion-test.py
 python3 codex-replacer/smoke-test.py
 systemd-analyze --user verify codex-replacer/systemd/codex-replacer-mcp.service codex-replacer/systemd/codex-chatgpt-browser.service codex-replacer/systemd/codex-lab-gc.service codex-replacer/systemd/codex-lab-gc.timer
 ```
@@ -77,12 +78,17 @@ This matters under many simultaneous chats: expiring or abandoning one MCP conne
 - tunnel MCP connection maximum TTL is 30 minutes, but correctness no longer depends on keeping one connection alive indefinitely
 - commands expected to exceed about 60 seconds should normally use `process_start` / `process_poll` instead of a synchronous `host_exec` request
 - mutating calls are never assumed safe to retry after an uncertain transport failure; inspect state first because the operation may already have completed
+- foreground `host_exec` has a **20-second interactive budget**; if a command is still running, it is kept alive as a managed process and the tool returns a `sessionId` immediately for `process_poll` instead of blocking the chat
+- `host_exec` commands containing an early `sleep` of 3 seconds or more are promoted immediately instead of burning a foreground request waiting for a timer
+- managed host commands run at nice level 5 so CPU-heavy builds/scans do not starve the MCP/tunnel control path when many chats are active
 
 `http-concurrency-test.py` runs eight one-second commands in parallel and deliberately abandons a long HTTP request; a second request must still complete while the abandoned command is running.
 
+The main Codex Replacer VM is intentionally treated as a latency-sensitive control plane. Expensive transferable repo work should run in the full-VM lab instead of competing with every chat for the control VM's 8 vCPUs. Four full VMs are now prewarmed so heavy jobs do not pay the roughly 20-second on-demand creation path for stations 3-4.
+
 ## Codex computer lab
 
-For heavier parallel product work, Codex Replacer exposes a small leased workstation pool backed by isolated Docker containers. The Codex Replacer machine is itself a KVM guest and does not currently receive nested virtualization CPU flags, so containers are the fast worker backend today. A future host-side libvirt backend can provide full VMs once the parent homeserver authorizes management access from this guest.
+For lightweight parallel product work, Codex Replacer exposes a small leased workstation pool backed by isolated Docker containers on the control VM. CPU-heavy work should use the separate full-KVM lab on the parent homeserver described below, so expensive builds do not compete with interactive MCP traffic for the control VM's 8 vCPUs.
 
 Current defaults:
 
@@ -132,6 +138,6 @@ For heavier or riskier work, Codex Replacer also exposes a full-VM lab backed by
 - `vm_lab_release` — sign out and normally recycle the VM from the golden image.
 - `vm_lab_gc` — release expired leases and maintain the prewarmed pool.
 
-The current default is **2 prewarmed VMs / 4 maximum**, each **4 vCPU, 8 GiB RAM, 100 GiB thin disk**, using `192.168.122.230` through `.233`. Stations 3–4 are created on demand and removed after recycled sign-out. The golden image includes Git, GitHub CLI, Python, Node 24, npm, Docker, qemu-guest-agent, sudo, and `/workspace`.
+The current default is **4 prewarmed VMs / 4 maximum**, each **4 vCPU, 8 GiB RAM, 100 GiB thin disk**, using `192.168.122.230` through `.233`. All four stations stay prewarmed; recycled sign-out restores a clean VM from the golden image and brings it back ready for the next agent. The golden image includes Git, GitHub CLI, Python, Node 24, npm, Docker, qemu-guest-agent, sudo, and `/workspace`.
 
 The full-VM ledger is `/tank/codex-lab-vm/SIGN-IN-OUT.md`; its append-only audit log is `/tank/codex-lab-vm/sign-in-out.jsonl`. VM provisioning on the homeserver is handled by `lab/vm-labctl.sh` and `/tank/vm/codex-lab/vm-labctl.sh`.

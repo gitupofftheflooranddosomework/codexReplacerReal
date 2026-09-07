@@ -30,9 +30,12 @@ import vm_lab_manager
 
 
 SERVER_NAME = "codex-replacer"
-SERVER_VERSION = "1.6.0"
+SERVER_VERSION = "1.8.0"
 DEFAULT_DIRECTORY = "/home/mark"
 MAX_CAPTURE_BYTES = 1 * 1024 * 1024
+HOST_EXEC_FOREGROUND_SECONDS = max(1, min(int(os.environ.get("CODEX_REPLACER_HOST_EXEC_FOREGROUND_SECONDS", "20")), 90))
+HOST_EXEC_WAIT_PROMOTION_SECONDS = max(1, min(int(os.environ.get("CODEX_REPLACER_HOST_EXEC_WAIT_PROMOTION_SECONDS", "3")), 30))
+HOST_EXEC_NICE = max(0, min(int(os.environ.get("CODEX_REPLACER_HOST_EXEC_NICE", "5")), 19))
 
 
 def now_iso():
@@ -118,21 +121,28 @@ def run_program(program, args, cwd=None, timeout=120, input_text=None, env=None,
 
 
 class ProcessSession:
-    def __init__(self, command, cwd, env, interactive):
+    def __init__(self, command, cwd, env, interactive, as_root=False, timeout_seconds=None, initial_stdin=None, close_stdin=False, nice=0):
         self.id = uuid.uuid4().hex
         self.command = command
         self.cwd = absolute_path(cwd)
         self.interactive = bool(interactive)
+        self.as_root = bool(as_root)
         self.started_at = now_iso()
         self.lock = threading.Lock()
         self.events = deque(maxlen=4000)
         self.next_sequence = 1
+        self.timed_out = False
         process_env = os.environ.copy()
-        if isinstance(env, dict):
-            process_env.update({str(key): str(value) for key, value in env.items()})
+        explicit_env = {str(key): str(value) for key, value in (env or {}).items()} if isinstance(env, dict) else {}
+        process_env.update(explicit_env)
         launch = ["/bin/bash", "-lc", command]
         if self.interactive:
             launch = ["/usr/bin/script", "-qefc", command, "/dev/null"]
+        if self.as_root:
+            env_args = [f"{key}={value}" for key, value in process_env.items()]
+            launch = ["sudo", "-n", "env", *env_args, *launch]
+        if nice:
+            launch = ["/usr/bin/nice", "-n", str(int(nice)), *launch]
         self.process = subprocess.Popen(
             launch,
             cwd=self.cwd,
@@ -147,6 +157,33 @@ class ProcessSession:
         self.stderr_thread = threading.Thread(target=self._read_stream, args=("stderr", self.process.stderr), daemon=True)
         self.stdout_thread.start()
         self.stderr_thread.start()
+        if initial_stdin is not None:
+            try:
+                self.process.stdin.write(str(initial_stdin).encode("utf-8"))
+                self.process.stdin.flush()
+            except BrokenPipeError:
+                pass
+        if close_stdin and self.process.stdin is not None and not self.process.stdin.closed:
+            try:
+                self.process.stdin.close()
+            except BrokenPipeError:
+                pass
+        if timeout_seconds is not None:
+            threading.Thread(target=self._watchdog, args=(float(timeout_seconds),), daemon=True).start()
+
+    def _watchdog(self, timeout_seconds):
+        if timeout_seconds <= 0:
+            return
+        try:
+            self.process.wait(timeout=timeout_seconds)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        self.timed_out = True
+        try:
+            self.stop()
+        except Exception:
+            pass
 
     def _read_stream(self, stream_name, stream):
         while True:
@@ -173,16 +210,38 @@ class ProcessSession:
             "command": self.command,
             "cwd": self.cwd,
             "interactive": self.interactive,
+            "asRoot": self.as_root,
             "startedAt": self.started_at,
             "running": exit_code is None,
             "exitCode": exit_code,
+            "timedOut": self.timed_out,
             "events": events,
             "nextSequence": next_sequence,
         }
 
+    def wait(self, timeout):
+        try:
+            self.process.wait(timeout=max(0.01, float(timeout)))
+        except subprocess.TimeoutExpired:
+            return False
+        self.stdout_thread.join(timeout=0.5)
+        self.stderr_thread.join(timeout=0.5)
+        return True
+
+    def captured_output(self, maximum=MAX_CAPTURE_BYTES):
+        with self.lock:
+            events = list(self.events)
+        stdout = "".join(event["text"] for event in events if event["stream"] == "stdout")
+        stderr = "".join(event["text"] for event in events if event["stream"] == "stderr")
+        stdout, stdout_truncated = clipped_text(stdout, maximum)
+        stderr, stderr_truncated = clipped_text(stderr, maximum)
+        return stdout, stderr, stdout_truncated or stderr_truncated
+
     def write(self, data):
         if self.process.poll() is not None:
             raise RuntimeError("The process is no longer running.")
+        if self.process.stdin is None or self.process.stdin.closed:
+            raise RuntimeError("The process stdin is closed.")
         self.process.stdin.write(data.encode("utf-8"))
         self.process.stdin.flush()
 
@@ -203,11 +262,21 @@ class ProcessManager:
         self.sessions = {}
         self.lock = threading.Lock()
 
-    def start(self, command, cwd=None, env=None, interactive=False):
-        session = ProcessSession(command, cwd, env, interactive)
+    def start(self, command, cwd=None, env=None, interactive=False, **session_options):
+        session = ProcessSession(command, cwd, env, interactive, **session_options)
         with self.lock:
             self.sessions[session.id] = session
         return session.snapshot()
+
+    def start_session(self, command, cwd=None, env=None, interactive=False, **session_options):
+        session = ProcessSession(command, cwd, env, interactive, **session_options)
+        with self.lock:
+            self.sessions[session.id] = session
+        return session
+
+    def discard(self, session_id):
+        with self.lock:
+            self.sessions.pop(session_id, None)
 
     def get(self, session_id):
         with self.lock:
@@ -699,58 +768,89 @@ def handle_image_view(arguments):
     )
 
 
+def _wait_command_delay(command):
+    # Agents often used `sleep 45; check ...` in host_exec, which needlessly held
+    # one tunnel request open and could cross the control-plane response deadline.
+    # If a meaningful wait appears near the start, promote the command immediately.
+    prefix = command[:512]
+    match = re.search(r"(?:^|[;\n])\s*sleep\s+([0-9]+(?:\.[0-9]+)?)\b", prefix)
+    if not match:
+        return 0.0
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return 0.0
+
+
 def handle_host_exec(arguments):
     cwd = absolute_path(arguments.get("cwd"))
     command = arguments["command"]
-    process_env = os.environ.copy()
-    process_env.update({str(key): str(value) for key, value in (arguments.get("env") or {}).items()})
     timeout = max(1, min(int(arguments.get("timeout", 120)), 86400))
     maximum = max(1024, min(int(arguments.get("maxOutputBytes", MAX_CAPTURE_BYTES)), 32 * 1024 * 1024))
     as_root = bool(arguments.get("asRoot", False))
-    launch = ["/bin/bash", "-lc", command]
-    if as_root:
-        # Passwordless sudo is deliberately available to this private operator.
-        # Use env so caller-supplied variables survive sudo's env_reset policy.
-        env_args = [f"{key}={value}" for key, value in process_env.items()]
-        launch = ["sudo", "-n", "env", *env_args, "/bin/bash", "-lc", command]
-    try:
-        completed = subprocess.run(
-            launch,
-            cwd=cwd,
-            env=process_env,
-            input=arguments.get("stdin"),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout,
-            check=False,
-        )
-        stdout, stdout_truncated = clipped_text(completed.stdout, maximum)
-        stderr, stderr_truncated = clipped_text(completed.stderr, maximum)
-        data = {
+    wait_delay = _wait_command_delay(command)
+
+    session = PROCESS_MANAGER.start_session(
+        command,
+        cwd,
+        arguments.get("env"),
+        False,
+        as_root=as_root,
+        timeout_seconds=timeout,
+        initial_stdin=arguments.get("stdin"),
+        close_stdin=True,
+        nice=HOST_EXEC_NICE,
+    )
+
+    foreground_seconds = min(timeout, HOST_EXEC_FOREGROUND_SECONDS)
+    immediate_promotion = wait_delay >= HOST_EXEC_WAIT_PROMOTION_SECONDS
+    completed = False if immediate_promotion else session.wait(foreground_seconds)
+    # Preserve classic host_exec timeout semantics when the caller explicitly
+    # asked for a timeout within the interactive budget. The watchdog and this
+    # path can race at the boundary, so make the timeout result deterministic.
+    if not immediate_promotion and not completed and timeout <= HOST_EXEC_FOREGROUND_SECONDS:
+        session.timed_out = True
+        try:
+            session.stop()
+        except Exception:
+            pass
+        session.wait(0.5)
+        completed = True
+    stdout, stderr, truncated = session.captured_output(maximum)
+
+    if completed:
+        snapshot = session.snapshot()
+        PROCESS_MANAGER.discard(session.id)
+        return tool_result({
             "command": command,
             "cwd": cwd,
             "asRoot": as_root,
-            "exitCode": completed.returncode,
+            "exitCode": None if snapshot["timedOut"] else snapshot["exitCode"],
             "stdout": stdout,
             "stderr": stderr,
-            "timedOut": False,
-            "truncated": stdout_truncated or stderr_truncated,
-        }
-    except subprocess.TimeoutExpired as error:
-        stdout, stdout_truncated = clipped_text(error.stdout or b"", maximum)
-        stderr, stderr_truncated = clipped_text(error.stderr or b"", maximum)
-        data = {
-            "command": command,
-            "cwd": cwd,
-            "asRoot": as_root,
-            "exitCode": None,
-            "stdout": stdout,
-            "stderr": stderr,
-            "timedOut": True,
-            "truncated": stdout_truncated or stderr_truncated,
-        }
-    return tool_result(data)
+            "timedOut": snapshot["timedOut"],
+            "truncated": truncated,
+            "running": False,
+        })
+
+    reason = "leading_wait" if immediate_promotion else "foreground_budget_exceeded"
+    return tool_result({
+        "command": command,
+        "cwd": cwd,
+        "asRoot": as_root,
+        "exitCode": None,
+        "stdout": stdout,
+        "stderr": stderr,
+        "timedOut": False,
+        "truncated": truncated,
+        "running": True,
+        "sessionId": session.id,
+        "promotedToBackground": True,
+        "promotionReason": reason,
+        "foregroundBudgetSeconds": foreground_seconds,
+        "requestedTimeoutSeconds": timeout,
+        "nextAction": "Use process_poll with this sessionId. Do not rerun the command.",
+    })
 
 
 def handle_process_start(arguments):
@@ -1404,10 +1504,12 @@ CONVERSATION_CONTINUITY_INSTRUCTIONS = (
     "Before context exhaustion, use prepare_chat_handoff and present its complete handoff to the user. The handoff must preserve the objective, exact current state, completed work, pending work, blockers, constraints, "
     "and concrete references such as repositories, branches, PRs, run IDs, paths, URLs, commands, services, and test results. Do not wait until the platform refuses another message. "
     "If the user explicitly asks to create the next chat and chatgpt_start_chat is available, seed that new chat with the generated handoff; otherwise output the handoff for the user to use. "
-    "Computer-lab rule: for parallel product work, prefer a leased lab station instead of stacking every build on the main Codex VM. "
-    "Use lab_acquire/lab_exec for fast lightweight isolation. Use vm_lab_acquire/vm_lab_exec for heavy builds, Docker-in-VM, risky dependency work, or stronger isolation. "
+    "Performance rule: treat the main Codex Replacer VM as the interactive control plane, not the build farm. Keep short inspection, filesystem, Git, GitHub, and orchestration calls on the main VM, but offload CPU-heavy or long-running builds, test suites, compilers, recursive validators/scans, Docker builds, package builds, PDF/link validation, and similar work to the full-VM lab whenever the work can run from a committed or otherwise transferable revision. "
+    "Use vm_lab_acquire/vm_lab_exec for CPU-heavy work and lab_acquire/lab_exec for lightweight isolated work. For repository work in a full VM, clone or fetch the needed revision into /workspace and run the expensive command there; use the main github tool for GitHub API/PR operations if gh authentication is not present inside the lab VM. "
+    "Do not run an expensive build on the main VM merely because host_exec is convenient. The exception is work that genuinely depends on unsynced main-VM state and cannot safely be transferred first. "
+    "Parallelism rule: issue independent read-only checks concurrently or combine them into one short shell/API call when safe instead of paying serial tool round trips. Never poll by sleeping in a foreground tool call; continue other useful work and poll later. "
     "Use a stable agent name, never use a station leased by another agent, and always call the matching lab_release or vm_lab_release when finished. "
-    "Transport resilience rule: prefer process_start/process_poll for host commands expected to run longer than about 60 seconds instead of holding a synchronous host_exec request open. "
+    "Transport resilience rule: never use foreground sleep commands to wait for a future check. Use process_start/process_poll, continue other useful work, and poll the session later. host_exec automatically promotes leading waits of a few seconds and commands that exceed its short foreground budget into persistent process sessions; when it returns running=true, use process_poll with the returned sessionId and never rerun that command. "
     "If any write or mutating tool call ends with an uncertain transport error, do not blindly retry it because it may already have executed; inspect the target state first, then retry only if still needed."
 )
 
@@ -1440,7 +1542,7 @@ DIRECT_TOOLS = dict([
     tool("fs_move", "Move path", "Use this when you need to move or rename a file or directory anywhere Mark can access.", object_schema({"source": string(), "destination": string()}, ["source", "destination"]), handle_fs_move, annotations(False, True, False)),
     tool("fs_delete", "Delete path", "Use this when you need to permanently delete a file or directory Mark can access.", object_schema({"path": string(), "recursive": {"type": "boolean", "default": False}}, ["path"]), handle_fs_delete, annotations(False, True, False)),
     tool("image_view", "View image", "Use this when you need to visually inspect an image file from any host path.", object_schema({"path": string(), "maxBytes": {"type": "integer", "minimum": 1, "maximum": 52428800}}, ["path"]), handle_image_view, annotations(True, False, False)),
-    tool("host_exec", "Execute VM command", "Use this for unrestricted shell access inside the dedicated Codex Replacer VM. Runs as Mark by default; set asRoot=true for passwordless root execution when privileged filesystem, networking, package, service, mount, device, firewall, or system operations are needed. Prefer process_start/process_poll instead when the command is expected to run longer than about 60 seconds, so one chat does not hold a synchronous transport request open unnecessarily.", object_schema({"command": string(), "cwd": string(), "timeout": {"type": "integer", "minimum": 1, "maximum": 86400}, "stdin": string(), "env": {"type": "object", "additionalProperties": {"type": ["string", "number", "boolean"]}}, "asRoot": {"type": "boolean", "default": False}, "maxOutputBytes": {"type": "integer", "minimum": 1024, "maximum": 33554432}}, ["command"]), handle_host_exec, annotations(False, True, True)),
+    tool("host_exec", "Execute VM command", "Use this for unrestricted shell access inside the dedicated Codex Replacer control VM. Runs as Mark by default; set asRoot=true for passwordless root execution when privileged filesystem, networking, package, service, mount, device, firewall, or system operations are needed. Keep this tool for short interactive/orchestration work; offload CPU-heavy builds, broad test suites, compilers, recursive validators/scans, Docker builds, and similar work to vm_lab_acquire/vm_lab_exec whenever transferable. Do not use sleep to wait in the foreground. Leading waits and commands that exceed the short foreground budget are automatically promoted to a persistent process session; if running=true is returned, continue with process_poll using sessionId and do not rerun the command.", object_schema({"command": string(), "cwd": string(), "timeout": {"type": "integer", "minimum": 1, "maximum": 86400}, "stdin": string(), "env": {"type": "object", "additionalProperties": {"type": ["string", "number", "boolean"]}}, "asRoot": {"type": "boolean", "default": False}, "maxOutputBytes": {"type": "integer", "minimum": 1024, "maximum": 33554432}}, ["command"]), handle_host_exec, annotations(False, True, True)),
     tool("process_start", "Start host process", "Use this when you need to start a long-running or interactive command as Mark and continue it across later tool calls.", object_schema({"command": string(), "cwd": string(), "interactive": {"type": "boolean", "default": False}, "env": {"type": "object", "additionalProperties": {"type": ["string", "number", "boolean"]}}}, ["command"]), handle_process_start, annotations(False, True, True)),
     tool("process_poll", "Read process output", "Use this when you need new output or completion state from a previously started process.", object_schema({"sessionId": string(), "afterSequence": {"type": "integer", "minimum": 0, "default": 0}}, ["sessionId"]), handle_process_poll, annotations(True, False, False)),
     tool("process_write", "Write process input", "Use this when you need to send text or terminal input to a running process.", object_schema({"sessionId": string(), "data": string()}, ["sessionId", "data"]), handle_process_write, annotations(False, True, True)),
@@ -1452,7 +1554,7 @@ DIRECT_TOOLS = dict([
     tool("lab_exec", "Run command in lab computer", "Run a shell command inside a currently leased isolated lab workstation. Identify it by leaseId or station.", object_schema({"command": string(), "leaseId": string(), "station": {"type": "integer", "minimum": 1, "maximum": 12}, "cwd": string("Directory inside the lab computer; defaults to /workspace."), "timeout": {"type": "integer", "minimum": 1, "maximum": 86400, "default": 120}, "env": {"type": "object", "additionalProperties": {"type": ["string", "number", "boolean"]}}, "asRoot": {"type": "boolean", "default": False}, "maxOutputBytes": {"type": "integer", "minimum": 1024, "maximum": 8388608, "default": 1048576}}, ["command"]), handle_lab_exec, annotations(False, True, True)),
     tool("lab_gc", "Maintain computer lab", "Release expired lightweight lab leases and ensure the configured prewarmed container workstation pool is ready.", object_schema(), handle_lab_gc, annotations(False, True, False)),
     tool("vm_lab_list", "List full-VM lab", "Show full KVM lab computers, active leases, VM state, and recent sign-in/sign-out activity.", object_schema({"auditLines": {"type": "integer", "minimum": 0, "maximum": 100, "default": 12}}), handle_vm_lab_list, annotations(True, False, False)),
-    tool("vm_lab_acquire", "Sign into full VM", "Lease a clean full KVM workstation for an agent/project. Prefer this for heavy builds, Docker-in-VM, risky dependency work, or tasks needing stronger isolation than the lightweight lab.", object_schema({"owner": string("Agent name signing into the workstation."), "project": string("Optional project or repository being worked on."), "ttlMinutes": {"type": "integer", "minimum": 15, "maximum": 1440, "default": 180}}, ["owner"]), handle_vm_lab_acquire, annotations(False, False, False)),
+    tool("vm_lab_acquire", "Sign into full VM", "Lease a clean full KVM workstation for an agent/project. Use this by default for CPU-heavy builds, broad test suites, compilers, recursive validators/scans, Docker-in-VM, risky dependency work, or other expensive work that can be run from a transferable repository revision. This keeps the main Codex VM responsive for all chats.", object_schema({"owner": string("Agent name signing into the workstation."), "project": string("Optional project or repository being worked on."), "ttlMinutes": {"type": "integer", "minimum": 15, "maximum": 1440, "default": 180}}, ["owner"]), handle_vm_lab_acquire, annotations(False, False, False)),
     tool("vm_lab_release", "Sign out of full VM", "Release a full KVM lab workstation and record the sign-out. By default the VM is recycled from the golden image so the next agent receives a clean computer.", object_schema({"leaseId": string(), "station": {"type": "integer", "minimum": 1, "maximum": 8}, "reason": string(), "recycle": {"type": "boolean", "default": True}}), handle_vm_lab_release, annotations(False, True, False)),
     tool("vm_lab_exec", "Run command in full VM", "Run a shell command inside a currently leased full KVM lab workstation. Identify it by leaseId or station.", object_schema({"command": string(), "leaseId": string(), "station": {"type": "integer", "minimum": 1, "maximum": 8}, "cwd": string("Directory inside the full VM; defaults to /workspace."), "timeout": {"type": "integer", "minimum": 1, "maximum": 86400, "default": 120}, "env": {"type": "object", "additionalProperties": {"type": ["string", "number", "boolean"]}}, "asRoot": {"type": "boolean", "default": False}, "maxOutputBytes": {"type": "integer", "minimum": 1024, "maximum": 8388608, "default": 1048576}}, ["command"]), handle_vm_lab_exec, annotations(False, True, True)),
     tool("vm_lab_gc", "Maintain full-VM lab", "Release expired full-VM leases and ensure the configured prewarmed KVM workstation pool is ready.", object_schema(), handle_vm_lab_gc, annotations(False, True, False)),
