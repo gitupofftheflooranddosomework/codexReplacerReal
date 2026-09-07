@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import http.client, importlib.util, os, re, secrets, tempfile, threading, urllib.parse
+import http.client, importlib.util, json, os, re, secrets, tempfile, threading, urllib.parse
 from pathlib import Path
 
 def response_body(resp):
@@ -39,7 +39,10 @@ def main():
             conn.request('GET','/auth/check',headers={'Cookie':new_cookie}); status,_,_=response_body(conn.getresponse()); assert status==204
             conn.request('GET','/',headers={'Cookie':new_cookie}); status,_,body=response_body(conn.getresponse()); assert status==200 and 'throughput-svg' in body and 'Cancel job' in body
             conn.request('POST','/control/worker/1/launch-terminal',body=b'{}',headers={'Cookie':new_cookie,'Content-Type':'application/json'}); status,_,_=response_body(conn.getresponse()); assert status==403
-            print('{"ok":true,"login":true,"secureCookie":true,"passwordChange":true,"sessionRotation":true,"dashboardControls":true,"csrfControls":true}')
+            body=json.dumps({'owner':'DashboardManualTest','project':'manual','command':'true','jobClass':'test'}).encode()
+            conn.request('POST','/control/worker/2/submit-job',body=body,headers={'Cookie':new_cookie,'X-CSRF-Token':re.search(r'const csrf="([^"]+)"',sched.dashboard_html(sched.verify_session(new_cookie.split('=',1)[1]))).group(1),'Content-Type':'application/json','Content-Length':str(len(body))}); status,_,payload=response_body(conn.getresponse()); assert status==202; job=json.loads(payload); assert job['requestedStation']==2 and job['owner']=='DashboardManualTest'
+            conn.request('GET','/dashboard/history/2',headers={'Cookie':new_cookie}); status,_,payload=response_body(conn.getresponse()); assert status==200 and json.loads(payload)['station']==2
+            print('{"ok":true,"login":true,"secureCookie":true,"passwordChange":true,"sessionRotation":true,"dashboardControls":true,"csrfControls":true,"pinnedSubmit":true,"historyRoute":true}')
         finally:
             conn.close(); server.shutdown(); server.server_close(); thread.join(timeout=2)
 if __name__=='__main__': main()

@@ -41,7 +41,11 @@ def main():
         sched = importlib.util.module_from_spec(spec); spec.loader.exec_module(sched)
         conn = sched.db()
         columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
-        assert {"chat_label", "chat_url"}.issubset(columns)
+        assert {"chat_label", "chat_url", "requested_station"}.issubset(columns)
+        usage_tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        assert "worker_usage" in usage_tables
+        backfill = conn.execute("SELECT * FROM worker_usage WHERE kind='job' AND ref_id='legacy'").fetchone()
+        assert backfill is not None and backfill["station"] == 1 and backfill["owner"] == "TestBot"
         row = conn.execute("SELECT * FROM jobs WHERE id='legacy'").fetchone()
         public = sched.public_job(row)
         assert public["owner"] == "TestBot"
@@ -58,8 +62,11 @@ def main():
         assert "Scheduler health & throughput" in html
         assert 'id="throughput-svg"' in html
         assert "Cancel job" in html and "Restart browser" in html and "Release lease" in html and "Job logs" in html
+        assert "Live six-VM status & controls" not in html
+        assert "Six KVM workstations" in html and "Run job on VM 1" in html and "Recent use" in html
+        assert 'id="submit-modal"' in html and 'id="history-modal"' in html
         assert "const csrf=\"test-csrf\"" in html
-        print('{"ok":true,"migration":true,"metrics":true,"publicStateRedacted":true,"svg":true,"controls":true}')
+        print('{"ok":true,"migration":true,"historyBackfill":true,"metrics":true,"publicStateRedacted":true,"svg":true,"integratedControls":true}')
 
 
 if __name__ == "__main__":

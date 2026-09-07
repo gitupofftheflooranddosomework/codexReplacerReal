@@ -101,7 +101,7 @@ The live Codex Replacer VM is tuned for interactive latency as well as throughpu
 
 ## Codex computer lab
 
-Codex Replacer 2.1 uses a **six-computer persistent KVM lab** as its primary parallel-work backend. The older Docker workstation pool still exists for lightweight compatibility/on-demand isolation, but it is not prewarmed and should not be used for CPU-heavy work.
+Codex Replacer 2.2 uses a **six-computer persistent KVM lab** as its primary parallel-work backend. The older Docker workstation pool still exists for lightweight compatibility/on-demand isolation, but it is not prewarmed and should not be used for CPU-heavy work.
 
 ### Six persistent KVM computers
 
@@ -122,11 +122,14 @@ The browser/workstation golden image is `codex-lab-base-browser-v2.qcow2`. `lab/
 
 ### Watch all six computers
 
-`https://browser.home.markshaw.ca/` is the authenticated six-screen operations dashboard. It updates every two seconds and has three layers: **scheduler health/throughput**, **per-VM identity/status/controls**, and the six live noVNC desktops. Every VM card shows CPU, RAM, root-disk usage, uptime, Linux/Docker/browser readiness, active job or interactive lease, elapsed time, and the stable `owner` bot/agent name. Scheduled jobs and interactive leases can also carry `chatLabel` and `chatUrl`; when a real `https://chatgpt.com/...` URL is supplied, the VM card exposes an **open chat** link. The MCP tunnel does not expose a ChatGPT conversation ID automatically, so agents are instructed to pass real chat metadata when available and never invent it. The dashboard uses its own HTML login page rather than HTTP Basic Auth: username `mark`, a salted PBKDF2-SHA256 password verifier stored in `/tank/vm/codex-lab/dashboard-auth.json` with mode `0600`, 12-hour signed sessions in a host-only `Secure; HttpOnly; SameSite=Strict` cookie, login throttling, and a built-in password-change page. Password changes rotate the session secret and invalidate other sessions. Plaintext passwords are never stored in the auth file.
+`https://browser.home.markshaw.ca/` is the authenticated six-screen operations dashboard. The old detached six-VM status grid is gone: **each live noVNC screen is now its own complete workstation card**. Directly around that screen are the current bot/chat owner, project/chat label and optional chat link, job/lease state and elapsed time, CPU/RAM/disk/uptime, Linux/Docker/browser readiness, controls, and the VM's recent-use history. This keeps the telemetry and controls visually attached to the computer they describe instead of duplicating the six machines in a separate panel. Scheduled jobs and interactive leases can carry `chatLabel` and `chatUrl`; when a real `https://chatgpt.com/...` URL is supplied, the card and history expose an **open chat** link. The MCP tunnel does not expose a trustworthy ChatGPT conversation ID automatically, so agents pass real chat metadata when available and never invent it. The dashboard uses its own HTML login page rather than HTTP Basic Auth: username `mark`, a salted PBKDF2-SHA256 password verifier stored in `/tank/vm/codex-lab/dashboard-auth.json` with mode `0600`, 12-hour signed sessions in a host-only `Secure; HttpOnly; SameSite=Strict` cookie, login throttling, and a built-in password-change page. Password changes rotate the session secret and invalidate other sessions. Plaintext passwords are never stored in the auth file.
 
 The legacy direct hostnames `browser1.home.markshaw.ca` through `browser6.home.markshaw.ca` and `browser-controller.home.markshaw.ca` only redirect to canonical paths on `browser.home.markshaw.ca`. This keeps the auth cookie scoped to one hostname instead of sending it to unrelated `*.home.markshaw.ca` services. For administrative recovery, `lab/reset-dashboard-auth.py --generate` can reset the `mark` login and invalidate all existing sessions if the password is forgotten again.
 
-Each VM card has direct operational controls: **Desktop**, **Terminal** (launches an `xterm` on that VM's visible desktop), **Job logs** for the active scheduled job, **Restart browser**, **Cancel job**, and **Release lease**. Mutating dashboard actions are POST-only and require the signed dashboard session plus its CSRF token. Job-log responses are deliberately redacted to owner/project/chat/status/timestamps plus stdout/stderr; stored commands and environment variables are not returned to the human dashboard endpoint.
+Each VM card has direct operational controls: **Desktop**, **Terminal** (launches an `xterm` on that VM's visible desktop), **Run job on VM N**, **History**, **Job logs** for the active scheduled job, **Restart browser**, **Cancel job**, and **Release lease**. The Run Job form creates a real scheduler job with `requested_station=N`; if that computer is busy, the job waits specifically for it and the card shows the pinned queue, while normal automatic jobs continue using the other free workers. Mutating dashboard actions are POST-only and require the signed dashboard session plus its CSRF token. Job-log responses are deliberately redacted to owner/project/chat/status/timestamps plus stdout/stderr; stored commands and environment variables are not returned to the human dashboard endpoint.
+
+
+Chat-to-VM history is durable in the scheduler's `worker_usage` table. A row represents one actual assignment session rather than a noisy event stream: scheduled jobs open the row when they start and close it on success/failure/timeout/cancel; interactive/browser leases open on `vm_lab_acquire` and close on release/expiry/lost-lock recovery. The migration backfills prior scheduled jobs, and `lab/backfill-lease-history.py` imports the existing `/tank/codex-lab-vm/sign-in-out.jsonl` audit so history predates v2.2. Each card shows its three most recent users inline, with a History dialog for the longer list.
 
 The scheduler metrics panel shows loop health/age/error count, 5-minute jobs/minute throughput, queue-delay average/p95, 1-hour success rate, six-worker utilization, runtime average/p95, oldest queued age, and a live inline **SVG** history covering the last 30 minutes. The SVG renders completed jobs/minute as bars, failed jobs as an overlay, and average queue delay as a line. Metrics are derived from the existing SQLite job history, so they survive scheduler restarts; process-loop health is live runtime state.
 
@@ -145,8 +148,8 @@ Long or CPU-heavy transferable work should use `vm_job_submit` instead of runnin
 - database: `/tank/vm/codex-lab/scheduler.sqlite3`
 - source: `lab/scheduler.py`
 - one heavy scheduled job per KVM worker at a time
-- FIFO queue when all six workers are busy
-- least-recently-used free-worker selection
+- automatic jobs remain FIFO and use least-recently-used free workers
+- dashboard-pinned jobs reserve their requested worker first; pinned jobs to a busy worker wait without blocking automatic work on the other workers
 - transient per-job systemd units on the worker at nice level 5 / CPUWeight 80
 - durable stdout/stderr and exit status under the worker's `~/.local/share/codex-worker/jobs/`
 - persistent per-worker Git mirror cache so repeated repository jobs avoid full network/object downloads
@@ -191,6 +194,9 @@ python3 codex-replacer/concurrency-test.py
 python3 codex-replacer/http-concurrency-test.py
 python3 codex-replacer/host-exec-promotion-test.py
 python3 codex-replacer/smoke-test.py
+python3 lab/pinned-scheduler-test.py
+python3 lab/dashboard-metrics-test.py
+python3 lab/auth-smoke-test.py
 python3 lab/scheduler-smoke-test.py --jobs 6 --sleep 2
 python3 lab/scheduler-smoke-test.py --jobs 12 --sleep 2
 ```

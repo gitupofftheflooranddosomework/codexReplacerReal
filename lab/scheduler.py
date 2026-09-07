@@ -19,6 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
 
+SCHEDULER_VERSION = "2.2.0"
 HOST = os.environ.get("CODEX_LAB_SCHEDULER_HOST", "0.0.0.0")
 PORT = int(os.environ.get("CODEX_LAB_SCHEDULER_PORT", "8766"))
 DB_PATH = Path(os.environ.get("CODEX_LAB_SCHEDULER_DB", "/tank/vm/codex-lab/scheduler.sqlite3"))
@@ -290,6 +291,7 @@ def db():
           repo_url TEXT,
           revision TEXT,
           status TEXT NOT NULL,
+          requested_station INTEGER,
           station INTEGER,
           unit_name TEXT,
           exit_code INTEGER,
@@ -302,9 +304,40 @@ def db():
         conn.execute("ALTER TABLE jobs ADD COLUMN chat_label TEXT")
     if "chat_url" not in columns:
         conn.execute("ALTER TABLE jobs ADD COLUMN chat_url TEXT")
+    if "requested_station" not in columns:
+        conn.execute("ALTER TABLE jobs ADD COLUMN requested_station INTEGER")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs(status, created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_finished ON jobs(finished_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_station_started ON jobs(station, started_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_requested_status ON jobs(requested_station, status, created_at)")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS worker_usage (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          kind TEXT NOT NULL,
+          ref_id TEXT NOT NULL,
+          station INTEGER NOT NULL,
+          started_at TEXT NOT NULL,
+          finished_at TEXT,
+          owner TEXT,
+          project TEXT,
+          chat_label TEXT,
+          chat_url TEXT,
+          status TEXT NOT NULL,
+          source TEXT NOT NULL DEFAULT 'scheduler',
+          UNIQUE(kind, ref_id)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_worker_usage_station_started ON worker_usage(station, started_at DESC)")
+    # Backfill prior scheduled jobs once so history exists immediately after the migration.
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO worker_usage(kind,ref_id,station,started_at,finished_at,owner,project,chat_label,chat_url,status,source)
+        SELECT 'job',id,station,COALESCE(started_at,created_at),finished_at,owner,project,chat_label,chat_url,status,'scheduler-backfill'
+        FROM jobs WHERE station IS NOT NULL AND COALESCE(started_at,created_at) IS NOT NULL
+        """
+    )
     conn.commit()
     return conn
 
@@ -349,6 +382,7 @@ def job_row(row):
         out["env"] = {}
     out["chatLabel"] = out.pop("chat_label", None)
     out["chatUrl"] = out.pop("chat_url", None)
+    out["requestedStation"] = out.pop("requested_station", None)
     station = out.get("station")
     if station:
         out["worker"] = worker_name(station)
@@ -364,9 +398,100 @@ def public_job(row):
     keep = (
         "id", "created_at", "updated_at", "started_at", "finished_at", "owner", "project",
         "chatLabel", "chatUrl", "job_class", "status", "station", "worker", "workerIp",
-        "browserUrl", "exit_code", "error",
+        "browserUrl", "requestedStation", "exit_code", "error",
     )
     return {key: job.get(key) for key in keep if key in job}
+
+
+def usage_row(row):
+    if row is None:
+        return None
+    out = dict(row)
+    out["chatLabel"] = out.pop("chat_label", None)
+    out["chatUrl"] = out.pop("chat_url", None)
+    return out
+
+
+def record_usage_start(conn, kind, ref_id, station, owner=None, project=None, chat_label=None, chat_url=None, started_at=None, source="scheduler"):
+    station = int(station)
+    if not 1 <= station <= MAX_STATIONS:
+        raise ValueError(f"station must be 1..{MAX_STATIONS}")
+    stamp = started_at or now_iso()
+    conn.execute(
+        """
+        INSERT INTO worker_usage(kind,ref_id,station,started_at,finished_at,owner,project,chat_label,chat_url,status,source)
+        VALUES(?,?,?,?,?,?,?,?,?,'running',?)
+        ON CONFLICT(kind,ref_id) DO UPDATE SET
+          station=excluded.station,
+          started_at=COALESCE(worker_usage.started_at,excluded.started_at),
+          finished_at=NULL,
+          owner=COALESCE(excluded.owner,worker_usage.owner),
+          project=COALESCE(excluded.project,worker_usage.project),
+          chat_label=COALESCE(excluded.chat_label,worker_usage.chat_label),
+          chat_url=COALESCE(excluded.chat_url,worker_usage.chat_url),
+          status='running',
+          source=excluded.source
+        """,
+        (kind, str(ref_id), station, stamp, None, owner, project, chat_label, chat_url, source),
+    )
+
+
+def record_usage_end(conn, kind, ref_id, status, finished_at=None):
+    stamp = finished_at or now_iso()
+    conn.execute(
+        "UPDATE worker_usage SET status=?, finished_at=COALESCE(finished_at,?) WHERE kind=? AND ref_id=?",
+        (str(status), stamp, str(kind), str(ref_id)),
+    )
+
+
+def worker_usage_history(conn, station, limit=8):
+    rows = conn.execute(
+        "SELECT * FROM worker_usage WHERE station=? ORDER BY started_at DESC, id DESC LIMIT ?",
+        (int(station), max(1, min(int(limit), 100))),
+    ).fetchall()
+    return [usage_row(row) for row in rows]
+
+
+def record_external_usage(payload):
+    action = str(payload.get("action") or "").strip()
+    kind = str(payload.get("kind") or "lease").strip() or "lease"
+    ref_id = str(payload.get("refId") or "").strip()
+    station = int(payload.get("station") or 0)
+    if not ref_id or not 1 <= station <= MAX_STATIONS:
+        raise ValueError("refId and valid station are required")
+    with DB_LOCK:
+        conn = db()
+        if action == "start":
+            record_usage_start(
+                conn, kind, ref_id, station,
+                owner=str(payload.get("owner") or "").strip() or None,
+                project=str(payload.get("project") or "").strip() or None,
+                chat_label=str(payload.get("chatLabel") or "").strip() or None,
+                chat_url=str(payload.get("chatUrl") or "").strip() or None,
+                started_at=str(payload.get("startedAt") or "").strip() or None,
+                source=str(payload.get("source") or "controller"),
+            )
+        elif action == "end":
+            # If the start event was missed, create a minimal row before ending it.
+            existing = conn.execute("SELECT 1 FROM worker_usage WHERE kind=? AND ref_id=?", (kind, ref_id)).fetchone()
+            if not existing:
+                record_usage_start(
+                    conn, kind, ref_id, station,
+                    owner=str(payload.get("owner") or "").strip() or None,
+                    project=str(payload.get("project") or "").strip() or None,
+                    chat_label=str(payload.get("chatLabel") or "").strip() or None,
+                    chat_url=str(payload.get("chatUrl") or "").strip() or None,
+                    started_at=str(payload.get("startedAt") or payload.get("finishedAt") or "").strip() or None,
+                    source=str(payload.get("source") or "controller"),
+                )
+            record_usage_end(conn, kind, ref_id, str(payload.get("status") or "released"), str(payload.get("finishedAt") or "").strip() or None)
+        else:
+            conn.close()
+            raise ValueError("action must be start or end")
+        conn.commit()
+        row = conn.execute("SELECT * FROM worker_usage WHERE kind=? AND ref_id=?", (kind, ref_id)).fetchone()
+        conn.close()
+    return usage_row(row)
 
 
 def parse_time(value):
@@ -598,6 +723,12 @@ fi
         "UPDATE jobs SET status='running', station=?, unit_name=?, started_at=?, updated_at=?, error=NULL WHERE id=?",
         (station, unit, stamp, stamp, job_id),
     )
+    record_usage_start(
+        conn, "job", job_id, station,
+        owner=job.get("owner"), project=job.get("project"),
+        chat_label=job.get("chat_label"), chat_url=job.get("chat_url"),
+        started_at=stamp, source="scheduler",
+    )
     conn.commit()
     return True
 
@@ -637,7 +768,35 @@ def reconcile_running(conn):
             "UPDATE jobs SET status=?, exit_code=?, finished_at=?, updated_at=? WHERE id=?",
             (status, rc, stamp, stamp, job["id"]),
         )
+        record_usage_end(conn, "job", job["id"], status, stamp)
     conn.commit()
+
+
+def plan_assignments(queued, stations):
+    remaining = list(stations)
+    assignments = []
+    # A pinned job reserves its requested worker before automatic jobs are
+    # placed. Other workers remain available, so pinning one station never
+    # serializes or blocks the rest of the fleet.
+    for job in queued:
+        requested = job.get("requested_station")
+        if requested is None:
+            continue
+        requested = int(requested)
+        if requested not in remaining:
+            continue
+        assignments.append((job, requested))
+        remaining.remove(requested)
+        if not remaining:
+            return assignments
+    for job in queued:
+        if not remaining:
+            break
+        if job.get("requested_station") is not None:
+            continue
+        station = remaining.pop(0)
+        assignments.append((job, station))
+    return assignments
 
 
 def dispatch(conn):
@@ -645,10 +804,9 @@ def dispatch(conn):
     if not stations:
         return
     queued = [dict(row) for row in conn.execute(
-        "SELECT * FROM jobs WHERE status='queued' ORDER BY created_at LIMIT ?",
-        (len(stations),),
+        "SELECT * FROM jobs WHERE status='queued' ORDER BY created_at"
     )]
-    assignments = list(zip(queued, stations))
+    assignments = plan_assignments(queued, stations)
     if not assignments:
         return
 
@@ -784,9 +942,19 @@ def state_payload():
         recent = [public_job(row) for row in conn.execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT 20")]
         queued = conn.execute("SELECT COUNT(*) FROM jobs WHERE status='queued'").fetchone()[0]
         metrics = scheduler_metrics(conn)
+        usage = {station: worker_usage_history(conn, station, 8) for station in range(1, MAX_STATIONS + 1)}
+        pinned_queued = {station: [] for station in range(1, MAX_STATIONS + 1)}
+        for row in conn.execute("SELECT * FROM jobs WHERE status='queued' AND requested_station IS NOT NULL ORDER BY created_at"):
+            station = int(row["requested_station"])
+            if station in pinned_queued:
+                pinned_queued[station].append(public_job(row))
         conn.close()
     with ThreadPoolExecutor(max_workers=MAX_STATIONS) as pool:
         workers = list(pool.map(lambda station: worker_probe(station, active.get(station)), range(1, MAX_STATIONS + 1)))
+    for worker in workers:
+        station = int(worker["station"])
+        worker["history"] = usage.get(station, [])
+        worker["queuedPinned"] = pinned_queued.get(station, [])
     ready = sum(bool(worker.get("ready")) for worker in workers)
     workstation_ready = sum(bool(worker.get("workstationReady")) for worker in workers)
     browser_ready = sum(bool(worker.get("browserReady")) for worker in workers)
@@ -819,6 +987,13 @@ def submit_job(payload):
     command = str(payload.get("command") or "").strip()
     if not owner or not command:
         raise ValueError("owner and command are required")
+    requested_station = payload.get("requestedStation")
+    if requested_station not in (None, ""):
+        requested_station = int(requested_station)
+        if not 1 <= requested_station <= MAX_STATIONS:
+            raise ValueError(f"requestedStation must be 1..{MAX_STATIONS}")
+    else:
+        requested_station = None
     job_id = uuid.uuid4().hex
     stamp = now_iso()
     env = payload.get("env") if isinstance(payload.get("env"), dict) else {}
@@ -828,12 +1003,12 @@ def submit_job(payload):
         str(payload.get("chatUrl") or "").strip() or None,
         str(payload.get("jobClass") or "cpu"), command, str(payload.get("cwd") or "/workspace"),
         json.dumps(env, separators=(",", ":")), max(1, min(int(payload.get("timeout", 3600)), 86400)),
-        str(payload.get("repoUrl") or "") or None, str(payload.get("revision") or "") or None, "queued",
+        str(payload.get("repoUrl") or "") or None, str(payload.get("revision") or "") or None, "queued", requested_station,
     )
     with DB_LOCK:
         conn = db()
         conn.execute(
-            "INSERT INTO jobs(id,created_at,updated_at,owner,project,chat_label,chat_url,job_class,command,cwd,env_json,timeout_seconds,repo_url,revision,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO jobs(id,created_at,updated_at,owner,project,chat_label,chat_url,job_class,command,cwd,env_json,timeout_seconds,repo_url,revision,status,requested_station) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             record,
         )
         conn.commit()
@@ -886,11 +1061,24 @@ def cancel_job(job_id):
             ssh(station, f"sudo systemctl stop {shlex.quote(row['unit_name'])} 2>/dev/null || true; rm -f /home/mark/.local/share/codex-worker/scheduler.lock", timeout=8)
         stamp = now_iso()
         conn.execute("UPDATE jobs SET status='canceled', finished_at=?, updated_at=? WHERE id=?", (stamp, stamp, job_id))
+        if row["station"]:
+            record_usage_end(conn, "job", job_id, "canceled", stamp)
         conn.commit()
         out = job_row(conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
         conn.close()
         WAKE.set()
         return out
+
+
+def dashboard_history(station, limit=50):
+    station = int(station)
+    if not 1 <= station <= MAX_STATIONS:
+        raise ValueError(f"station must be 1..{MAX_STATIONS}")
+    with DB_LOCK:
+        conn = db()
+        rows = worker_usage_history(conn, station, limit)
+        conn.close()
+    return {"station": station, "history": rows}
 
 
 def dashboard_job(job_id, max_bytes=32768):
@@ -901,6 +1089,15 @@ def dashboard_job(job_id, max_bytes=32768):
     public["stdoutTail"] = job.get("stdoutTail", "")
     public["stderrTail"] = job.get("stderrTail", "")
     return public
+
+
+def submit_worker_job(station, payload):
+    station = int(station)
+    if not 1 <= station <= MAX_STATIONS:
+        raise ValueError(f"station must be 1..{MAX_STATIONS}")
+    body = dict(payload or {})
+    body["requestedStation"] = station
+    return public_job(submit_job(body))
 
 
 def worker_control(station, action):
@@ -951,63 +1148,73 @@ def worker_control(station, action):
 
 
 def dashboard_html(session):
-    fleet = "".join(f"""
-      <article class="fleet-node" id="fleet-{i}">
-        <div class="fleet-head"><span class="dot"></span><strong>VM {i}</strong><span class="fleet-state">checking</span></div>
-        <div class="identity"><strong class="identity-owner">Idle</strong><span class="identity-project">No bot assigned</span><a class="identity-chat" target="_blank" rel="noreferrer" hidden>open chat</a></div>
-        <div class="meters"><div><span>CPU</span><b class="cpu">—</b></div><div><span>RAM</span><b class="ram">—</b></div><div><span>Disk</span><b class="disk">—</b></div></div>
-        <div class="services"><span class="svc workstation">Linux</span><span class="svc docker">Docker</span><span class="svc browser">Browser</span></div>
-        <div class="fleet-job">No active job</div>
-        <div class="node-actions">
-          <a class="mini" target="_blank" href="/vm{i}/vnc.html?autoconnect=1&resize=scale&path=vm{i}/websockify">Desktop</a>
-          <button class="mini terminal" data-station="{i}" data-action="launch-terminal">Terminal</button>
-          <button class="mini logs" data-station="{i}" data-view="logs" hidden>Job logs</button>
-          <button class="mini restart" data-station="{i}" data-action="restart-browser">Restart browser</button>
-          <button class="mini danger cancel" data-station="{i}" data-action="cancel-job" hidden>Cancel job</button>
-          <button class="mini danger release" data-station="{i}" data-action="release-lease" hidden>Release lease</button>
-        </div>
-      </article>""" for i in range(1, MAX_STATIONS + 1))
     cards = "".join(f"""
       <section class="worker" id="worker-{i}">
-        <header><span class="dot"></span><strong>Worker {i}</strong><span class="meta">loading…</span><a target="_blank" href="/vm{i}/vnc.html?autoconnect=1&resize=scale&path=vm{i}/websockify">full screen</a></header>
+        <header class="worker-head">
+          <span class="dot"></span><strong>VM {i}</strong><span class="worker-state">checking</span>
+          <span class="worker-owner">Idle</span><span class="spacer"></span>
+          <a class="screen-link" target="_blank" href="/vm{i}/vnc.html?autoconnect=1&resize=scale&path=vm{i}/websockify">full screen</a>
+        </header>
         <iframe src="/vm{i}/vnc.html?autoconnect=1&resize=scale&path=vm{i}/websockify" loading="eager" title="Codex worker {i}"></iframe>
-        <footer><span class="job">No active job</span><span class="who"></span></footer>
+        <div class="cockpit">
+          <div class="identity-row">
+            <div class="identity-main"><span>Current bot / chat</span><strong class="identity-owner">Idle</strong><small class="identity-project">No bot assigned</small></div>
+            <a class="identity-chat" target="_blank" rel="noreferrer" hidden>open chat</a>
+            <div class="activity">No active job</div>
+          </div>
+          <div class="status-row">
+            <div class="meter"><span>CPU</span><b class="cpu">—</b></div>
+            <div class="meter"><span>RAM</span><b class="ram">—</b></div>
+            <div class="meter"><span>Disk</span><b class="disk">—</b></div>
+            <div class="meter"><span>Uptime</span><b class="uptime">—</b></div>
+            <div class="services"><span class="svc workstation">Linux</span><span class="svc docker">Docker</span><span class="svc browser">Browser</span></div>
+          </div>
+          <div class="worker-actions">
+            <a class="mini" target="_blank" href="/vm{i}/vnc.html?autoconnect=1&resize=scale&path=vm{i}/websockify">Desktop</a>
+            <button class="mini terminal" data-station="{i}" data-action="launch-terminal">Terminal</button>
+            <button class="mini primary run-job" data-station="{i}" data-view="submit">Run job on VM {i}</button>
+            <button class="mini history" data-station="{i}" data-view="history">History</button>
+            <button class="mini logs" data-station="{i}" data-view="logs" hidden>Job logs</button>
+            <button class="mini restart" data-station="{i}" data-action="restart-browser">Restart browser</button>
+            <button class="mini danger cancel" data-station="{i}" data-action="cancel-job" hidden>Cancel job</button>
+            <button class="mini danger release" data-station="{i}" data-action="release-lease" hidden>Release lease</button>
+          </div>
+          <div class="history-inline"><span class="history-label">Recent use</span><div class="history-items"><span class="history-empty">No history yet</span></div></div>
+        </div>
       </section>""" for i in range(1, MAX_STATIONS + 1))
     csrf_json = json.dumps(str(session.get("csrf") or ""))
     return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Codex KVM Lab</title><style>
-:root{{color-scheme:dark;background:#0b0d10;color:#e7edf5;font-family:Inter,system-ui,sans-serif}}*{{box-sizing:border-box}}body{{margin:0;background:#0b0d10}}button{{font:inherit}}nav{{position:sticky;top:0;z-index:9;background:#11161def;padding:10px 14px;backdrop-filter:blur(10px);display:flex;gap:14px;align-items:center;border-bottom:1px solid #27303a}}nav h1{{font-size:16px;margin:0}}#summary{{font-size:12px;color:#aab6c3}}#dispatch{{font-size:11px;padding:4px 8px;border:1px solid #31503d;border-radius:999px;background:#153221;color:#9ef0bd}}#dispatch.bad{{border-color:#713744;background:#391b23;color:#ffc0c9}}nav a{{color:#9dc9ff;text-decoration:none}}nav .spacer{{margin-left:auto}}.section{{padding:12px 10px 2px}}.section-title{{display:flex;align-items:center;gap:10px;margin:0 2px 9px}}.section-title h2{{font-size:13px;margin:0}}.section-title span{{font-size:11px;color:#8190a0}}.metrics{{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px;margin-bottom:8px}}.metric{{background:#11161d;border:1px solid #27303a;border-radius:10px;padding:10px;min-width:0}}.metric span{{display:block;color:#7e8c9c;font-size:9px;text-transform:uppercase;letter-spacing:.06em}}.metric strong{{display:block;font-size:18px;margin-top:3px}}.metric small{{display:block;color:#8290a0;font-size:9px;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}.metric.good strong{{color:#80e0a8}}.metric.warn strong{{color:#ffd078}}.metric.bad strong{{color:#ff8995}}.graph-wrap{{background:#11161d;border:1px solid #27303a;border-radius:10px;padding:10px}}.graph-head{{display:flex;gap:16px;align-items:center;font-size:10px;color:#8391a1;margin-bottom:4px}}.legend{{display:inline-flex;gap:4px;align-items:center}}.legend i{{width:8px;height:8px;border-radius:2px;background:#3895e8}}.legend.queue i{{background:#45d08b}}.legend.fail i{{background:#e65e70}}#throughput-svg{{display:block;width:100%;height:130px;overflow:visible}}.fleet{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}}.fleet-node{{background:#11161d;border:1px solid #27303a;border-radius:10px;padding:10px;min-width:0}}.fleet-head{{display:flex;gap:6px;align-items:center;font-size:12px}}.fleet-state{{margin-left:auto;color:#8795a5;font-size:10px}}.dot{{width:8px;height:8px;border-radius:50%;background:#7d8793;flex:0 0 auto}}.ready .dot{{background:#36d37e;box-shadow:0 0 8px #36d37e88}}.busy .dot{{background:#ffc857;box-shadow:0 0 8px #ffc85788}}.down .dot{{background:#ff5d6c}}.installing .dot{{background:#5ba7ff;box-shadow:0 0 8px #5ba7ff88}}.identity{{display:grid;grid-template-columns:minmax(0,1fr) auto;column-gap:8px;margin-top:8px;padding:7px;background:#0b0f14;border-radius:7px;min-height:47px}}.identity-owner{{font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}.identity-project{{grid-column:1/2;font-size:9px;color:#8795a5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}.identity-chat{{grid-column:2;grid-row:1/3;align-self:center;color:#8fc5ff;font-size:9px;text-decoration:none}}.meters{{display:grid;grid-template-columns:repeat(3,1fr);gap:5px;margin-top:8px}}.meters div{{background:#0b0f14;border-radius:6px;padding:5px}}.meters span{{display:block;color:#728090;font-size:8px;text-transform:uppercase;letter-spacing:.06em}}.meters b{{font-size:11px}}.services{{display:flex;gap:4px;flex-wrap:wrap;margin-top:7px}}.svc{{font-size:8px;border:1px solid #3a4654;border-radius:999px;padding:2px 5px;color:#7e8b99}}.svc.ok{{border-color:#2c6a49;color:#8edcae;background:#173122}}.fleet-job{{font-size:9px;color:#8593a3;margin-top:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}.node-actions{{display:flex;gap:5px;flex-wrap:wrap;margin-top:8px}}.mini{{appearance:none;border:1px solid #344354;background:#151c25;color:#b9d6f5;border-radius:6px;padding:5px 7px;font-size:9px;text-decoration:none;cursor:pointer}}.mini:hover{{background:#1c2734}}.mini:disabled{{opacity:.4;cursor:not-allowed}}.mini.danger{{border-color:#65343e;color:#ffb5bf;background:#2a171b}}main{{padding:10px;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}}.worker{{background:#11161d;border:1px solid #27303a;border-radius:10px;overflow:hidden;min-width:0}}header{{height:34px;display:flex;align-items:center;gap:8px;padding:0 10px;font-size:12px}}header a{{margin-left:auto;color:#9dc9ff;text-decoration:none}}.meta{{color:#8f9daa;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}iframe{{display:block;width:100%;aspect-ratio:16/10;border:0;background:#050607}}footer{{min-height:34px;padding:7px 10px;font-size:10px;color:#aab6c3;display:flex;justify-content:space-between;gap:10px;border-top:1px solid #202832}}footer span{{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}footer .who{{color:#8fc5ff}}#toast{{position:fixed;right:16px;bottom:16px;z-index:20;max-width:360px;background:#16202b;border:1px solid #3a4a5c;border-radius:9px;padding:10px 12px;font-size:11px;box-shadow:0 12px 40px #0008;display:none}}#toast.bad{{border-color:#7d3947;background:#32191e;color:#ffc5cc}}.modal{{position:fixed;inset:0;z-index:30;background:#000a;display:none;place-items:center;padding:20px}}.modal.open{{display:grid}}.modal-card{{width:min(980px,100%);max-height:88vh;background:#0e141b;border:1px solid #344252;border-radius:12px;box-shadow:0 24px 80px #000c;overflow:hidden;display:flex;flex-direction:column}}.modal-head{{display:flex;gap:10px;align-items:center;padding:10px 12px;border-bottom:1px solid #28323e;font-size:11px}}.modal-head strong{{font-size:12px}}.modal-head .spacer{{flex:1}}.modal pre{{margin:0;padding:12px;overflow:auto;min-height:240px;white-space:pre-wrap;word-break:break-word;font:11px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;color:#cdd8e4}}.stderr{{color:#ffabb5}}@media(max-width:1350px){{.metrics{{grid-template-columns:repeat(3,1fr)}}}}@media(max-width:1200px){{main{{grid-template-columns:repeat(2,minmax(0,1fr))}}}}@media(max-width:900px){{.fleet{{grid-template-columns:repeat(2,1fr)}}}}@media(max-width:760px){{.metrics{{grid-template-columns:repeat(2,1fr)}}.fleet{{grid-template-columns:1fr}}main{{grid-template-columns:1fr}}#dispatch{{display:none}}}}@media(max-width:460px){{.metrics{{grid-template-columns:1fr}}}}
+:root{{color-scheme:dark;background:#0b0d10;color:#e7edf5;font-family:Inter,system-ui,sans-serif}}*{{box-sizing:border-box}}body{{margin:0;background:#0b0d10}}button,input,textarea,select{{font:inherit}}nav{{position:sticky;top:0;z-index:9;background:#11161def;padding:10px 14px;backdrop-filter:blur(10px);display:flex;gap:14px;align-items:center;border-bottom:1px solid #27303a}}nav h1{{font-size:16px;margin:0}}#summary{{font-size:12px;color:#aab6c3}}#dispatch{{font-size:11px;padding:4px 8px;border:1px solid #31503d;border-radius:999px;background:#153221;color:#9ef0bd}}#dispatch.bad{{border-color:#713744;background:#391b23;color:#ffc0c9}}nav a{{color:#9dc9ff;text-decoration:none}}nav .spacer,.worker-head .spacer{{margin-left:auto}}.section{{padding:12px 10px 2px}}.section-title{{display:flex;align-items:center;gap:10px;margin:0 2px 9px}}.section-title h2{{font-size:13px;margin:0}}.section-title span{{font-size:11px;color:#8190a0}}.metrics{{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px;margin-bottom:8px}}.metric{{background:#11161d;border:1px solid #27303a;border-radius:10px;padding:10px;min-width:0}}.metric span{{display:block;color:#7e8c9c;font-size:9px;text-transform:uppercase;letter-spacing:.06em}}.metric strong{{display:block;font-size:18px;margin-top:3px}}.metric small{{display:block;color:#8290a0;font-size:9px;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}.metric.good strong{{color:#80e0a8}}.metric.warn strong{{color:#ffd078}}.metric.bad strong{{color:#ff8995}}.graph-wrap{{background:#11161d;border:1px solid #27303a;border-radius:10px;padding:10px}}.graph-head{{display:flex;gap:16px;align-items:center;font-size:10px;color:#8391a1;margin-bottom:4px}}.legend{{display:inline-flex;gap:4px;align-items:center}}.legend i{{width:8px;height:8px;border-radius:2px;background:#3895e8}}.legend.queue i{{background:#45d08b}}.legend.fail i{{background:#e65e70}}#throughput-svg{{display:block;width:100%;height:120px;overflow:visible}}main{{padding:10px;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}}.worker{{background:#11161d;border:1px solid #27303a;border-radius:12px;overflow:hidden;min-width:0;box-shadow:0 8px 30px #0002}}.worker-head{{min-height:38px;display:flex;align-items:center;gap:7px;padding:0 10px;font-size:11px;border-bottom:1px solid #202832}}.worker-head strong{{font-size:13px}}.worker-state{{color:#8593a3}}.worker-owner{{color:#b5c5d6;max-width:130px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}.screen-link{{color:#9dc9ff;text-decoration:none}}.dot{{width:8px;height:8px;border-radius:50%;background:#7d8793;flex:0 0 auto}}.ready .dot{{background:#36d37e;box-shadow:0 0 8px #36d37e88}}.busy .dot{{background:#ffc857;box-shadow:0 0 8px #ffc85788}}.down .dot{{background:#ff5d6c}}.installing .dot{{background:#5ba7ff;box-shadow:0 0 8px #5ba7ff88}}iframe{{display:block;width:100%;aspect-ratio:16/10;border:0;background:#050607}}.cockpit{{border-top:1px solid #202832}}.identity-row{{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px 10px;padding:9px 10px;background:#0e1319}}.identity-main span{{display:block;color:#728090;font-size:8px;text-transform:uppercase;letter-spacing:.06em}}.identity-main strong{{display:block;font-size:11px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}.identity-main small{{display:block;color:#8795a5;font-size:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}.identity-chat{{grid-column:2;grid-row:1/2;align-self:center;color:#8fc5ff;font-size:9px;text-decoration:none}}.activity{{grid-column:1/3;color:#9aa8b7;font-size:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}.status-row{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr)) auto;gap:5px;padding:7px 10px;align-items:stretch}}.meter{{background:#0b0f14;border-radius:6px;padding:5px}}.meter span{{display:block;color:#728090;font-size:8px;text-transform:uppercase;letter-spacing:.05em}}.meter b{{font-size:10px}}.services{{display:flex;gap:3px;align-items:center;justify-content:flex-end;flex-wrap:wrap}}.svc{{font-size:8px;border:1px solid #3a4654;border-radius:999px;padding:2px 5px;color:#7e8b99}}.svc.ok{{border-color:#2c6a49;color:#8edcae;background:#173122}}.worker-actions{{display:flex;gap:5px;flex-wrap:wrap;padding:6px 10px 8px}}.mini{{appearance:none;border:1px solid #344354;background:#151c25;color:#b9d6f5;border-radius:6px;padding:5px 7px;font-size:9px;text-decoration:none;cursor:pointer}}.mini:hover{{background:#1c2734}}.mini:disabled{{opacity:.4;cursor:not-allowed}}.mini.primary{{border-color:#2c6a49;background:#153221;color:#a9efc3}}.mini.danger{{border-color:#65343e;color:#ffb5bf;background:#2a171b}}.history-inline{{border-top:1px solid #202832;padding:7px 10px;display:grid;grid-template-columns:auto 1fr;gap:8px;align-items:start;min-height:34px}}.history-label{{font-size:8px;text-transform:uppercase;letter-spacing:.06em;color:#728090;padding-top:2px}}.history-items{{display:flex;gap:5px;min-width:0;overflow:hidden}}.history-chip{{border:1px solid #2c3743;background:#0c1117;border-radius:6px;padding:3px 5px;min-width:0;max-width:32%;font-size:8px;color:#a9b7c5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}.history-chip a{{color:#8fc5ff;text-decoration:none}}.history-empty{{font-size:8px;color:#65717e;padding-top:2px}}#toast{{position:fixed;right:16px;bottom:16px;z-index:40;max-width:360px;background:#16202b;border:1px solid #3a4a5c;border-radius:9px;padding:10px 12px;font-size:11px;box-shadow:0 12px 40px #0008;display:none}}#toast.bad{{border-color:#7d3947;background:#32191e;color:#ffc5cc}}.modal{{position:fixed;inset:0;z-index:30;background:#000a;display:none;place-items:center;padding:20px}}.modal.open{{display:grid}}.modal-card{{width:min(920px,100%);max-height:90vh;background:#0e141b;border:1px solid #344252;border-radius:12px;box-shadow:0 24px 80px #000c;overflow:hidden;display:flex;flex-direction:column}}.modal-card.narrow{{width:min(700px,100%)}}.modal-head{{display:flex;gap:10px;align-items:center;padding:10px 12px;border-bottom:1px solid #28323e;font-size:11px}}.modal-head strong{{font-size:12px}}.modal-head .spacer{{flex:1}}.modal pre{{margin:0;padding:12px;overflow:auto;min-height:240px;white-space:pre-wrap;word-break:break-word;font:11px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;color:#cdd8e4}}.form-grid{{padding:12px;display:grid;grid-template-columns:1fr 1fr;gap:10px;overflow:auto}}.field{{display:flex;flex-direction:column;gap:4px}}.field.wide{{grid-column:1/3}}.field label{{font-size:9px;color:#8997a7}}.field input,.field textarea,.field select{{width:100%;background:#090d12;border:1px solid #344150;color:#dce5ef;border-radius:7px;padding:7px;font-size:10px}}.field textarea{{min-height:150px;resize:vertical;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}}.form-note{{font-size:9px;color:#8391a0;grid-column:1/3}}.form-actions{{grid-column:1/3;display:flex;justify-content:flex-end;gap:8px}}.history-modal-list{{padding:8px 12px 14px;overflow:auto}}.history-row{{display:grid;grid-template-columns:110px 80px minmax(0,1fr) auto;gap:8px;align-items:center;border-bottom:1px solid #202832;padding:7px 0;font-size:9px}}.history-row .when{{color:#758291}}.history-row .kind{{text-transform:uppercase;color:#8ba1b7}}.history-row strong{{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}.history-row small{{display:block;color:#7f8d9b;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}.history-row a{{color:#8fc5ff;text-decoration:none}}@media(max-width:1400px){{.metrics{{grid-template-columns:repeat(3,1fr)}}main{{grid-template-columns:repeat(2,minmax(0,1fr))}}}}@media(max-width:850px){{main{{grid-template-columns:1fr}}.status-row{{grid-template-columns:repeat(4,1fr)}}.services{{grid-column:1/5;justify-content:flex-start}}}}@media(max-width:700px){{.metrics{{grid-template-columns:repeat(2,1fr)}}.form-grid{{grid-template-columns:1fr}}.field.wide,.form-note,.form-actions{{grid-column:1}}}}@media(max-width:460px){{.metrics{{grid-template-columns:1fr}}.history-row{{grid-template-columns:75px 60px minmax(0,1fr)}}.history-row>a{{grid-column:3}}}}
 </style></head><body><nav><h1>Codex KVM Lab</h1><span id="dispatch">AUTO · 6-way scheduler</span><span id="summary">loading…</span><span class="spacer"></span><a href="/controller/vnc.html?autoconnect=1&resize=scale&path=controller/websockify" target="_blank">controller</a><a href="/change-password">password</a><a href="/logout">sign out</a></nav>
 <section class="section"><div class="section-title"><h2>Scheduler health & throughput</h2><span id="timestamp">updating…</span></div><div class="metrics">
-<div class="metric" id="m-health"><span>Scheduler</span><strong>—</strong><small>loop health</small></div>
-<div class="metric" id="m-throughput"><span>Throughput</span><strong>—</strong><small>jobs/min · 5m</small></div>
-<div class="metric" id="m-queue"><span>Queue p95</span><strong>—</strong><small>start delay · 5m</small></div>
-<div class="metric" id="m-success"><span>Success</span><strong>—</strong><small>completed · 1h</small></div>
-<div class="metric" id="m-util"><span>Worker utilization</span><strong>—</strong><small>six VMs · 5m</small></div>
-<div class="metric" id="m-runtime"><span>Runtime p95</span><strong>—</strong><small>job duration · 1h</small></div>
-</div><div class="graph-wrap"><div class="graph-head"><span>Last 30 minutes</span><span class="legend"><i></i>completed/min</span><span class="legend fail"><i></i>failed</span><span class="legend queue"><i></i>avg queue ms</span></div><svg id="throughput-svg" viewBox="0 0 600 130" preserveAspectRatio="none" aria-label="Scheduler throughput history"></svg></div></section>
-<section class="section"><div class="section-title"><h2>Live six-VM status & controls</h2><span>bot/chat ownership + direct controls</span></div><div class="fleet">{fleet}</div></section><main>{cards}</main><div id="job-modal" class="modal"><section class="modal-card"><div class="modal-head"><strong id="job-modal-title">Job logs</strong><span id="job-modal-meta"></span><span class="spacer"></span><button class="mini" id="job-refresh">Refresh</button><button class="mini" id="job-close">Close</button></div><pre id="job-output">Loading…</pre></section></div><div id="toast"></div>
+<div class="metric" id="m-health"><span>Scheduler</span><strong>—</strong><small>loop health</small></div><div class="metric" id="m-throughput"><span>Throughput</span><strong>—</strong><small>jobs/min · 5m</small></div><div class="metric" id="m-queue"><span>Queue p95</span><strong>—</strong><small>start delay · 5m</small></div><div class="metric" id="m-success"><span>Success</span><strong>—</strong><small>completed · 1h</small></div><div class="metric" id="m-util"><span>Worker utilization</span><strong>—</strong><small>six VMs · 5m</small></div><div class="metric" id="m-runtime"><span>Runtime p95</span><strong>—</strong><small>job duration · 1h</small></div>
+</div><div class="graph-wrap"><div class="graph-head"><span>Last 30 minutes</span><span class="legend"><i></i>completed/min</span><span class="legend fail"><i></i>failed</span><span class="legend queue"><i></i>avg queue ms</span></div><svg id="throughput-svg" viewBox="0 0 600 120" preserveAspectRatio="none" aria-label="Scheduler throughput history"></svg></div></section>
+<section class="section"><div class="section-title"><h2>Six KVM workstations</h2><span>status, ownership, controls and history are attached to each live screen</span></div></section><main>{cards}</main>
+<div id="job-modal" class="modal"><section class="modal-card"><div class="modal-head"><strong id="job-modal-title">Job logs</strong><span id="job-modal-meta"></span><span class="spacer"></span><button class="mini" id="job-refresh">Refresh</button><button class="mini" id="job-close">Close</button></div><pre id="job-output">Loading…</pre></section></div>
+<div id="history-modal" class="modal"><section class="modal-card"><div class="modal-head"><strong id="history-title">VM history</strong><span class="spacer"></span><button class="mini" id="history-close">Close</button></div><div id="history-list" class="history-modal-list">Loading…</div></section></div>
+<div id="submit-modal" class="modal"><section class="modal-card narrow"><div class="modal-head"><strong id="submit-title">Run job</strong><span class="spacer"></span><button class="mini" id="submit-close">Close</button></div><form id="submit-form" class="form-grid"><input type="hidden" id="submit-station"><div class="field"><label>Bot / owner</label><input id="submit-owner" required value="Mark Dashboard"></div><div class="field"><label>Project</label><input id="submit-project" placeholder="optional project"></div><div class="field"><label>Chat label</label><input id="submit-chat-label" placeholder="optional chat title"></div><div class="field"><label>Chat URL</label><input id="submit-chat-url" type="url" placeholder="https://chatgpt.com/..."></div><div class="field"><label>Job class</label><select id="submit-class"><option>test</option><option>build</option><option selected>cpu</option><option>io</option><option>browser</option></select></div><div class="field"><label>Timeout seconds</label><input id="submit-timeout" type="number" min="1" max="86400" value="3600"></div><div class="field wide"><label>Working directory</label><input id="submit-cwd" value="/workspace"></div><div class="field wide"><label>Command</label><textarea id="submit-command" required placeholder="npm test"></textarea></div><div class="form-note" id="submit-note">This job is pinned to the selected VM. If that VM is busy, it waits for that VM; normal agent jobs continue using automatic six-way scheduling.</div><div class="form-actions"><button type="button" class="mini" id="submit-cancel">Cancel</button><button type="submit" class="mini primary">Queue on this VM</button></div></form></section></div>
+<div id="toast"></div>
 <script>
-const csrf={csrf_json};const NS='http://www.w3.org/2000/svg';let lastState=null;
-const pct=v=>v==null?'—':`${{Math.round(v)}}%`;const gib=v=>v==null?'—':`${{Number(v).toFixed(0)}}G`;const ms=v=>v==null?'—':v<1000?`${{Math.round(v)}}ms`:`${{(v/1000).toFixed(v<10000?1:0)}}s`;function uptime(s){{if(!s)return'—';const d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60);return d?`${{d}}d ${{h}}h`:h?`${{h}}h ${{m}}m`:`${{m}}m`;}}function elapsed(iso){{if(!iso)return'';const sec=Math.max(0,(Date.now()-Date.parse(iso))/1000);return uptime(sec)}}
+const csrf={csrf_json};const NS='http://www.w3.org/2000/svg';let lastState=null,logJobId=null;
+const pct=v=>v==null?'—':`${{Math.round(v)}}%`;const gib=v=>v==null?'—':`${{Number(v).toFixed(0)}}G`;const ms=v=>v==null?'—':v<1000?`${{Math.round(v)}}ms`:`${{(v/1000).toFixed(v<10000?1:0)}}s`;function uptime(s){{if(!s)return'—';const d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60);return d?`${{d}}d ${{h}}h`:h?`${{h}}h ${{m}}m`:`${{m}}m`;}}function elapsed(iso){{if(!iso)return'';return uptime(Math.max(0,(Date.now()-Date.parse(iso))/1000))}}function when(iso){{if(!iso)return'—';const sec=Math.max(0,(Date.now()-Date.parse(iso))/1000);return sec<86400?`${{uptime(sec)}} ago`:new Date(iso).toLocaleDateString()}}function validChat(url){{return typeof url==='string'&&(url.startsWith('https://chatgpt.com/')||url.startsWith('https://chat.openai.com/'))}}
 function toast(message,bad=false){{const el=document.getElementById('toast');el.textContent=message;el.classList.toggle('bad',bad);el.style.display='block';clearTimeout(el._t);el._t=setTimeout(()=>el.style.display='none',4000)}}
-function validChat(url){{return typeof url==='string'&&(url.startsWith('https://chatgpt.com/')||url.startsWith('https://chat.openai.com/'))}}
-async function action(station,name){{const confirmText=name==='cancel-job'?'Cancel the running job on VM '+station+'?':name==='release-lease'?'Release the interactive bot/browser lease on VM '+station+'?':name==='restart-browser'?'Restart the visible browser desktop on VM '+station+'? This will interrupt any browser automation currently using it.':null;if(confirmText&&!confirm(confirmText))return;try{{const r=await fetch(`/control/worker/${{station}}/${{name}}`,{{method:'POST',headers:{{'X-CSRF-Token':csrf,'Content-Type':'application/json'}},body:'{{}}'}});const d=await r.json();if(!r.ok)throw new Error(d.error||`HTTP ${{r.status}}`);toast(`VM ${{station}}: ${{name.replaceAll('-',' ')}} complete`);if(name==='launch-terminal')window.open(`/vm${{station}}/vnc.html?autoconnect=1&resize=scale&path=vm${{station}}/websockify`,'_blank');setTimeout(refresh,150)}}catch(e){{toast(`VM ${{station}}: ${{e.message}}`,true)}}}}
-let logJobId=null;async function showLogs(station){{const w=(lastState?.workers||[]).find(x=>x.station===station),id=w?.activeJob?.id;if(!id)return toast(`VM ${{station}} has no active scheduled job`,true);logJobId=id;document.getElementById('job-modal').classList.add('open');document.getElementById('job-modal-title').textContent=`VM ${{station}} · ${{w.activeJob.owner||'job'}}`;await refreshLogs()}}async function refreshLogs(){{if(!logJobId)return;const out=document.getElementById('job-output');try{{const r=await fetch(`/dashboard/job/${{encodeURIComponent(logJobId)}}`,{{cache:'no-store'}}),d=await r.json();if(!r.ok)throw new Error(d.error||`HTTP ${{r.status}}`);document.getElementById('job-modal-meta').textContent=`${{d.status||''}} · ${{d.project||d.job_class||''}}`;const stderr=d.stderrTail?`
-
---- STDERR ---
-${{d.stderrTail}}`:'';out.textContent=(d.stdoutTail||'(no stdout yet)')+stderr}}catch(e){{out.textContent=`Could not load logs: ${{e.message}}`}}}}function closeLogs(){{logJobId=null;document.getElementById('job-modal').classList.remove('open')}}document.addEventListener('click',e=>{{const actionButton=e.target.closest('button[data-action]');if(actionButton)action(Number(actionButton.dataset.station),actionButton.dataset.action);const viewButton=e.target.closest('button[data-view="logs"]');if(viewButton)showLogs(Number(viewButton.dataset.station))}});document.getElementById('job-refresh').addEventListener('click',refreshLogs);document.getElementById('job-close').addEventListener('click',closeLogs);document.getElementById('job-modal').addEventListener('click',e=>{{if(e.target.id==='job-modal')closeLogs()}});
-function metric(id,value,detail,kind=''){{const el=document.getElementById(id);el.classList.remove('good','warn','bad');if(kind)el.classList.add(kind);el.querySelector('strong').textContent=value;el.querySelector('small').textContent=detail}}
-function renderSvg(history){{const svg=document.getElementById('throughput-svg');svg.replaceChildren();if(!history||!history.length)return;const w=600,h=130,pad=8,base=112;const maxJobs=Math.max(1,...history.map(x=>x.completed||0));const maxQueue=Math.max(1,...history.map(x=>x.avgQueueMs||0));const bw=(w-pad*2)/history.length;history.forEach((x,i)=>{{const bh=(x.completed||0)/maxJobs*78;const rect=document.createElementNS(NS,'rect');rect.setAttribute('x',pad+i*bw+1);rect.setAttribute('y',base-bh);rect.setAttribute('width',Math.max(1,bw-2));rect.setAttribute('height',bh);rect.setAttribute('fill','#3895e8');rect.setAttribute('rx','1');svg.appendChild(rect);if(x.failed){{const fh=Math.max(4,Math.min(bh,(x.failed/maxJobs)*78));const fail=document.createElementNS(NS,'rect');fail.setAttribute('x',pad+i*bw+1);fail.setAttribute('y',base-fh);fail.setAttribute('width',Math.max(1,bw-2));fail.setAttribute('height',fh);fail.setAttribute('fill','#e65e70');svg.appendChild(fail)}}}});const points=history.map((x,i)=>`${{pad+i*bw+bw/2}},${{base-(x.avgQueueMs||0)/maxQueue*78}}`).join(' ');const line=document.createElementNS(NS,'polyline');line.setAttribute('points',points);line.setAttribute('fill','none');line.setAttribute('stroke','#45d08b');line.setAttribute('stroke-width','2');line.setAttribute('vector-effect','non-scaling-stroke');svg.appendChild(line);const axis=document.createElementNS(NS,'line');axis.setAttribute('x1',pad);axis.setAttribute('x2',w-pad);axis.setAttribute('y1',base);axis.setAttribute('y2',base);axis.setAttribute('stroke','#344150');axis.setAttribute('stroke-width','1');svg.appendChild(axis)}}
-function updateMetrics(s){{const m=s.metrics||{{}},w5=(m.windows||{{}})['5m']||{{}},w1=(m.windows||{{}})['1h']||{{}};const health=m.loopHealthy&&s.scheduler?.healthy;metric('m-health',health?'Healthy':'Degraded',`${{ms(m.loopAgeMs)}} loop age · ${{m.errors||0}} errors`,health?'good':'bad');metric('m-throughput',`${{Number(w5.jobsPerMinute||0).toFixed(2)}}`,` ${{w5.completed||0}} completed / 5m`,w5.jobsPerMinute>0?'good':'');metric('m-queue',ms(w5.p95QueueMs),`avg ${{ms(w5.avgQueueMs)}} · oldest ${{ms(m.oldestQueuedMs)}}`,(w5.p95QueueMs||0)>3000?'warn':'good');metric('m-success',w1.successRatePercent==null?'—':`${{w1.successRatePercent}}%`,`${{w1.succeeded||0}} ok · ${{w1.failed||0}} failed`,w1.failed?'warn':'good');metric('m-util',`${{w5.workerUtilizationPercent??0}}%`,`${{s.scheduler?.busy??0}} busy · ${{s.scheduler?.free??0}} free`);metric('m-runtime',ms(w1.p95RuntimeMs),`avg ${{ms(w1.avgRuntimeMs)}} · 1h`);renderSvg(m.history)}}
-function updateWorker(w){{const busy=!!(w.activeJob||w.exclusive||w.schedulerBusy),installing=w.ready&&!w.workstationReady,cls=!w.ready?'down':installing?'installing':busy?'busy':'ready';const identity=w.activeJob||w.lease||null;const owner=identity?.owner||(w.schedulerBusy?'Scheduled job':'Idle');const project=identity?.project||identity?.chatLabel||(identity?'No project label':'No bot assigned');const chatUrl=identity?.chatUrl;const fleet=document.getElementById(`fleet-${{w.station}}`);fleet.classList.remove('ready','busy','down','installing');fleet.classList.add(cls);fleet.querySelector('.fleet-state').textContent=!w.ready?w.state:installing?'installing':busy?'busy':`ready · ${{uptime(w.uptimeSeconds)}}`;fleet.querySelector('.cpu').textContent=pct(w.cpuPercent);fleet.querySelector('.ram').textContent=pct(w.memUsedPercent);fleet.querySelector('.disk').textContent=pct(w.diskUsedPercent);fleet.querySelector('.workstation').classList.toggle('ok',!!w.workstationReady);fleet.querySelector('.docker').classList.toggle('ok',!!w.dockerReady);fleet.querySelector('.browser').classList.toggle('ok',!!w.browserReady);fleet.querySelector('.identity-owner').textContent=owner;fleet.querySelector('.identity-project').textContent=project;const chat=fleet.querySelector('.identity-chat');if(validChat(chatUrl)){{chat.href=chatUrl;chat.textContent=identity.chatLabel?'open chat':'chat';chat.hidden=false}}else{{chat.hidden=true;chat.removeAttribute('href')}}const age=w.activeJob?elapsed(w.activeJob.started_at):w.lease?elapsed(w.lease.acquiredAt):'';fleet.querySelector('.fleet-job').textContent=w.activeJob?`${{w.activeJob.job_class||'job'}} · ${{w.activeJob.status}} · ${{age}}`:w.lease?`Interactive/browser lease · ${{age}}`:w.schedulerBusy?'Scheduled job':'No active job';fleet.querySelector('.cancel').hidden=!w.activeJob;fleet.querySelector('.logs').hidden=!w.activeJob;fleet.querySelector('.release').hidden=!w.lease;fleet.querySelector('.terminal').disabled=!w.ready;fleet.querySelector('.restart').disabled=!w.browserReady;const el=document.getElementById(`worker-${{w.station}}`);el.classList.remove('ready','busy','down','installing');el.classList.add(cls);el.querySelector('.meta').textContent=w.ready?`CPU ${{pct(w.cpuPercent)}} · RAM ${{pct(w.memUsedPercent)}} · ${{gib(w.diskAvailableGiB)}} free`:`${{w.state}}`;el.querySelector('.job').textContent=w.activeJob?`${{w.activeJob.project||w.activeJob.job_class||'job'}} · ${{w.activeJob.status}} · ${{age}}`:w.lease?`Interactive lease · ${{w.lease.project||'browser'}} · ${{age}}`:installing?'Linux workstation installing':'No active job';el.querySelector('.who').textContent=identity?.owner||''}}
+async function action(station,name){{const confirmText=name==='cancel-job'?`Cancel the running job on VM ${{station}}?`:name==='release-lease'?`Release the interactive bot/browser lease on VM ${{station}}?`:name==='restart-browser'?`Restart the visible browser desktop on VM ${{station}}?`:null;if(confirmText&&!confirm(confirmText))return;try{{const r=await fetch(`/control/worker/${{station}}/${{name}}`,{{method:'POST',headers:{{'X-CSRF-Token':csrf,'Content-Type':'application/json'}},body:'{{}}'}}),d=await r.json();if(!r.ok)throw new Error(d.error||`HTTP ${{r.status}}`);toast(`VM ${{station}}: ${{name.replaceAll('-',' ')}} complete`);if(name==='launch-terminal')window.open(`/vm${{station}}/vnc.html?autoconnect=1&resize=scale&path=vm${{station}}/websockify`,'_blank');setTimeout(refresh,150)}}catch(e){{toast(`VM ${{station}}: ${{e.message}}`,true)}}}}
+async function showLogs(station){{const w=(lastState?.workers||[]).find(x=>x.station===station),id=w?.activeJob?.id;if(!id)return toast(`VM ${{station}} has no active scheduled job`,true);logJobId=id;document.getElementById('job-modal').classList.add('open');document.getElementById('job-modal-title').textContent=`VM ${{station}} · ${{w.activeJob.owner||'job'}}`;await refreshLogs()}}async function refreshLogs(){{if(!logJobId)return;const out=document.getElementById('job-output');try{{const r=await fetch(`/dashboard/job/${{encodeURIComponent(logJobId)}}`,{{cache:'no-store'}}),d=await r.json();if(!r.ok)throw new Error(d.error||`HTTP ${{r.status}}`);document.getElementById('job-modal-meta').textContent=`${{d.status||''}} · ${{d.project||d.job_class||''}}`;out.textContent=(d.stdoutTail||'(no stdout yet)')+(d.stderrTail?`\n\n--- STDERR ---\n${{d.stderrTail}}`:'')}}catch(e){{out.textContent=`Could not load logs: ${{e.message}}`}}}}function closeLogs(){{logJobId=null;document.getElementById('job-modal').classList.remove('open')}}
+function historyRow(item){{const row=document.createElement('div');row.className='history-row';const t=document.createElement('span');t.className='when';t.textContent=when(item.started_at);const k=document.createElement('span');k.className='kind';k.textContent=`${{item.kind}} · ${{item.status}}`;const who=document.createElement('div');const strong=document.createElement('strong');strong.textContent=item.owner||'unknown';const small=document.createElement('small');small.textContent=item.chatLabel||item.project||'no project/chat label';who.append(strong,small);row.append(t,k,who);if(validChat(item.chatUrl)){{const a=document.createElement('a');a.href=item.chatUrl;a.target='_blank';a.rel='noreferrer';a.textContent='open chat';row.appendChild(a)}}return row}}
+async function showHistory(station){{const modal=document.getElementById('history-modal'),list=document.getElementById('history-list');document.getElementById('history-title').textContent=`VM ${{station}} · chat / bot history`;list.textContent='Loading…';modal.classList.add('open');try{{const r=await fetch(`/dashboard/history/${{station}}`,{{cache:'no-store'}}),d=await r.json();if(!r.ok)throw new Error(d.error||`HTTP ${{r.status}}`);list.replaceChildren();if(!d.history?.length)list.textContent='No recorded use yet.';else d.history.forEach(item=>list.appendChild(historyRow(item)))}}catch(e){{list.textContent=`Could not load history: ${{e.message}}`}}}}function closeHistory(){{document.getElementById('history-modal').classList.remove('open')}}
+function openSubmit(station){{document.getElementById('submit-station').value=station;document.getElementById('submit-title').textContent=`Run job on VM ${{station}}`;document.getElementById('submit-note').textContent=`Pinned to VM ${{station}}. If it is busy, this job waits for VM ${{station}} while automatic jobs continue using the other free workers.`;document.getElementById('submit-modal').classList.add('open');document.getElementById('submit-command').focus()}}function closeSubmit(){{document.getElementById('submit-modal').classList.remove('open')}}
+async function submitPinned(e){{e.preventDefault();const station=Number(document.getElementById('submit-station').value),owner=document.getElementById('submit-owner').value.trim(),command=document.getElementById('submit-command').value;if(!owner||!command.trim())return toast('Owner and command are required',true);const payload={{owner,project:document.getElementById('submit-project').value.trim()||null,chatLabel:document.getElementById('submit-chat-label').value.trim()||null,chatUrl:document.getElementById('submit-chat-url').value.trim()||null,jobClass:document.getElementById('submit-class').value,cwd:document.getElementById('submit-cwd').value.trim()||'/workspace',timeout:Number(document.getElementById('submit-timeout').value)||3600,command}};try{{const r=await fetch(`/control/worker/${{station}}/submit-job`,{{method:'POST',headers:{{'X-CSRF-Token':csrf,'Content-Type':'application/json'}},body:JSON.stringify(payload)}}),d=await r.json();if(!r.ok)throw new Error(d.error||`HTTP ${{r.status}}`);localStorage.setItem('codexDashboardOwner',owner);toast(`Queued ${{d.id?.slice(0,8)||'job'}} for VM ${{station}}`);document.getElementById('submit-command').value='';closeSubmit();setTimeout(refresh,100)}}catch(err){{toast(`Could not queue VM ${{station}} job: ${{err.message}}`,true)}}}}
+function metric(id,value,detail,kind=''){{const el=document.getElementById(id);el.classList.remove('good','warn','bad');if(kind)el.classList.add(kind);el.querySelector('strong').textContent=value;el.querySelector('small').textContent=detail}}function renderSvg(history){{const svg=document.getElementById('throughput-svg');svg.replaceChildren();if(!history?.length)return;const w=600,pad=8,base=105,maxJobs=Math.max(1,...history.map(x=>x.completed||0)),maxQueue=Math.max(1,...history.map(x=>x.avgQueueMs||0)),bw=(w-pad*2)/history.length;history.forEach((x,i)=>{{const bh=(x.completed||0)/maxJobs*72,rect=document.createElementNS(NS,'rect');rect.setAttribute('x',pad+i*bw+1);rect.setAttribute('y',base-bh);rect.setAttribute('width',Math.max(1,bw-2));rect.setAttribute('height',bh);rect.setAttribute('fill','#3895e8');svg.appendChild(rect);if(x.failed){{const fail=document.createElementNS(NS,'rect'),fh=Math.max(4,Math.min(bh,(x.failed/maxJobs)*72));fail.setAttribute('x',pad+i*bw+1);fail.setAttribute('y',base-fh);fail.setAttribute('width',Math.max(1,bw-2));fail.setAttribute('height',fh);fail.setAttribute('fill','#e65e70');svg.appendChild(fail)}}}});const line=document.createElementNS(NS,'polyline');line.setAttribute('points',history.map((x,i)=>`${{pad+i*bw+bw/2}},${{base-(x.avgQueueMs||0)/maxQueue*72}}`).join(' '));line.setAttribute('fill','none');line.setAttribute('stroke','#45d08b');line.setAttribute('stroke-width','2');line.setAttribute('vector-effect','non-scaling-stroke');svg.appendChild(line)}}function updateMetrics(s){{const m=s.metrics||{{}},w5=(m.windows||{{}})['5m']||{{}},w1=(m.windows||{{}})['1h']||{{}},health=m.loopHealthy&&s.scheduler?.healthy;metric('m-health',health?'Healthy':'Degraded',`${{ms(m.loopAgeMs)}} loop age · ${{m.errors||0}} errors`,health?'good':'bad');metric('m-throughput',`${{Number(w5.jobsPerMinute||0).toFixed(2)}}`,`${{w5.completed||0}} completed / 5m`,w5.jobsPerMinute>0?'good':'');metric('m-queue',ms(w5.p95QueueMs),`avg ${{ms(w5.avgQueueMs)}} · oldest ${{ms(m.oldestQueuedMs)}}`,(w5.p95QueueMs||0)>3000?'warn':'good');metric('m-success',w1.successRatePercent==null?'—':`${{w1.successRatePercent}}%`,`${{w1.succeeded||0}} ok · ${{w1.failed||0}} failed`,w1.failed?'warn':'good');metric('m-util',`${{w5.workerUtilizationPercent??0}}%`,`${{s.scheduler?.busy??0}} busy · ${{s.scheduler?.free??0}} free`);metric('m-runtime',ms(w1.p95RuntimeMs),`avg ${{ms(w1.avgRuntimeMs)}} · 1h`);renderSvg(m.history)}}
+function renderInlineHistory(el,history){{el.replaceChildren();if(!history?.length){{const empty=document.createElement('span');empty.className='history-empty';empty.textContent='No history yet';el.appendChild(empty);return}}history.slice(0,3).forEach(item=>{{const chip=document.createElement('span');chip.className='history-chip';chip.title=`${{item.kind}} · ${{item.status}} · ${{item.project||''}}`;if(validChat(item.chatUrl)){{const a=document.createElement('a');a.href=item.chatUrl;a.target='_blank';a.rel='noreferrer';a.textContent=item.owner||item.chatLabel||'chat';chip.appendChild(a)}}else chip.textContent=item.owner||item.chatLabel||item.project||item.kind;el.appendChild(chip)}})}}
+function updateWorker(w){{const busy=!!(w.activeJob||w.exclusive||w.schedulerBusy),installing=w.ready&&!w.workstationReady,cls=!w.ready?'down':installing?'installing':busy?'busy':'ready',identity=w.activeJob||w.lease||null,owner=identity?.owner||(w.schedulerBusy?'Scheduled job':'Idle'),project=identity?.chatLabel||identity?.project||(identity?'No project/chat label':'No bot assigned'),chatUrl=identity?.chatUrl,el=document.getElementById(`worker-${{w.station}}`);el.classList.remove('ready','busy','down','installing');el.classList.add(cls);el.querySelector('.worker-state').textContent=!w.ready?w.state:installing?'installing':busy?'busy':`ready`;el.querySelector('.worker-owner').textContent=owner;el.querySelector('.identity-owner').textContent=owner;el.querySelector('.identity-project').textContent=project;const chat=el.querySelector('.identity-chat');if(validChat(chatUrl)){{chat.href=chatUrl;chat.textContent='open chat';chat.hidden=false}}else{{chat.hidden=true;chat.removeAttribute('href')}}const age=w.activeJob?elapsed(w.activeJob.started_at):w.lease?elapsed(w.lease.acquiredAt):'';el.querySelector('.activity').textContent=w.activeJob?`${{w.activeJob.job_class||'job'}} · ${{w.activeJob.status}} · ${{age}}${{w.activeJob.requestedStation?` · pinned VM ${{w.activeJob.requestedStation}}`:''}}`:w.lease?`Interactive/browser lease · ${{age}}`:w.schedulerBusy?'Scheduled job':w.queuedPinned?.length?`${{w.queuedPinned.length}} pinned job${{w.queuedPinned.length===1?'':'s'}} waiting · next: ${{w.queuedPinned[0].owner||'unknown'}}`:'No active job';el.querySelector('.cpu').textContent=pct(w.cpuPercent);el.querySelector('.ram').textContent=pct(w.memUsedPercent);el.querySelector('.disk').textContent=pct(w.diskUsedPercent);el.querySelector('.uptime').textContent=uptime(w.uptimeSeconds);el.querySelector('.workstation').classList.toggle('ok',!!w.workstationReady);el.querySelector('.docker').classList.toggle('ok',!!w.dockerReady);el.querySelector('.browser').classList.toggle('ok',!!w.browserReady);el.querySelector('.cancel').hidden=!w.activeJob;el.querySelector('.logs').hidden=!w.activeJob;el.querySelector('.release').hidden=!w.lease;el.querySelector('.terminal').disabled=!w.ready;el.querySelector('.restart').disabled=!w.browserReady;renderInlineHistory(el.querySelector('.history-items'),w.history)}}
 async function refresh(){{try{{const s=await fetch('/state.json',{{cache:'no-store'}}).then(r=>{{if(!r.ok)throw new Error(`HTTP ${{r.status}}`);return r.json()}});lastState=s;const sched=s.scheduler||{{}};document.getElementById('summary').textContent=`${{sched.ready??0}}/6 ready · ${{sched.busy??0}} busy · ${{s.queuedJobs}} queued`;const badge=document.getElementById('dispatch');badge.textContent=`AUTO · ${{sched.capacity||6}}-way · ${{sched.free??0}} free`;badge.classList.toggle('bad',!sched.healthy);document.getElementById('timestamp').textContent=`updated ${{new Date(s.time).toLocaleTimeString()}}`;updateMetrics(s);for(const w of s.workers)updateWorker(w)}}catch(e){{document.getElementById('summary').textContent='status unavailable';toast(`Status refresh failed: ${{e.message}}`,true)}}}}
-refresh();setInterval(refresh,2000);
+document.addEventListener('click',e=>{{const a=e.target.closest('button[data-action]');if(a)action(Number(a.dataset.station),a.dataset.action);const v=e.target.closest('button[data-view]');if(v?.dataset.view==='logs')showLogs(Number(v.dataset.station));if(v?.dataset.view==='history')showHistory(Number(v.dataset.station));if(v?.dataset.view==='submit')openSubmit(Number(v.dataset.station))}});document.getElementById('job-refresh').addEventListener('click',refreshLogs);document.getElementById('job-close').addEventListener('click',closeLogs);document.getElementById('history-close').addEventListener('click',closeHistory);document.getElementById('submit-close').addEventListener('click',closeSubmit);document.getElementById('submit-cancel').addEventListener('click',closeSubmit);document.getElementById('submit-form').addEventListener('submit',submitPinned);for(const id of ['job-modal','history-modal','submit-modal'])document.getElementById(id).addEventListener('click',e=>{{if(e.target.id===id)document.getElementById(id).classList.remove('open')}});const savedOwner=localStorage.getItem('codexDashboardOwner');if(savedOwner)document.getElementById('submit-owner').value=savedOwner;refresh();setInterval(refresh,2000);
 </script></body></html>"""
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "CodexLabScheduler/2.1.0"
+    server_version = f"CodexLabScheduler/{SCHEDULER_VERSION}"
 
     def log_message(self, fmt, *args):
         print(json.dumps({"time": now_iso(), "event": "http", "client": self.client_ip(), "message": fmt % args}), flush=True)
@@ -1086,7 +1293,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         u = urlparse(self.path)
         if u.path == "/healthz":
-            return self.send_json({"ok": True, "service": "codex-lab-scheduler", "maxStations": MAX_STATIONS, "authConfigured": load_dashboard_auth() is not None})
+            return self.send_json({"ok": True, "service": "codex-lab-scheduler", "version": SCHEDULER_VERSION, "maxStations": MAX_STATIONS, "authConfigured": load_dashboard_auth() is not None})
         if u.path == "/auth/check":
             if self.session():
                 self.send_response(204); self.send_header("Cache-Control", "no-store"); self.security_headers(); self.end_headers(); return
@@ -1113,6 +1320,13 @@ class Handler(BaseHTTPRequestHandler):
             job_id = u.path.rsplit("/", 1)[-1]
             job = dashboard_job(job_id)
             return self.send_json(job or {"error": "not found"}, 200 if job else 404)
+        if u.path.startswith("/dashboard/history/"):
+            if not self.session():
+                return self.send_json({"error": "unauthorized"}, 401)
+            try:
+                return self.send_json(dashboard_history(int(u.path.rsplit("/", 1)[-1]), 50))
+            except ValueError as exc:
+                return self.send_json({"error": str(exc)}, 400)
         if u.path == "/state.json":
             if not self.session():
                 return self.send_json({"error": "unauthorized"}, 401)
@@ -1129,6 +1343,11 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/jobs":
             q = parse_qs(u.query)
             return self.send_json({"jobs": list_jobs((q.get("status") or [None])[0], (q.get("limit") or [50])[0])})
+        if u.path.startswith("/api/history/"):
+            station = int(u.path.rsplit("/", 1)[-1])
+            with DB_LOCK:
+                conn = db(); rows = worker_usage_history(conn, station, 100); conn.close()
+            return self.send_json({"station": station, "history": rows})
         if u.path.startswith("/api/jobs/"):
             job_id = u.path.split("/")[3]
             q = parse_qs(u.query)
@@ -1187,7 +1406,12 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) != 4:
                 return self.send_json({"error": "invalid worker action path"}, 404)
             try:
-                result = worker_control(int(parts[2]), parts[3])
+                station = int(parts[2]); action = parts[3]
+                if action == "submit-job":
+                    payload = self.read_json()
+                    result = submit_worker_job(station, payload)
+                    return self.send_json(result, 202)
+                result = worker_control(station, action)
                 return self.send_json(result, 200)
             except ValueError as exc:
                 return self.send_json({"error": str(exc)}, 400)
@@ -1202,6 +1426,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if u.path == "/api/jobs":
                 return self.send_json(submit_job(payload), 202)
+            if u.path == "/api/usage":
+                return self.send_json(record_external_usage(payload), 202)
             if u.path.startswith("/api/jobs/") and u.path.endswith("/cancel"):
                 job_id = u.path.split("/")[3]
                 job = cancel_job(job_id)

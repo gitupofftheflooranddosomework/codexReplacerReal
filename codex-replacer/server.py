@@ -31,7 +31,7 @@ import vm_job_scheduler
 
 
 SERVER_NAME = "codex-replacer"
-SERVER_VERSION = "2.1.0"
+SERVER_VERSION = "2.2.0"
 DEFAULT_DIRECTORY = "/home/mark"
 MAX_CAPTURE_BYTES = 1 * 1024 * 1024
 HOST_EXEC_FOREGROUND_SECONDS = max(1, min(int(os.environ.get("CODEX_REPLACER_HOST_EXEC_FOREGROUND_SECONDS", "20")), 90))

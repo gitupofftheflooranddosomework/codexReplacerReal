@@ -7,6 +7,8 @@ import subprocess
 import tempfile
 import time
 import uuid
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -22,6 +24,7 @@ HOME_KEY = os.environ.get("CODEX_VM_LAB_HOME_KEY", "/home/mark/.ssh/id_ed25519_h
 GUEST_KEY = os.environ.get("CODEX_VM_LAB_GUEST_KEY", "/home/mark/.ssh/id_ed25519_codex_lab_vm")
 KNOWN_HOSTS = os.environ.get("CODEX_VM_LAB_KNOWN_HOSTS", "/home/mark/.ssh/codex_lab_known_hosts")
 REMOTE_CTL = os.environ.get("CODEX_VM_LAB_CTL", "/tank/vm/codex-lab/vm-labctl.sh")
+SCHEDULER_URL = os.environ.get("CODEX_LAB_SCHEDULER_URL", "http://192.168.122.1:8766").rstrip("/")
 
 
 def now(): return datetime.now(timezone.utc)
@@ -59,6 +62,39 @@ def save_state(state):
 def audit(event, **fields):
     ensure_dirs()
     with AUDIT_FILE.open("a") as h: h.write(json.dumps({"time":iso(),"event":event,**fields},separators=(",",":"))+"\n")
+
+def notify_usage(action, record, status=None, finished_at=None):
+    if not record or not record.get("leaseId") or not record.get("station"):
+        return False
+    payload = {
+        "action": str(action),
+        "kind": "lease",
+        "refId": str(record.get("leaseId")),
+        "station": int(record.get("station")),
+        "owner": record.get("owner"),
+        "project": record.get("project"),
+        "chatLabel": record.get("chatLabel"),
+        "chatUrl": record.get("chatUrl"),
+        "startedAt": record.get("acquiredAt"),
+        "finishedAt": finished_at,
+        "status": status,
+        "source": "vm-lab-controller",
+    }
+    data = json.dumps(payload, separators=(",", ":")).encode()
+    request = urllib.request.Request(
+        SCHEDULER_URL + "/api/usage",
+        data=data,
+        method="POST",
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=1.5) as response:
+            return 200 <= response.status < 300
+    except Exception:
+        # The local sign-in/out audit remains the source-of-truth fallback if
+        # the homeserver scheduler is temporarily unavailable.
+        return False
+
 
 def locked_state():
     ensure_dirs(); lock=LOCK_FILE.open("r+"); fcntl.flock(lock.fileno(), fcntl.LOCK_EX); return lock, load_state()
@@ -150,6 +186,7 @@ def reconcile_lost_leases(state):
             station=old.get("station"), leaseId=old.get("leaseId"),
             owner=old.get("owner"), project=old.get("project"), reason="remote-lock-lost",
         )
+        notify_usage("end", old, status="lost", finished_at=old.get("releasedAt"))
     if recovered:
         save_state(state)
     return recovered
@@ -180,6 +217,7 @@ def expire(state):
             "auto_sign_out", station=old.get("station"), leaseId=old.get("leaseId"),
             owner=old.get("owner"), project=old.get("project"), reason="expired",
         )
+        notify_usage("end", old, status="expired", finished_at=old.get("releasedAt"))
     if expired:
         save_state(state)
     return expired
@@ -231,6 +269,7 @@ def acquire(owner, project=None, ttl_minutes=180, chat_label=None, chat_url=None
             audit("sign_in", station=s, leaseId=lease, owner=owner, project=project or None,
                   chatLabel=str(chat_label or "").strip() or None,
                   chatUrl=str(chat_url or "").strip() or None, ttlMinutes=ttl)
+            notify_usage("start", r)
             return r.copy()
         raise RuntimeError(f"All {MAX_STATIONS} full-VM lab stations are leased")
     finally: unlock(lock)
@@ -258,6 +297,7 @@ def validate_lease(lease_id, station=None):
                 "auto_sign_out", station=old.get("station"), leaseId=old.get("leaseId"),
                 owner=old.get("owner"), project=old.get("project"), reason="remote-lock-lost",
             )
+            notify_usage("end", old, status="lost", finished_at=old.get("releasedAt"))
             raise KeyError(f"Lease {lease_id} no longer owns worker {old.get('station')}")
         return record.copy()
     finally:
@@ -287,6 +327,7 @@ def release(lease_id=None, station=None, reason="released", recycle=False):
             owner=old.get("owner"), project=old.get("project"), reason=reason,
             recycle=bool(recycle),
         )
+        notify_usage("end", old, status=str(reason or "released"), finished_at=record.get("releasedAt"))
     finally:
         unlock(lock)
     if recycle:
