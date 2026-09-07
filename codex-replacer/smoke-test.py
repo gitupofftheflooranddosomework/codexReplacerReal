@@ -84,6 +84,7 @@ def main():
             "fs_read", "fs_write", "fs_search", "host_exec", "process_start",
             "git", "github", "docker", "browser_navigate", "browser_take_screenshot",
             "prepare_chat_handoff", "chatgpt_start_chat", "chatgpt_browser_status", "chatgpt_auth_begin",
+            "lab_list", "lab_acquire", "lab_release", "lab_exec", "lab_gc",
         }
         missing = sorted(required - names)
         if missing:

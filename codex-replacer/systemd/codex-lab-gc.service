@@ -1,0 +1,10 @@
+[Unit]
+Description=Maintain Codex computer lab leases and prewarmed workers
+After=docker.service
+
+[Service]
+Type=oneshot
+Environment=CODEX_LAB_ROOT=/tank/codex-lab
+Environment=CODEX_LAB_MAX_STATIONS=6
+Environment=CODEX_LAB_PREWARM_STATIONS=4
+ExecStart=/usr/bin/env PYTHONPATH=%h/docker/markshaw-private-mcp/codex-replacer /usr/bin/python3 -c 'import lab_manager; lab_manager.collect()'

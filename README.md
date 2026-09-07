@@ -40,7 +40,63 @@ FlareSolverr describes itself as a proxy for bypassing Cloudflare/DDoS-GUARD cha
 Run:
 
 ```sh
-python3 -m py_compile codex-replacer/server.py codex-replacer/smoke-test.py
+python3 -m py_compile codex-replacer/server.py codex-replacer/lab_manager.py codex-replacer/smoke-test.py codex-replacer/concurrency-test.py
+python3 codex-replacer/concurrency-test.py
 python3 codex-replacer/smoke-test.py
-systemd-analyze --user verify codex-replacer/systemd/codex-chatgpt-browser.service
+systemd-analyze --user verify codex-replacer/systemd/codex-chatgpt-browser.service codex-replacer/systemd/codex-lab-gc.service codex-replacer/systemd/codex-lab-gc.timer
+```
+
+## Parallel MCP dispatcher
+
+Codex Replacer 1.4 processes independent MCP requests concurrently instead of serializing every request behind one synchronous stdin loop.
+
+- server default and hard maximum: **20 concurrent MCP requests**
+- server override: `CODEX_REPLACER_MAX_WORKERS` (clamped to 20)
+- tunnel dispatcher: `MCP_MAX_CONCURRENT_REQUESTS=20` so the tunnel does not impose its old 10-request ceiling
+- control-plane buffer: `CONTROL_PLANE_MAX_INFLIGHT_REQUESTS=20`
+- browser requests still serialize on the shared browser client lock so one persistent browser profile cannot be corrupted by overlapping automation
+- normal shell, Git, GitHub, HTTP, filesystem, process, and lab work can execute concurrently
+- default captured command output is 1 MiB; callers can explicitly request more when needed
+- structured tool results are no longer duplicated in full as text content; the text compatibility preview is capped at 2 KiB
+- each completed MCP request writes an `mcp_request_completed` timing record to the service journal with method, tool, status, and elapsed milliseconds
+
+This separates server-side execution time from ChatGPT reasoning/tool-transport time when diagnosing slow turns.
+
+## Codex computer lab
+
+For heavier parallel product work, Codex Replacer exposes a small leased workstation pool backed by isolated Docker containers. The Codex Replacer machine is itself a KVM guest and does not currently receive nested virtualization CPU flags, so containers are the fast worker backend today. A future host-side libvirt backend can provide full VMs once the parent homeserver authorizes management access from this guest.
+
+Current defaults:
+
+- 4 prewarmed workstations
+- 6 maximum active workstations on the current 8-vCPU / 16-GiB Codex VM
+- 2 vCPU and 2 GiB RAM limit per workstation
+- workspaces stored on `/tank/codex-lab`
+- current human-readable sign-in sheet: `/tank/codex-lab/SIGN-IN-OUT.md`
+- append-only audit log: `/tank/codex-lab/sign-in-out.jsonl`
+- released/expired workspaces are archived under `/tank/codex-lab/archives` instead of being deleted
+- leases default to 180 minutes and are capped at 24 hours
+
+MCP workflow:
+
+1. `lab_acquire` with the agent name and project.
+2. `lab_exec` using the returned lease ID.
+3. `lab_release` when work is complete.
+4. `lab_list` shows who has each station and recent sign-in/out activity.
+5. `lab_gc` releases expired leases and restores the prewarmed pool.
+
+`codex-lab-gc.timer` runs maintenance every 15 minutes and also repopulates the prewarmed pool after boot.
+
+The worker image is built from `lab/Dockerfile` as `codex-lab-worker:bookworm` and includes Node.js, Python, Git/GitHub CLI, build-essential, ripgrep, rsync, curl, and common archive utilities. Agents can use root inside their leased container when a project needs extra packages without modifying the main Codex VM.
+
+To apply the durable service settings on a Codex VM:
+
+```sh
+mkdir -p ~/.config/systemd/user/codex-replacer.service.d
+cp codex-replacer/systemd/codex-replacer-performance.conf ~/.config/systemd/user/codex-replacer.service.d/20-performance.conf
+cp codex-replacer/systemd/codex-lab-gc.service ~/.config/systemd/user/
+cp codex-replacer/systemd/codex-lab-gc.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now codex-lab-gc.timer
+systemctl --user restart codex-replacer.service
 ```

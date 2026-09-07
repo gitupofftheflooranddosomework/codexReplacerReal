@@ -12,6 +12,7 @@ import signal
 import socket
 import stat
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 import sys
 import tempfile
 import threading
@@ -24,11 +25,13 @@ from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
+import lab_manager
+
 
 SERVER_NAME = "codex-replacer"
-SERVER_VERSION = "1.3.0"
+SERVER_VERSION = "1.4.0"
 DEFAULT_DIRECTORY = "/home/mark"
-MAX_CAPTURE_BYTES = 4 * 1024 * 1024
+MAX_CAPTURE_BYTES = 1 * 1024 * 1024
 
 
 def now_iso():
@@ -60,7 +63,10 @@ def tool_result(data=None, message=None, content=None, is_error=False):
     elif message is not None:
         payload["content"] = [{"type": "text", "text": message}]
     elif data is not None:
-        payload["content"] = [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}]
+        preview = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+        if len(preview) > 2048:
+            preview = preview[:2048] + "... [full result in structuredContent]"
+        payload["content"] = [{"type": "text", "text": preview}]
     else:
         payload["content"] = []
     if is_error:
@@ -776,6 +782,44 @@ def handle_process_list(_arguments):
     return tool_result({"sessions": PROCESS_MANAGER.list()})
 
 
+def handle_lab_list(arguments):
+    return tool_result(lab_manager.list_stations(arguments.get("auditLines", 12)))
+
+
+def handle_lab_acquire(arguments):
+    return tool_result(lab_manager.acquire(
+        arguments["owner"],
+        arguments.get("project"),
+        arguments.get("ttlMinutes", 180),
+    ))
+
+
+def handle_lab_release(arguments):
+    return tool_result(lab_manager.release(
+        lease_id=arguments.get("leaseId"),
+        station=arguments.get("station"),
+        reason=arguments.get("reason", "released"),
+        recycle=arguments.get("recycle", True),
+    ))
+
+
+def handle_lab_exec(arguments):
+    return tool_result(lab_manager.execute(
+        arguments["command"],
+        lease_id=arguments.get("leaseId"),
+        station=arguments.get("station"),
+        cwd=arguments.get("cwd", "/workspace"),
+        timeout=arguments.get("timeout", 120),
+        env=arguments.get("env"),
+        as_root=arguments.get("asRoot", False),
+        max_bytes=arguments.get("maxOutputBytes", 1024 * 1024),
+    ))
+
+
+def handle_lab_gc(_arguments):
+    return tool_result(lab_manager.collect())
+
+
 def command_tool(program, arguments):
     return tool_result(run_program(
         program,
@@ -1320,7 +1364,9 @@ CONVERSATION_CONTINUITY_INSTRUCTIONS = (
     "large/repeated tool outputs, a context compaction or prior-conversation summary, difficulty retaining early decisions, or any platform warning about conversation length. "
     "Before context exhaustion, use prepare_chat_handoff and present its complete handoff to the user. The handoff must preserve the objective, exact current state, completed work, pending work, blockers, constraints, "
     "and concrete references such as repositories, branches, PRs, run IDs, paths, URLs, commands, services, and test results. Do not wait until the platform refuses another message. "
-    "If the user explicitly asks to create the next chat and chatgpt_start_chat is available, seed that new chat with the generated handoff; otherwise output the handoff for the user to use."
+    "If the user explicitly asks to create the next chat and chatgpt_start_chat is available, seed that new chat with the generated handoff; otherwise output the handoff for the user to use. "
+    "Computer-lab rule: for heavy or conflicting parallel product work, prefer a leased lab station instead of stacking every build on the main Codex VM. "
+    "Use lab_acquire with a stable agent name before lab_exec, never use a station leased by another agent, and always call lab_release when finished."
 )
 
 
@@ -1358,6 +1404,11 @@ DIRECT_TOOLS = dict([
     tool("process_write", "Write process input", "Use this when you need to send text or terminal input to a running process.", object_schema({"sessionId": string(), "data": string()}, ["sessionId", "data"]), handle_process_write, annotations(False, True, True)),
     tool("process_stop", "Stop process", "Use this when you need to terminate a process started by Codex Replacer.", object_schema({"sessionId": string(), "force": {"type": "boolean", "default": False}}, ["sessionId"]), handle_process_stop, annotations(False, True, False)),
     tool("process_list", "List processes", "Use this when you need to inspect all commands started by Codex Replacer.", object_schema(), handle_process_list, annotations(True, False, False)),
+    tool("lab_list", "List computer lab", "Show the Codex computer-lab stations, active leases, running state, and recent sign-in/sign-out activity.", object_schema({"auditLines": {"type": "integer", "minimum": 0, "maximum": 100, "default": 12}}), handle_lab_list, annotations(True, False, False)),
+    tool("lab_acquire", "Sign into lab computer", "Lease an isolated Codex lab workstation for an agent/project. Use a short stable agent name so other agents can see who owns the station.", object_schema({"owner": string("Agent name signing out the workstation, for example BuildMoose-Sol."), "project": string("Optional project or repository being worked on."), "ttlMinutes": {"type": "integer", "minimum": 15, "maximum": 1440, "default": 180}}, ["owner"]), handle_lab_acquire, annotations(False, False, False)),
+    tool("lab_release", "Sign out of lab computer", "Release a leased lab workstation and record the sign-out. By default the container is recycled and its prior workspace is archived rather than deleted.", object_schema({"leaseId": string(), "station": {"type": "integer", "minimum": 1, "maximum": 12}, "reason": string(), "recycle": {"type": "boolean", "default": True}}), handle_lab_release, annotations(False, True, False)),
+    tool("lab_exec", "Run command in lab computer", "Run a shell command inside a currently leased isolated lab workstation. Identify it by leaseId or station.", object_schema({"command": string(), "leaseId": string(), "station": {"type": "integer", "minimum": 1, "maximum": 12}, "cwd": string("Directory inside the lab computer; defaults to /workspace."), "timeout": {"type": "integer", "minimum": 1, "maximum": 86400, "default": 120}, "env": {"type": "object", "additionalProperties": {"type": ["string", "number", "boolean"]}}, "asRoot": {"type": "boolean", "default": False}, "maxOutputBytes": {"type": "integer", "minimum": 1024, "maximum": 8388608, "default": 1048576}}, ["command"]), handle_lab_exec, annotations(False, True, True)),
+    tool("lab_gc", "Maintain computer lab", "Release expired lab leases and ensure the configured prewarmed workstation pool is ready.", object_schema(), handle_lab_gc, annotations(False, True, False)),
     tool("git", "Run git", "Use this when you need unrestricted git operations as Mark in any repository.", object_schema(COMMON_COMMAND_PROPERTIES), lambda arguments: command_tool("git", arguments), annotations(False, True, True)),
     tool("github", "Run GitHub CLI", "Use this when you need unrestricted GitHub operations as Mark through the authenticated gh CLI.", object_schema(COMMON_COMMAND_PROPERTIES), lambda arguments: command_tool("gh", arguments), annotations(False, True, True)),
     tool("docker", "Run Docker", "Use this when you need unrestricted Docker or Docker Compose operations inside the dedicated Codex Replacer VM.", object_schema(COMMON_COMMAND_PROPERTIES), lambda arguments: command_tool("docker", arguments), annotations(False, True, True)),
@@ -1365,9 +1416,18 @@ DIRECT_TOOLS = dict([
 ])
 
 
+SEND_LOCK = threading.Lock()
+LOG_LOCK = threading.Lock()
+REQUEST_EXECUTOR = ThreadPoolExecutor(
+    max_workers=max(2, min(int(os.environ.get("CODEX_REPLACER_MAX_WORKERS", "20")), 20)),
+    thread_name_prefix="mcp-request",
+)
+
 def send_message(message):
-    sys.stdout.write(json.dumps(message, separators=(",", ":"), ensure_ascii=False) + "\n")
-    sys.stdout.flush()
+    payload = json.dumps(message, separators=(",", ":"), ensure_ascii=False) + "\n"
+    with SEND_LOCK:
+        sys.stdout.write(payload)
+        sys.stdout.flush()
 
 
 def handle_request(message):
@@ -1436,6 +1496,36 @@ def shutdown(_signal_number=None, _frame=None):
     raise SystemExit(0)
 
 
+def _process_message(message):
+    started = time.monotonic()
+    method = message.get("method")
+    tool_name = (message.get("params") or {}).get("name") if method == "tools/call" else None
+    status = "ok"
+    try:
+        response = handle_request(message)
+        if response is not None:
+            send_message(response)
+    except Exception as error:
+        status = "error"
+        send_message({
+            "jsonrpc": "2.0",
+            "id": message.get("id"),
+            "error": {"code": -32603, "message": f"Internal error: {error}"},
+        })
+    finally:
+        event = {
+            "time": now_iso(),
+            "event": "mcp_request_completed",
+            "requestId": message.get("id"),
+            "method": method,
+            "tool": tool_name,
+            "status": status,
+            "elapsedMs": round((time.monotonic() - started) * 1000, 2),
+        }
+        with LOG_LOCK:
+            sys.stderr.write(json.dumps(event, separators=(",", ":")) + "\n")
+            sys.stderr.flush()
+
 def main():
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
@@ -1444,15 +1534,15 @@ def main():
             continue
         try:
             message = json.loads(line)
-            response = handle_request(message)
-            if response is not None:
-                send_message(response)
         except Exception as error:
             send_message({
                 "jsonrpc": "2.0",
                 "id": None,
-                "error": {"code": -32603, "message": f"Internal error: {error}"},
+                "error": {"code": -32700, "message": f"Parse error: {error}"},
             })
+            continue
+        REQUEST_EXECUTOR.submit(_process_message, message)
+    REQUEST_EXECUTOR.shutdown(wait=True)
     shutdown()
 
 
