@@ -88,6 +88,17 @@ This matters under many simultaneous chats: expiring or abandoning one MCP conne
 
 The main Codex Replacer VM is intentionally treated as a latency-sensitive control plane. Expensive transferable repo work should run in the full-VM lab instead of competing with every chat for the control VM's 8 vCPUs. Four full VMs are now prewarmed so heavy jobs do not pay the roughly 20-second on-demand creation path for stations 3-4.
 
+### Control-VM runtime tuning
+
+The live Codex Replacer VM is tuned for interactive latency as well as throughput:
+
+- libvirt memory target: **24 GiB** (live and persistent)
+- next-boot CPU target: **12 vCPU**; the current boot remains at 8 vCPU to avoid interrupting active chats
+- `vm.swappiness=10`; stale swap from the previous 16-GiB allocation was cleared after the memory increase
+- root ext4 uses `noatime` and does **not** use continuous `discard`
+- `fstrim.timer` remains enabled for weekly batched trim instead of paying discard/unmap overhead during delete-heavy builds
+- the VM root/work qcow2 files are currently backed by the homeserver's 7-disk spinning RAIDZ1 `tank` pool. Guest virtio scheduling (`none`), qcow2 `cache=none`, ZFS LZ4 and `atime=off` are already appropriate. Sampled pool wait under write activity was roughly 15–46 ms, so an SSD/NVMe tier is the largest remaining storage-performance opportunity. A maintenance-window migration from qcow2-on-ZFS files to raw ZFS zvols could reduce double-CoW overhead, but cannot remove the physical HDD seek latency.
+
 ## Codex computer lab
 
 For lightweight parallel product work, Codex Replacer exposes a small leased workstation pool backed by isolated Docker containers on the control VM. CPU-heavy work should use the separate full-KVM lab on the parent homeserver described below, so expensive builds do not compete with interactive MCP traffic for the control VM's 8 vCPUs.
