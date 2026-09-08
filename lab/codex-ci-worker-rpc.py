@@ -115,7 +115,9 @@ def action_import(args):
     shutil.rmtree(root, ignore_errors=True); repo.mkdir(parents=True, exist_ok=True)
     rc = subprocess.run(["tar","-xf","-","-C",str(repo)], stdin=sys.stdin.buffer, check=False).returncode
     if rc: return rc
-    for cmd in (["git","init","-q"],["git","add","-A"],["git","-c","user.name=Codex-CI","-c","user.email=codex-ci@localhost","commit","-qm","snapshot","--no-gpg-sign"]):
+    # A command-only scheduler job legitimately archives an empty Git tree.
+    # Preserve that snapshot as a real commit instead of rejecting it before exec.
+    for cmd in (["git","init","-q"],["git","add","-A"],["git","-c","user.name=Codex-CI","-c","user.email=codex-ci@localhost","commit","--allow-empty","-qm","snapshot","--no-gpg-sign"]):
         rc = subprocess.run(cmd,cwd=repo,check=False).returncode
         if rc: return rc
     print(repo); return 0
