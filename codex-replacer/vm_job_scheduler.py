@@ -6,7 +6,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-BASE_URL = os.environ.get("CODEX_LAB_SCHEDULER_URL", "http://192.168.122.1:8766").rstrip("/")
+BASE_URL = os.environ.get("CODEX_LAB_SCHEDULER_URL", "http://192.168.122.1:8767").rstrip("/")
 def request(method, path, payload=None, timeout=10):
     data = None if payload is None else json.dumps(payload, separators=(",", ":")).encode()
     req = urllib.request.Request(
@@ -59,7 +59,7 @@ def submit_many(owner, jobs, project=None, chat_label=None, chat_url=None):
             payload["chatUrl"] = chat_url
         return submit(payload)
 
-    with ThreadPoolExecutor(max_workers=min(12, len(jobs))) as pool:
+    with ThreadPoolExecutor(max_workers=min(48, len(jobs))) as pool:
         submitted = list(pool.map(one, jobs))
     return {"count": len(submitted), "jobs": submitted}
 
@@ -79,4 +79,4 @@ def workers():
 
 
 def cancel(job_id):
-    return request("POST", f"/api/jobs/{urllib.parse.quote(job_id)}/cancel", {}, timeout=10)
+    return request("POST", f"/api/jobs/{urllib.parse.quote(job_id)}/cancel", {}, timeout=45)
