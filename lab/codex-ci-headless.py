@@ -53,6 +53,8 @@ DESKTOP_ACTIVE_MIB = max(DESKTOP_ACTIVE_FLOOR_MIB, int(os.environ.get("CODEX_DES
 DESKTOP_HEADROOM_MIB = max(512, int(os.environ.get("CODEX_DESKTOP_HEADROOM_MIB", "2048")))
 DESKTOP_BALLOON_STEP_MIB = max(256, int(os.environ.get("CODEX_DESKTOP_BALLOON_STEP_MIB", "512")))
 STALE_CREATING_SECONDS = max(120, int(os.environ.get("CODEX_CI_STALE_CREATING_SECONDS", "300")))
+STORE_BACKOFF_BASE_SECONDS = max(5, int(os.environ.get("CODEX_CI_STORE_BACKOFF_BASE_SECONDS", "30")))
+STORE_BACKOFF_MAX_SECONDS = max(STORE_BACKOFF_BASE_SECONDS, int(os.environ.get("CODEX_CI_STORE_BACKOFF_MAX_SECONDS", "900")))
 SCHEDULER = os.environ.get("CODEX_LAB_SCHEDULER_URL", "http://127.0.0.1:8766").rstrip("/")
 ACTIVE = ("creating", "running", "idle", "releasing")
 
@@ -105,6 +107,9 @@ def db():
     conn.execute("CREATE INDEX IF NOT EXISTS ci_status ON instances(status,created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS ci_project ON instances(project,status,created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS ci_session ON instances(project,session_key,status)")
+    conn.execute("""CREATE TABLE IF NOT EXISTS storage_health(
+      storage_root TEXT PRIMARY KEY,consecutive_failures INTEGER NOT NULL DEFAULT 0,
+      last_failure_at TEXT,backoff_until TEXT,last_error TEXT,last_success_at TEXT)""")
     conn.commit()
     return conn
 
@@ -294,19 +299,110 @@ def pressure_reason():
     return None
 
 
+def storage_backoff_seconds(failures):
+    failures = max(1, int(failures or 1))
+    return min(STORE_BACKOFF_MAX_SECONDS, STORE_BACKOFF_BASE_SECONDS * (2 ** min(20, failures - 1)))
+
+
+def storage_health_row(conn, root):
+    return conn.execute("SELECT * FROM storage_health WHERE storage_root=?", (str(root),)).fetchone()
+
+
+def storage_retry_seconds(row, current=None):
+    if not row:
+        return 0
+    until = parse_stamp(row["backoff_until"])
+    current = current or now()
+    if not until or until <= current:
+        return 0
+    return max(1, int((until - current).total_seconds() + .999))
+
+
+def mark_store_failure(conn, root, detail):
+    root = str(root)
+    row = storage_health_row(conn, root)
+    failures = int(row["consecutive_failures"] if row else 0) + 1
+    delay = storage_backoff_seconds(failures)
+    current = now()
+    until = current + timedelta(seconds=delay)
+    conn.execute("""INSERT INTO storage_health(storage_root,consecutive_failures,last_failure_at,backoff_until,last_error,last_success_at)
+                    VALUES(?,?,?,?,?,NULL)
+                    ON CONFLICT(storage_root) DO UPDATE SET
+                      consecutive_failures=excluded.consecutive_failures,
+                      last_failure_at=excluded.last_failure_at,
+                      backoff_until=excluded.backoff_until,
+                      last_error=excluded.last_error""",
+                 (root, failures, current.isoformat(), until.isoformat(), str(detail)[:2000]))
+    return delay
+
+
+def mark_store_success(conn, root):
+    root = str(root)
+    conn.execute("""INSERT INTO storage_health(storage_root,consecutive_failures,last_failure_at,backoff_until,last_error,last_success_at)
+                    VALUES(?,0,NULL,NULL,NULL,?)
+                    ON CONFLICT(storage_root) DO UPDATE SET
+                      consecutive_failures=0,backoff_until=NULL,last_error=NULL,last_success_at=excluded.last_success_at""",
+                 (root, stamp()))
+
+
+def storage_health_data(conn):
+    current = now()
+    rows = {row["storage_root"]: row for row in conn.execute("SELECT * FROM storage_health")}
+    result = []
+    for root in STORES:
+        row = rows.get(str(root))
+        retry = storage_retry_seconds(row, current)
+        base = root / BASE
+        result.append({
+            "storageRoot": str(root),
+            "basePresent": base.is_file(),
+            "status": "backoff" if retry else ("healthy" if base.is_file() else "missing_base"),
+            "consecutiveFailures": int(row["consecutive_failures"] if row else 0),
+            "retryInSeconds": retry,
+            "backoffUntil": row["backoff_until"] if row else None,
+            "lastFailureAt": row["last_failure_at"] if row else None,
+            "lastSuccessAt": row["last_success_at"] if row else None,
+            "lastError": row["last_error"] if row else None,
+        })
+    return result
+
+
+def store_retry_seconds(root):
+    with locked():
+        conn = db()
+        try:
+            return storage_retry_seconds(storage_health_row(conn, root))
+        finally:
+            conn.close()
+
+
 def choose_store(conn):
     active = active_rows(conn)
     counts = {str(x): 0 for x in STORES}
     for row in active:
         if row["storage_root"] in counts: counts[row["storage_root"]] += 1
-    candidates = []
+    candidates, blocked = [], []
+    current = now()
     for root in STORES:
-        root.mkdir(parents=True, exist_ok=True)
-        base = root / BASE
-        if not base.exists(): continue
-        usage = shutil.disk_usage(root)
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            base = root / BASE
+            if not base.is_file():
+                continue
+            usage = shutil.disk_usage(root)
+        except OSError:
+            continue
+        health = storage_health_row(conn, root)
+        retry = storage_retry_seconds(health, current)
+        if retry:
+            blocked.append((retry, str(root)))
+            continue
         candidates.append((counts[str(root)], -(usage.free), str(root), root))
-    if not candidates: raise RuntimeError("no healthy headless storage root with base image is available")
+    if not candidates:
+        if blocked:
+            retry, root = min(blocked)
+            raise RuntimeError(f"all headless storage roots are in backoff; earliest retry in {retry}s ({root})")
+        raise RuntimeError("no healthy headless storage root with base image is available")
     candidates.sort()
     return candidates[0][-1]
 
@@ -362,6 +458,7 @@ def state_data(conn=None, history_limit=40):
                 "ioPsiAvg10": psi_avg10("io"),
                 "memoryPsiAvg10": psi_avg10("memory"),
                 "pressureReason": pressure_reason()},
+                "storageHealth": storage_health_data(conn),
                 "active": current, "history": history}
     finally:
         if own:
@@ -469,6 +566,19 @@ def provision(rec):
     base = store / BASE
     root = store / rec["name"]
     disk = root / f"{rec['name']}.qcow2"
+    retry = store_retry_seconds(store)
+    if retry:
+        detail = f"storage root {store} is in backoff for {retry}s after provisioning failure"
+        with locked():
+            conn = db()
+            try:
+                conn.execute("UPDATE instances SET status='failed',finished_at=?,destroyed_at=?,error=?,teardown_reason='storage_backoff' WHERE id=?",
+                             (stamp(), stamp(), detail, rec["id"]))
+                event(conn, rec["id"], "storage_backoff", detail)
+                conn.commit(); write_state(conn)
+            finally:
+                conn.close()
+        raise RuntimeError(detail)
     root.mkdir(parents=True, exist_ok=False)
     try:
         with provision_marker(rec["id"]):
@@ -494,9 +604,11 @@ def provision(rec):
             with locked():
                 conn = db()
                 try:
+                    mark_store_success(conn, store)
                     conn.execute("UPDATE instances SET status='running',started_at=?,disk_gib=?,error=NULL WHERE id=?",
                                  (stamp(), effective_gib, rec["id"]))
                     event(conn, rec["id"], "started", f"domain={rec['name']}")
+                    event(conn, rec["id"], "storage_healthy", str(store))
                     conn.commit(); write_state(conn)
                     return dict(conn.execute("SELECT * FROM instances WHERE id=?", (rec["id"],)).fetchone())
                 finally: conn.close()
@@ -506,9 +618,11 @@ def provision(rec):
         with locked():
             conn = db()
             try:
+                delay = mark_store_failure(conn, store, detail)
                 conn.execute("UPDATE instances SET status='failed',finished_at=?,destroyed_at=?,error=?,teardown_reason='provision_failed' WHERE id=?",
                              (stamp(), stamp(), detail[:6000], rec["id"]))
                 event(conn, rec["id"], "provision_failed", detail[:6000])
+                event(conn, rec["id"], "storage_backoff", f"root={store} delay={delay}s")
                 conn.commit(); write_state(conn)
             finally: conn.close()
         raise RuntimeError(detail) from exc

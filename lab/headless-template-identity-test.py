@@ -38,6 +38,47 @@ with tempfile.TemporaryDirectory() as td:
     assert arc["protectedMiB"] == 16 * 1024, arc
     assert arc["reclaimableMiB"] == 76 * 1024, arc
     assert mod.admission_charge_mib(2048) == 2560
+
+    # Storage failures must quarantine only the failing root with exponential
+    # backoff, leave healthy roots selectable, and recover immediately after a
+    # successful provision. This prevents a persistent storage fault from
+    # becoming a VM creation retry storm.
+    mod.STORE_BACKOFF_BASE_SECONDS = 10
+    mod.STORE_BACKOFF_MAX_SECONDS = 80
+    stores = [td / "store-a", td / "store-b", td / "store-c"]
+    mod.STORES = stores
+    for store in stores:
+        store.mkdir()
+        (store / mod.BASE).write_bytes(b"base")
+    conn = mod.db()
+    assert mod.storage_backoff_seconds(1) == 10
+    assert mod.storage_backoff_seconds(2) == 20
+    assert mod.storage_backoff_seconds(4) == 80
+    assert mod.storage_backoff_seconds(9) == 80
+    delay = mod.mark_store_failure(conn, stores[0], "permission denied")
+    conn.commit()
+    assert delay == 10
+    health = {x["storageRoot"]: x for x in mod.storage_health_data(conn)}
+    assert health[str(stores[0])]["status"] == "backoff", health
+    assert health[str(stores[0])]["consecutiveFailures"] == 1, health
+    assert mod.choose_store(conn) != stores[0]
+    mod.mark_store_failure(conn, stores[1], "permission denied")
+    mod.mark_store_failure(conn, stores[2], "permission denied")
+    conn.commit()
+    try:
+        mod.choose_store(conn)
+    except RuntimeError as exc:
+        assert "all headless storage roots are in backoff" in str(exc), exc
+    else:
+        raise AssertionError("all quarantined roots must fail closed")
+    mod.mark_store_success(conn, stores[0])
+    conn.commit()
+    assert mod.choose_store(conn) == stores[0]
+    health = {x["storageRoot"]: x for x in mod.storage_health_data(conn)}
+    assert health[str(stores[0])]["status"] == "healthy", health
+    assert health[str(stores[0])]["consecutiveFailures"] == 0, health
+    conn.close()
+
     conn = mod.db()
     future = mod.stamp(mod.now() + timedelta(hours=1))
     old = mod.stamp(mod.now() - timedelta(minutes=10))
