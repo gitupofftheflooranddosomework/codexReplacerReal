@@ -34,6 +34,10 @@ with tempfile.TemporaryDirectory() as td:
     assert mod.desktop_target_mib({"memTotalMiB": 8192, "memAvailableMiB": 1000}, True) == 8192
     assert mod.desktop_target_mib({"memTotalMiB": 8192, "memAvailableMiB": 6500}, False) == 4096
     assert mod.desktop_target_mib({}, True) == 8192
+    arc = mod.arc_capacity_from_values(92 * 1024, 6 * 1024)
+    assert arc["protectedMiB"] == 16 * 1024, arc
+    assert arc["reclaimableMiB"] == 76 * 1024, arc
+    assert mod.admission_charge_mib(2048) == 2560
     conn = mod.db()
     future = mod.stamp(mod.now() + timedelta(hours=1))
     old = mod.stamp(mod.now() - timedelta(minutes=10))
@@ -43,7 +47,9 @@ with tempfile.TemporaryDirectory() as td:
         return (iid, f"ci-test-{iid}", f"192.168.122.{n}", f"52:54:00:ce:00:{n:02x}", "test", "test", None, str(td), 2048, 4096, 2, 40, created, None, None, future, None, "creating", None, None, None)
     conn.execute("INSERT INTO instances VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", row("old", old))
     conn.execute("INSERT INTO instances VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", row("newer", recent))
-    conn.commit(); conn.close()
+    conn.commit()
+    assert mod.pending_create_charge_mib(conn) == 5120
+    conn.close()
     calls = []
     def fake_finish(iid, status="finished", exit_code=None, reason="job_finished", keep=0):
         calls.append((iid, status, reason)); return {"id": iid}

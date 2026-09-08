@@ -40,6 +40,8 @@ MAX_MEM_MIB = max(MEM_MIB, int(os.environ.get("CODEX_CI_HEADLESS_MAX_MEMORY_MIB"
 VCPUS = max(1, int(os.environ.get("CODEX_CI_HEADLESS_VCPUS", "2")))
 DISK_GIB = max(10, int(os.environ.get("CODEX_CI_HEADLESS_DISK_GIB", "40")))
 HOST_RESERVE_MIB = max(4096, int(os.environ.get("CODEX_CI_HOST_RESERVE_MIB", "12288")))
+ARC_FLOOR_MIB = max(4096, int(os.environ.get("CODEX_CI_ARC_FLOOR_MIB", "16384")))
+VM_MEMORY_OVERHEAD_MIB = max(256, int(os.environ.get("CODEX_CI_VM_MEMORY_OVERHEAD_MIB", "512")))
 MAX_LOAD_PER_CPU = max(.5, float(os.environ.get("CODEX_CI_MAX_LOAD_PER_CPU", "2.0")))
 MAX_IO_PSI_AVG10 = max(1.0, float(os.environ.get("CODEX_CI_MAX_IO_PSI_AVG10", "70.0")))
 MAX_MEMORY_PSI_AVG10 = max(1.0, float(os.environ.get("CODEX_CI_MAX_MEMORY_PSI_AVG10", "25.0")))
@@ -139,6 +141,53 @@ def meminfo():
     return values.get("MemTotal", 0), values.get("MemAvailable", 0)
 
 
+def arc_capacity_from_values(size_mib, c_min_mib):
+    size = max(0, int(size_mib or 0))
+    c_min = max(0, int(c_min_mib or 0))
+    protected = max(ARC_FLOOR_MIB, c_min)
+    return {
+        "sizeMiB": size,
+        "cMinMiB": c_min,
+        "protectedMiB": protected,
+        "reclaimableMiB": max(0, size - protected),
+    }
+
+
+def zfs_arc_capacity():
+    values = {}
+    try:
+        for line in pathlib.Path("/proc/spl/kstat/zfs/arcstats").read_text().splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[0] in ("size", "c_min"):
+                values[parts[0]] = int(parts[2]) // (1024 * 1024)
+    except (OSError, ValueError, IndexError):
+        pass
+    return arc_capacity_from_values(values.get("size", 0), values.get("c_min", 0))
+
+
+def memory_capacity():
+    total, available = meminfo()
+    arc = zfs_arc_capacity()
+    effective = available + arc["reclaimableMiB"]
+    if total:
+        effective = min(total, effective)
+    return {
+        "totalMiB": total,
+        "availableMiB": available,
+        "effectiveAvailableMiB": max(0, effective),
+        "arc": arc,
+    }
+
+
+def admission_charge_mib(memory_mib):
+    return max(0, int(memory_mib)) + VM_MEMORY_OVERHEAD_MIB
+
+
+def pending_create_charge_mib(conn):
+    rows = conn.execute("SELECT memory_mib FROM instances WHERE status='creating'").fetchall()
+    return sum(admission_charge_mib(row["memory_mib"]) for row in rows)
+
+
 def load_ok():
     try:
         return os.getloadavg()[0] <= max(1, os.cpu_count() or 1) * MAX_LOAD_PER_CPU
@@ -218,11 +267,22 @@ def state_data(conn=None, history_limit=100):
             f"SELECT * FROM instances WHERE status NOT IN ({marks}) "
             "ORDER BY COALESCE(destroyed_at,finished_at,created_at) DESC LIMIT ?",
             (*ACTIVE, int(history_limit)))]
-        total, available = meminfo()
+        memory = memory_capacity()
+        arc = memory["arc"]
+        pending_charge = pending_create_charge_mib(conn)
         return {"time": stamp(), "capacity": {"maxActive": MAX_ACTIVE,
                 "projectMaxActive": PROJECT_MAX, "active": len(current),
                 "freeSlots": max(0, MAX_ACTIVE - len(current)),
-                "hostMemTotalMiB": total, "hostMemAvailableMiB": available,
+                "hostMemTotalMiB": memory["totalMiB"],
+                "hostMemAvailableMiB": memory["availableMiB"],
+                "hostEffectiveAvailableMiB": memory["effectiveAvailableMiB"],
+                "zfsArcSizeMiB": arc["sizeMiB"],
+                "zfsArcCMinMiB": arc["cMinMiB"],
+                "zfsArcProtectedMiB": arc["protectedMiB"],
+                "zfsArcReclaimableMiB": arc["reclaimableMiB"],
+                "pendingCreateChargeMiB": pending_charge,
+                "headlessAdmissionOverheadMiB": VM_MEMORY_OVERHEAD_MIB,
+                "headlessDefaultAdmissionChargeMiB": admission_charge_mib(MEM_MIB),
                 "hostReserveMiB": HOST_RESERVE_MIB,
                 "load1": os.getloadavg()[0] if hasattr(os, "getloadavg") else None,
                 "loadPerCpuLimit": MAX_LOAD_PER_CPU,
@@ -264,9 +324,18 @@ def reserve(owner, project, ttl, session_key, memory, max_memory, vcpus, disk):
                 raise RuntimeError(f"headless KVM capacity reached ({len(rows)}/{MAX_ACTIVE})")
             if sum(1 for r in rows if r["project"] == project) >= PROJECT_MAX:
                 raise RuntimeError(f"project headless KVM capacity reached ({PROJECT_MAX})")
-            _, available = meminfo()
-            if available and available - max_memory < HOST_RESERVE_MIB:
-                raise RuntimeError(f"host RAM guard: {available} MiB available; {HOST_RESERVE_MIB} MiB reserve required")
+            memory_state = memory_capacity()
+            pending_charge = pending_create_charge_mib(conn)
+            new_charge = admission_charge_mib(memory)
+            effective_after = memory_state["effectiveAvailableMiB"] - pending_charge - new_charge
+            if memory_state["effectiveAvailableMiB"] and effective_after < HOST_RESERVE_MIB:
+                arc = memory_state["arc"]
+                raise RuntimeError(
+                    "host RAM guard: "
+                    f"raw={memory_state['availableMiB']} MiB effective={memory_state['effectiveAvailableMiB']} MiB "
+                    f"arc_reclaimable={arc['reclaimableMiB']} MiB pending={pending_charge} MiB "
+                    f"new_charge={new_charge} MiB reserve={HOST_RESERVE_MIB} MiB"
+                )
             pressure = pressure_reason()
             if pressure:
                 raise RuntimeError(pressure)
