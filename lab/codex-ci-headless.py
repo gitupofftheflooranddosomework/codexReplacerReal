@@ -33,7 +33,7 @@ STORES = [pathlib.Path(x.strip()) for x in os.environ.get(
 ).split(",") if x.strip()]
 IP_FIRST = int(os.environ.get("CODEX_CI_HEADLESS_IP_START", "100"))
 IP_LAST = int(os.environ.get("CODEX_CI_HEADLESS_IP_END", "199"))
-MAX_ACTIVE = max(1, int(os.environ.get("CODEX_CI_HEADLESS_MAX_ACTIVE", "48")))
+MAX_ACTIVE = max(1, int(os.environ.get("CODEX_CI_HEADLESS_MAX_ACTIVE", "96")))
 PROJECT_MAX = max(1, int(os.environ.get("CODEX_CI_HEADLESS_PROJECT_MAX_ACTIVE", str(MAX_ACTIVE))))
 MEM_MIB = max(768, int(os.environ.get("CODEX_CI_HEADLESS_MEMORY_MIB", "2048")))
 MAX_MEM_MIB = max(MEM_MIB, int(os.environ.get("CODEX_CI_HEADLESS_MAX_MEMORY_MIB", "4096")))
@@ -43,6 +43,7 @@ HOST_RESERVE_MIB = max(4096, int(os.environ.get("CODEX_CI_HOST_RESERVE_MIB", "12
 MAX_LOAD_PER_CPU = max(.5, float(os.environ.get("CODEX_CI_MAX_LOAD_PER_CPU", "2.0")))
 MAX_IO_PSI_AVG10 = max(1.0, float(os.environ.get("CODEX_CI_MAX_IO_PSI_AVG10", "70.0")))
 MAX_MEMORY_PSI_AVG10 = max(1.0, float(os.environ.get("CODEX_CI_MAX_MEMORY_PSI_AVG10", "25.0")))
+NEW_WORKER_HEADROOM_MIB = max(0, int(os.environ.get("CODEX_CI_NEW_WORKER_HEADROOM_MIB", "512")))
 DESKTOP_IDLE_MIB = max(2048, int(os.environ.get("CODEX_DESKTOP_IDLE_MIB", "4096")))
 DESKTOP_ACTIVE_FLOOR_MIB = max(DESKTOP_IDLE_MIB, int(os.environ.get("CODEX_DESKTOP_ACTIVE_FLOOR_MIB", "6144")))
 DESKTOP_ACTIVE_MIB = max(DESKTOP_ACTIVE_FLOOR_MIB, int(os.environ.get("CODEX_DESKTOP_ACTIVE_MIB", "8192")))
@@ -159,6 +160,11 @@ def psi_avg10(resource, level="some"):
     return None
 
 
+def admission_memory_budget(memory_mib, max_memory_mib):
+    """Resident-memory budget charged when admitting one new ballooned VM."""
+    return min(int(max_memory_mib), int(memory_mib) + NEW_WORKER_HEADROOM_MIB)
+
+
 def pressure_reason():
     if not load_ok():
         return "host CPU/load high-water guard is active"
@@ -226,6 +232,7 @@ def state_data(conn=None, history_limit=100):
                 "hostReserveMiB": HOST_RESERVE_MIB,
                 "load1": os.getloadavg()[0] if hasattr(os, "getloadavg") else None,
                 "loadPerCpuLimit": MAX_LOAD_PER_CPU,
+                "newWorkerHeadroomMiB": NEW_WORKER_HEADROOM_MIB,
                 "ioPsiAvg10": psi_avg10("io"),
                 "memoryPsiAvg10": psi_avg10("memory"),
                 "pressureReason": pressure_reason()},
@@ -265,8 +272,12 @@ def reserve(owner, project, ttl, session_key, memory, max_memory, vcpus, disk):
             if sum(1 for r in rows if r["project"] == project) >= PROJECT_MAX:
                 raise RuntimeError(f"project headless KVM capacity reached ({PROJECT_MAX})")
             _, available = meminfo()
-            if available and available - max_memory < HOST_RESERVE_MIB:
-                raise RuntimeError(f"host RAM guard: {available} MiB available; {HOST_RESERVE_MIB} MiB reserve required")
+            memory_budget = admission_memory_budget(memory, max_memory)
+            if available and available - memory_budget < HOST_RESERVE_MIB:
+                raise RuntimeError(
+                    f"host RAM guard: {available} MiB available; {memory_budget} MiB new-worker budget; "
+                    f"{HOST_RESERVE_MIB} MiB reserve required"
+                )
             pressure = pressure_reason()
             if pressure:
                 raise RuntimeError(pressure)
