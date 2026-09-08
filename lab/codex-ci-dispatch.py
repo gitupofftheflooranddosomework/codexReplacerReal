@@ -2,7 +2,7 @@
 """Dispatch a clean GitHub Actions checkout to one shared Codex KVM worker.
 
 The SSH key used by this client is deliberately restricted on every worker to
-codex-ci-worker-rpc.py.  The runner cannot bypass the shared VM claim locks or
+codex-ci-worker-rpc.py. The runner cannot bypass the shared VM claim locks or
 access another lease's workspace.
 """
 
@@ -132,15 +132,59 @@ def release(station: int, payload: dict, status: str) -> None:
     })
 
 
-def check_clean_git(workspace: pathlib.Path) -> None:
+def safe_input(value: str) -> str:
+    path = pathlib.PurePosixPath(value)
+    if path.is_absolute() or not path.parts or ".." in path.parts or path.parts[0] == ".git":
+        raise ValueError(f"input path must be repository-relative and outside .git: {value}")
+    return str(path)
+
+
+def git_paths(workspace: pathlib.Path, command: list[str]) -> set[str]:
     result = subprocess.run(
-        ["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=workspace,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+        command, cwd=workspace, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
     )
     if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode(errors="replace").strip() or "git workspace inspection failed")
+    return {
+        item.decode(errors="surrogateescape")
+        for item in result.stdout.split(b"\0")
+        if item
+    }
+
+
+def check_workspace_inputs(workspace: pathlib.Path, inputs: list[str]) -> None:
+    """Reject undeclared workspace mutations while permitting explicit overlay inputs.
+
+    GitHub Actions commonly downloads or generates artifacts after checkout. Those
+    files must be declared with --input before they can be streamed into a leased
+    worker. Any modified, staged, or untracked path outside those declared roots
+    still fails closed, preserving the committed-checkout boundary.
+    """
+    probe = subprocess.run(
+        ["git", "rev-parse", "--is-inside-work-tree"], cwd=workspace,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+    )
+    if probe.returncode != 0 or probe.stdout.strip() != "true":
         raise RuntimeError("workspace is not a Git checkout")
-    if result.stdout.strip():
-        raise RuntimeError("workspace is dirty; dispatch only committed Actions checkouts")
+
+    allowed = [pathlib.PurePosixPath(safe_input(item)) for item in inputs]
+    dirty = set()
+    dirty |= git_paths(workspace, ["git", "diff", "--no-renames", "--name-only", "-z"])
+    dirty |= git_paths(workspace, ["git", "diff", "--cached", "--no-renames", "--name-only", "-z"])
+    dirty |= git_paths(workspace, ["git", "ls-files", "--others", "--exclude-standard", "-z"])
+
+    def permitted(value: str) -> bool:
+        path = pathlib.PurePosixPath(value)
+        return any(path == root or root in path.parents for root in allowed)
+
+    unexpected = sorted(path for path in dirty if not permitted(path))
+    if unexpected:
+        sample = ", ".join(unexpected[:20])
+        suffix = " ..." if len(unexpected) > 20 else ""
+        raise RuntimeError(
+            "workspace contains undeclared changes; dispatch only committed checkout plus explicit --input paths: "
+            + sample + suffix
+        )
 
 
 def stream_snapshot(station: int, lease_id: str, workspace: pathlib.Path) -> None:
@@ -163,13 +207,6 @@ def stream_snapshot(station: int, lease_id: str, workspace: pathlib.Path) -> Non
         raise RuntimeError(f"worker snapshot import failed: {remote_stderr.decode(errors='replace').strip()}")
 
 
-def safe_input(value: str) -> str:
-    path = pathlib.PurePosixPath(value)
-    if path.is_absolute() or not path.parts or ".." in path.parts or path.parts[0] == ".git":
-        raise ValueError(f"input path must be repository-relative and outside .git: {value}")
-    return str(path)
-
-
 def push_inputs(station: int, lease_id: str, workspace: pathlib.Path, inputs: list[str]) -> None:
     if not inputs:
         return
@@ -186,7 +223,7 @@ def push_inputs(station: int, lease_id: str, workspace: pathlib.Path, inputs: li
         stdin=archive.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     archive.stdout.close()
-    _, remote_stderr = remote.communicate(timeout=120)
+    _, remote_stderr = remote.communicate(timeout=300)
     archive_stderr = archive.stderr.read() if archive.stderr is not None else b""
     archive_rc = archive.wait(timeout=10)
     if archive_rc != 0:
@@ -213,7 +250,7 @@ def pull_artifacts(station: int, lease_id: str, artifacts: list[str], destinatio
     extract = subprocess.run(["tar", "-xf", "-", "-C", str(destination)], stdin=remote.stdout, check=False)
     remote.stdout.close()
     stderr = remote.stderr.read() if remote.stderr is not None else b""
-    rc = remote.wait(timeout=60)
+    rc = remote.wait(timeout=300)
     if rc != 0 or extract.returncode != 0:
         raise RuntimeError(f"artifact transfer failed: {stderr.decode(errors='replace').strip()}")
 
@@ -254,7 +291,7 @@ def main() -> int:
     workspace = pathlib.Path(args.workspace).resolve()
     if not workspace.is_dir():
         raise SystemExit(f"workspace does not exist: {workspace}")
-    check_clean_git(workspace)
+    check_workspace_inputs(workspace, args.input)
     env = parse_env(args.env)
     station = 0
     payload = None
