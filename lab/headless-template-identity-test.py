@@ -26,6 +26,10 @@ with tempfile.TemporaryDirectory() as td:
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     assert mod.BASE == "codex-ci-base-v2.qcow2"
+    gib = 1024 ** 3
+    assert mod.effective_disk_gib(100 * gib, 40) == 100
+    assert mod.effective_disk_gib(100 * gib, 120) == 120
+    assert mod.effective_disk_gib(100 * gib + 1, 100) == 101
     conn = mod.db()
     future = mod.stamp(mod.now() + timedelta(hours=1))
     old = mod.stamp(mod.now() - timedelta(minutes=10))
