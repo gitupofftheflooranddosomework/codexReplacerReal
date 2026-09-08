@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodically maintain Codex computer lab leases
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+AccuracySec=1min
+Persistent=true
+Unit=codex-lab-gc.service
+
+[Install]
+WantedBy=timers.target

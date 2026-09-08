@@ -1,0 +1,12 @@
+[Unit]
+Description=Set unique identity for a Codex KVM worker clone
+Before=codex-worker-desktop.service ssh.service
+After=sys-subsystem-net-devices-enp1s0.device
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/codex-worker-identity
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
