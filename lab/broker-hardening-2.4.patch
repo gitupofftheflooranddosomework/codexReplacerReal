@@ -1,0 +1,189 @@
+--- a/codex-replacer/server.py
++++ b/codex-replacer/server.py
+@@ -31,12 +31,13 @@
+ 
+ 
+ SERVER_NAME = "codex-replacer"
+-SERVER_VERSION = "2.2.0"
++SERVER_VERSION = "2.4.0"
+ DEFAULT_DIRECTORY = "/home/mark"
+ MAX_CAPTURE_BYTES = 1 * 1024 * 1024
+ HOST_EXEC_FOREGROUND_SECONDS = max(1, min(int(os.environ.get("CODEX_REPLACER_HOST_EXEC_FOREGROUND_SECONDS", "20")), 90))
+ HOST_EXEC_WAIT_PROMOTION_SECONDS = max(1, min(int(os.environ.get("CODEX_REPLACER_HOST_EXEC_WAIT_PROMOTION_SECONDS", "3")), 30))
+ HOST_EXEC_NICE = max(0, min(int(os.environ.get("CODEX_REPLACER_HOST_EXEC_NICE", "5")), 19))
++BROKER_ONLY = os.environ.get("CODEX_REPLACER_BROKER_ONLY", "0").strip().lower() in {"1", "true", "yes", "on"}
+ 
+ 
+ def now_iso():
+@@ -538,6 +539,17 @@
+                 raise RuntimeError(response["error"].get("message", "KVM browser MCP error."))
+             return response.get("result", {})
+ 
++    def list_tools(self):
++        with self.lock:
++            for attempt in range(2):
++                try:
++                    self._ensure()
++                    return self._request("tools/list", {}).get("tools", [])
++                except Exception:
++                    self.close()
++                    if attempt:
++                        raise
++
+     def call(self, name, arguments):
+         with self.lock:
+             for attempt in range(2):
+@@ -571,7 +583,17 @@
+             if self.descriptors is not None:
+                 return self.descriptors
+             descriptors = []
+-            for original in BROWSER_CLIENT.list_tools():
++            originals = None
++            errors = []
++            for station, client in self.clients.items():
++                try:
++                    originals = client.list_tools()
++                    break
++                except Exception as error:
++                    errors.append(f"VM {station}: {error}")
++            if originals is None:
++                raise RuntimeError("Could not discover browser tools from any KVM worker: " + "; ".join(errors))
++            for original in originals:
+                 name = original.get("name") or ""
+                 if not name.startswith("browser_"):
+                     continue
+@@ -1794,7 +1816,7 @@
+     "Before context exhaustion, use prepare_chat_handoff and present its complete handoff to the user. The handoff must preserve the objective, exact current state, completed work, pending work, blockers, constraints, "
+     "and concrete references such as repositories, branches, PRs, run IDs, paths, URLs, commands, services, and test results. Do not wait until the platform refuses another message. "
+     "If the user explicitly asks to create the next chat and chatgpt_start_chat is available, seed that new chat with the generated handoff; otherwise output the handoff for the user to use. "
+-    "Performance rule: treat the main Codex Replacer VM as the interactive control plane, not the build farm. Keep short inspection, filesystem, Git, GitHub, and orchestration calls on the main VM. For transferable CPU-heavy or long-running builds, test suites, compilers, recursive validators/scans, Docker builds, package builds, PDF/link validation, and similar work, use vm_job_submit. When two or more independent heavy tasks are available, prefer vm_job_submit_batch so one MCP call can fill all six workers immediately. The homeserver scheduler chooses workers automatically and runs up to six independent heavy jobs concurrently. Poll with vm_job_status and never resubmit a running job just to check it. "
++    "Execution boundary: the user console/control VM is reserved exclusively for Mark and is never a bot work machine. This MCP endpoint is a broker. For interactive repository, shell, or browser work first use vm_lab_acquire with your stable bot name, then vm_lab_exec or vm_browser_* with that lease and always vm_lab_release when finished. For transferable CPU-heavy or long-running builds, test suites, compilers, recursive validators/scans, Docker builds, package builds, PDF/link validation, and similar work, use vm_job_submit. When two or more independent heavy tasks are available, prefer vm_job_submit_batch so one MCP call can fill all six shared workers immediately. The homeserver scheduler chooses workers automatically and runs up to six independent heavy jobs concurrently. Poll with vm_job_status and never resubmit a running job just to check it. Controller-local host/fs/git/docker/browser tools are intentionally unavailable to bots. "
+     "The six KVM workers are persistent computers with visible Chromium desktops. Use vm_worker_status for worker/browser health and direct the human to https://browser.home.markshaw.ca for the six-screen dashboard when useful. For interactive browser work, first call vm_lab_acquire with your stable agent name, then use the returned station and leaseId with vm_browser_* tools; always release the lease when finished. This permits six independent visible browser agents at once without cross-agent clicking/type collisions. vm_lab_exec can use the same lease for shell work. The lightweight Docker lab is legacy/on-demand and should not be preferred over the KVM scheduler. "
+     "For repository scheduler jobs, prefer repoUrl plus revision for a committed/pushed revision so the worker can prepare its own isolated checkout. Use the main github tool for GitHub API/PR operations if gh authentication is not present inside a worker. Do not run an expensive build on the main VM merely because host_exec is convenient. The exception is work that genuinely depends on unsynced main-VM state and cannot safely be transferred first. "
+     "Parallelism rule: issue independent read-only checks concurrently or combine them into one short shell/API call when safe instead of paying serial tool round trips. Never poll by sleeping in a foreground tool call; continue other useful work and poll later. "
+@@ -1863,6 +1885,47 @@
+ ])
+ 
+ 
++class ControllerReservedError(RuntimeError):
++    pass
++
++
++BROKER_DIRECT_TOOL_NAMES = {
++    "prepare_chat_handoff",
++    "chatgpt_browser_status",
++    "chatgpt_auth_begin",
++    "chatgpt_start_chat",
++    "vm_lab_list",
++    "vm_lab_acquire",
++    "vm_lab_release",
++    "vm_lab_exec",
++    "vm_lab_gc",
++    "vm_job_submit",
++    "vm_job_submit_batch",
++    "vm_job_status",
++    "vm_job_list",
++    "vm_job_cancel",
++    "vm_worker_status",
++}
++
++
++def controller_reserved_message(name=None):
++    prefix = f"Tool {name!r} is controller-local and was not executed. " if name else "Controller-local execution was not performed. "
++    return (
++        prefix
++        + "The user console/control VM is reserved for Mark. Use vm_lab_acquire + vm_lab_exec for "
++          "interactive repository/shell work, vm_job_submit or vm_job_submit_batch for transferable "
++          "build/test work, and vm_browser_* with an active lease for visible browser work."
++    )
++
++
++def broker_direct_tools():
++    return [
++        entry["descriptor"]
++        for name, entry in DIRECT_TOOLS.items()
++        if name in BROKER_DIRECT_TOOL_NAMES
++    ]
++
++
+ SEND_LOCK = threading.Lock()
+ LOG_LOCK = threading.Lock()
+ REQUEST_EXECUTOR = ThreadPoolExecutor(
+@@ -1894,12 +1957,13 @@
+     if method == "ping":
+         return {"jsonrpc": "2.0", "id": request_id, "result": {}}
+     if method == "tools/list":
+-        tools = [entry["descriptor"] for entry in DIRECT_TOOLS.values()]
++        tools = broker_direct_tools() if BROKER_ONLY else [entry["descriptor"] for entry in DIRECT_TOOLS.values()]
+         try:
+-            tools.extend(
+-                item for item in BROWSER_CLIENT.list_tools()
+-                if item.get("name") not in DIRECT_TOOLS
+-            )
++            if not BROKER_ONLY:
++                tools.extend(
++                    item for item in BROWSER_CLIENT.list_tools()
++                    if item.get("name") not in DIRECT_TOOLS
++                )
+             tools.extend(KVM_BROWSER_POOL.tool_descriptors())
+         except Exception as error:
+             sys.stderr.write(f"Visual browser tools are temporarily unavailable: {error}\n")
+@@ -1909,6 +1973,8 @@
+         name = params.get("name")
+         arguments = params.get("arguments") or {}
+         try:
++            if BROKER_ONLY and name not in BROKER_DIRECT_TOOL_NAMES and not (name and name.startswith("vm_browser_")):
++                raise ControllerReservedError(controller_reserved_message(name))
+             if name in DIRECT_TOOLS:
+                 result = DIRECT_TOOLS[name]["handler"](arguments)
+             elif name and name.startswith("vm_browser_"):
+--- a/codex-replacer/http-server.py
++++ b/codex-replacer/http-server.py
+@@ -216,26 +216,27 @@
+ 
+ 
+ def warm_dependencies():
+-    started = time.monotonic()
+-    try:
+-        tools = server.BROWSER_CLIENT.list_tools()
+-        event = {
+-            "time": server.now_iso(),
+-            "event": "mcp_dependency_warmed",
+-            "dependency": "visual_browser",
+-            "toolCount": len(tools),
+-            "elapsedMs": round((time.monotonic() - started) * 1000, 2),
+-        }
+-    except Exception as error:
+-        event = {
+-            "time": server.now_iso(),
+-            "event": "mcp_dependency_warm_failed",
+-            "dependency": "visual_browser",
+-            "error": str(error),
+-            "elapsedMs": round((time.monotonic() - started) * 1000, 2),
+-        }
+-    sys.stderr.write(json.dumps(event, separators=(",", ":")) + "\n")
+-    sys.stderr.flush()
++    if not server.BROKER_ONLY:
++        started = time.monotonic()
++        try:
++            tools = server.BROWSER_CLIENT.list_tools()
++            event = {
++                "time": server.now_iso(),
++                "event": "mcp_dependency_warmed",
++                "dependency": "visual_browser",
++                "toolCount": len(tools),
++                "elapsedMs": round((time.monotonic() - started) * 1000, 2),
++            }
++        except Exception as error:
++            event = {
++                "time": server.now_iso(),
++                "event": "mcp_dependency_warm_failed",
++                "dependency": "visual_browser",
++                "error": str(error),
++                "elapsedMs": round((time.monotonic() - started) * 1000, 2),
++            }
++        sys.stderr.write(json.dumps(event, separators=(",", ":")) + "\n")
++        sys.stderr.flush()
+ 
+     kvm_started = time.monotonic()
+     try:
