@@ -163,13 +163,62 @@ def _remote_exclusive_lease(station):
 
 def reset_worker_vault(station):
     """Remove reusable Bitwarden state before a shared VM changes hands."""
+    scrubber = f"""
+import json
+import os
+import pathlib
+import tempfile
+
+path = pathlib.Path('/home/mark/.config/Bitwarden CLI/data.json')
+path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+state_version = 79
+try:
+    existing = json.loads(path.read_text())
+    if isinstance(existing.get('stateVersion'), int):
+        state_version = existing['stateVersion']
+except (FileNotFoundError, json.JSONDecodeError, OSError):
+    pass
+clean = {{
+    'global_environment_environment': {{
+        'region': 'Self-hosted',
+        'urls': {{
+            'api': None,
+            'base': {VAULT_URL!r},
+            'events': None,
+            'icons': None,
+            'identity': None,
+            'keyConnector': None,
+            'notifications': None,
+            'send': None,
+            'webVault': None,
+        }},
+    }},
+    'stateVersion': state_version,
+}}
+handle, temporary = tempfile.mkstemp(prefix='.data.json.', dir=path.parent)
+try:
+    os.fchmod(handle, 0o600)
+    with os.fdopen(handle, 'w') as stream:
+        json.dump(clean, stream, separators=(',', ':'))
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+finally:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+"""
     command = (
         "if command -v bw >/dev/null 2>&1; then "
-        "bw logout >/dev/null 2>&1 || true; "
-        f"bw config server {shlex.quote(VAULT_URL)} >/dev/null 2>&1 || true; "
+        "timeout 3s bw logout >/dev/null 2>&1 || true; "
+        f"python3 -c {shlex.quote(scrubber)}; "
         "fi"
     )
-    result = ssh_guest(int(station), command, 12)
+    try:
+        result = ssh_guest(int(station), command, 8)
+    except subprocess.TimeoutExpired:
+        return False
     return result.returncode == 0
 
 
@@ -247,7 +296,8 @@ def acquire(owner, project=None, ttl_minutes=180, chat_label=None, chat_url=None
             r=record_for(state,s)
             if r.get("status")=="leased": continue
             ensure_station(s)
-            reset_worker_vault(s)
+            if not reset_worker_vault(s):
+                continue
             repair = ssh_guest(
                 s,
                 "mkdir -p /home/mark/.local/share/codex-worker && flock -n /home/mark/.local/share/codex-worker/claim.lock sh -c 'test ! -e /home/mark/.local/share/codex-worker/scheduler.lock && rm -f /home/mark/.local/share/codex-worker/exclusive.lock'",
@@ -324,6 +374,11 @@ def release(lease_id=None, station=None, reason="released", recycle=False):
         record = find_active(state, lease_id, station)
         old = record.copy()
         station_number = int(record["station"])
+        if not reset_worker_vault(station_number):
+            raise RuntimeError(
+                f"Could not scrub vault state on worker {station_number}; "
+                "the lease remains active"
+            )
         clear = ssh_guest(
             station_number,
             "rm -f /home/mark/.local/share/codex-worker/exclusive.lock",
@@ -334,7 +389,6 @@ def release(lease_id=None, station=None, reason="released", recycle=False):
                 f"Could not clear exclusive lock on worker {station_number}: "
                 f"{(clear.stderr or clear.stdout).strip()}"
             )
-        reset_worker_vault(station_number)
         _mark_free(record, reason)
         save_state(state)
         audit(
