@@ -1,25 +1,21 @@
 #!/usr/bin/env python3
-"""Run a GitHub Actions workspace on one shared Codex KVM worker.
+"""Dispatch a clean GitHub Actions checkout to one shared Codex KVM worker.
 
-This client is intended for lightweight self-hosted GitHub runners on the
-homeserver.  It does not make a worker project-specific.  Instead it claims a
-station with the same claim.lock / scheduler.lock / exclusive.lock protocol
-used by interactive Codex leases, streams a credential-free source snapshot to
-that worker, runs the requested command, optionally pulls declared artifacts
-back, and always releases/scrubs the worker.
+The SSH key used by this client is deliberately restricted on every worker to
+codex-ci-worker-rpc.py.  The runner cannot bypass the shared VM claim locks or
+access another lease's workspace.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import pathlib
-import shlex
 import subprocess
 import sys
 import time
-import urllib.error
 import urllib.request
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -30,7 +26,10 @@ SSH_USER = os.environ.get("CODEX_CI_SSH_USER", "mark")
 SSH_KEY = os.environ.get("CODEX_CI_SSH_KEY", "/var/lib/codex-ci/ssh/id_ed25519_codex_ci")
 KNOWN_HOSTS = os.environ.get("CODEX_CI_KNOWN_HOSTS", "/var/lib/codex-ci/ssh/known_hosts")
 SCHEDULER_URL = os.environ.get("CODEX_LAB_SCHEDULER_URL", "http://192.168.122.1:8766").rstrip("/")
-REMOTE_ROOT = os.environ.get("CODEX_CI_REMOTE_ROOT", "/workspace/ci-dispatch")
+
+
+def encode(value: str) -> str:
+    return base64.urlsafe_b64encode(value.encode()).rstrip(b"=").decode()
 
 
 def now_iso() -> str:
@@ -38,8 +37,6 @@ def now_iso() -> str:
 
 
 def worker_ip(station: int) -> str:
-    # The six canonical workers are 192.168.122.230 .. .235.  Keep the base
-    # configurable for future labs while retaining deterministic station IDs.
     prefix, last = WORKER_BASE.rsplit(".", 1)
     return f"{prefix}.{int(last) + int(station)}"
 
@@ -56,30 +53,23 @@ def ssh_base(station: int) -> list[str]:
     ]
 
 
-def ssh_run(station: int, command: str, *, input_bytes: bytes | None = None,
-            timeout: int = 30, capture: bool = True) -> subprocess.CompletedProcess:
-    kwargs = {
-        "input": input_bytes,
-        "timeout": timeout,
-        "check": False,
-    }
-    if capture:
-        kwargs.update({"stdout": subprocess.PIPE, "stderr": subprocess.PIPE})
-    return subprocess.run([*ssh_base(station), command], **kwargs)
+def ssh_capture(station: int, original_command: str, *, input_bytes: bytes | None = None,
+                timeout: int = 30) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [*ssh_base(station), original_command], input=input_bytes,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False,
+    )
 
 
 def post_usage(payload: dict) -> None:
     data = json.dumps(payload, separators=(",", ":")).encode()
     request = urllib.request.Request(
-        SCHEDULER_URL + "/api/usage",
-        data=data,
-        method="POST",
+        SCHEDULER_URL + "/api/usage", data=data, method="POST",
         headers={"Content-Type": "application/json", "Accept": "application/json"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=2) as response:
-            if response.status >= 300:
-                raise RuntimeError(f"scheduler usage HTTP {response.status}")
+        with urllib.request.urlopen(request, timeout=2):
+            return
     except Exception as exc:
         print(f"warning: scheduler usage record failed: {exc}", file=sys.stderr)
 
@@ -98,40 +88,29 @@ def lease_payload(lease_id: str, owner: str, project: str | None, ttl_minutes: i
     }
 
 
-def try_claim(station: int, payload: dict) -> bool:
-    encoded = json.dumps(payload, separators=(",", ":")).encode()
-    command = (
-        "mkdir -p /home/mark/.local/share/codex-worker && "
-        "flock -n /home/mark/.local/share/codex-worker/claim.lock sh -c "
-        "'test ! -e /home/mark/.local/share/codex-worker/scheduler.lock && "
-        "test ! -e /home/mark/.local/share/codex-worker/exclusive.lock && "
-        "cat > /home/mark/.local/share/codex-worker/exclusive.lock'"
-    )
-    result = ssh_run(station, command, input_bytes=encoded, timeout=8)
-    return result.returncode == 0
-
-
 def acquire(owner: str, project: str | None, wait_seconds: int, ttl_minutes: int) -> tuple[int, dict]:
     deadline = time.monotonic() + max(1, wait_seconds)
     while True:
         start = int(uuid.uuid4().int % MAX_STATIONS) + 1
         for offset in range(MAX_STATIONS):
             station = ((start - 1 + offset) % MAX_STATIONS) + 1
-            ready = ssh_run(
-                station,
-                "test -e /var/lib/codex-lab-ready -a -e /var/lib/codex-worker-workstation-v1",
-                timeout=6,
-            )
-            if ready.returncode != 0:
+            probe = ssh_capture(station, "codex-ci probe", timeout=6)
+            if probe.returncode != 0:
                 continue
             payload = lease_payload(uuid.uuid4().hex, owner, project, ttl_minutes)
-            if try_claim(station, payload):
-                post_usage({
-                    "action": "start", "kind": "ci", "refId": payload["leaseId"],
-                    "station": station, "owner": owner, "project": project,
-                    "startedAt": payload["acquiredAt"], "source": "github-actions",
-                })
-                return station, payload
+            claim = ssh_capture(
+                station,
+                "codex-ci claim " + encode(json.dumps(payload, separators=(",", ":"))),
+                timeout=8,
+            )
+            if claim.returncode != 0:
+                continue
+            post_usage({
+                "action": "start", "kind": "ci", "refId": payload["leaseId"],
+                "station": station, "owner": owner, "project": project,
+                "startedAt": payload["acquiredAt"], "source": "github-actions",
+            })
+            return station, payload
         if time.monotonic() >= deadline:
             raise TimeoutError(f"No shared Codex KVM became free within {wait_seconds}s")
         time.sleep(1)
@@ -139,28 +118,12 @@ def acquire(owner: str, project: str | None, wait_seconds: int, ttl_minutes: int
 
 def release(station: int, payload: dict, status: str) -> None:
     lease_id = payload["leaseId"]
-    remote_dir = f"{REMOTE_ROOT}/{lease_id}"
-    cleanup = f"""
-set -eu
-bw logout >/dev/null 2>&1 || true
-rm -rf {shlex.quote(remote_dir)}
-mkdir -p /home/mark/.local/share/codex-worker
-flock -w 5 /home/mark/.local/share/codex-worker/claim.lock python3 - {shlex.quote(lease_id)} <<'PY'
-import json, os, sys
-path='/home/mark/.local/share/codex-worker/exclusive.lock'
-try:
-    data=json.load(open(path))
-except Exception:
-    data={{}}
-if data.get('leaseId') == sys.argv[1]:
-    try: os.unlink(path)
-    except FileNotFoundError: pass
-PY
-"""
-    result = ssh_run(station, cleanup, timeout=20)
+    result = ssh_capture(station, f"codex-ci release {lease_id}", timeout=20)
     if result.returncode != 0:
-        err = (result.stderr or b"").decode(errors="replace").strip()
-        print(f"warning: worker release cleanup failed on VM {station}: {err}", file=sys.stderr)
+        print(
+            f"warning: worker release failed on VM {station}: "
+            f"{result.stderr.decode(errors='replace').strip()}", file=sys.stderr,
+        )
     post_usage({
         "action": "end", "kind": "ci", "refId": lease_id,
         "station": station, "owner": payload["owner"], "project": payload.get("project"),
@@ -171,72 +134,62 @@ PY
 
 def check_clean_git(workspace: pathlib.Path) -> None:
     result = subprocess.run(
-        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
-        cwd=workspace, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=workspace,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
     )
     if result.returncode != 0:
         raise RuntimeError("workspace is not a Git checkout")
     if result.stdout.strip():
-        raise RuntimeError("workspace is dirty; refusing to dispatch a snapshot that differs from the checked-out revision")
+        raise RuntimeError("workspace is dirty; dispatch only committed Actions checkouts")
 
 
-def stream_snapshot(station: int, payload: dict, workspace: pathlib.Path) -> str:
-    lease_id = payload["leaseId"]
-    remote_dir = f"{REMOTE_ROOT}/{lease_id}"
-    remote_repo = f"{remote_dir}/repo"
-    init_cmd = (
-        f"rm -rf {shlex.quote(remote_dir)} && mkdir -p {shlex.quote(remote_repo)} && "
-        f"tar -xf - -C {shlex.quote(remote_repo)} && cd {shlex.quote(remote_repo)} && "
-        "git init -q && git add -A && "
-        "git -c user.name=Codex-CI -c user.email=codex-ci@localhost commit -qm snapshot --no-gpg-sign"
-    )
+def stream_snapshot(station: int, lease_id: str, workspace: pathlib.Path) -> None:
     archive = subprocess.Popen(
-        ["git", "archive", "--format=tar", "HEAD"], cwd=workspace, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        ["git", "archive", "--format=tar", "HEAD"], cwd=workspace,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     assert archive.stdout is not None
-    remote = subprocess.Popen([*ssh_base(station), init_cmd], stdin=archive.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    remote = subprocess.Popen(
+        [*ssh_base(station), f"codex-ci import {lease_id}"],
+        stdin=archive.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
     archive.stdout.close()
-    remote_stdout, remote_stderr = remote.communicate(timeout=120)
+    _, remote_stderr = remote.communicate(timeout=120)
     archive_stderr = archive.stderr.read() if archive.stderr is not None else b""
     archive_rc = archive.wait(timeout=10)
     if archive_rc != 0:
         raise RuntimeError(f"git archive failed: {archive_stderr.decode(errors='replace').strip()}")
     if remote.returncode != 0:
         raise RuntimeError(f"worker snapshot import failed: {remote_stderr.decode(errors='replace').strip()}")
-    return remote_repo
 
 
-def validate_artifact_path(value: str) -> str:
-    p = pathlib.PurePosixPath(value)
-    if p.is_absolute() or ".." in p.parts or not p.parts:
+def safe_artifact(value: str) -> str:
+    path = pathlib.PurePosixPath(value)
+    if path.is_absolute() or not path.parts or ".." in path.parts:
         raise ValueError(f"artifact path must be repository-relative: {value}")
-    return str(p)
+    return str(path)
 
 
-def pull_artifacts(station: int, remote_repo: str, artifacts: list[str], destination: pathlib.Path) -> None:
+def pull_artifacts(station: int, lease_id: str, artifacts: list[str], destination: pathlib.Path) -> None:
     if not artifacts:
         return
-    clean = [validate_artifact_path(item) for item in artifacts]
+    clean = [safe_artifact(item) for item in artifacts]
     destination.mkdir(parents=True, exist_ok=True)
-    command = "cd " + shlex.quote(remote_repo) + " && tar -cf - -- " + " ".join(shlex.quote(x) for x in clean)
-    remote = subprocess.Popen([*ssh_base(station), command], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    remote_cmd = "codex-ci artifact " + lease_id + " " + " ".join(encode(item) for item in clean)
+    remote = subprocess.Popen([*ssh_base(station), remote_cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     assert remote.stdout is not None
     extract = subprocess.run(["tar", "-xf", "-", "-C", str(destination)], stdin=remote.stdout, check=False)
     remote.stdout.close()
     stderr = remote.stderr.read() if remote.stderr is not None else b""
-    rc = remote.wait(timeout=30)
+    rc = remote.wait(timeout=60)
     if rc != 0 or extract.returncode != 0:
         raise RuntimeError(f"artifact transfer failed: {stderr.decode(errors='replace').strip()}")
 
 
-def run_command(station: int, remote_repo: str, command: str, timeout: int, env: dict[str, str]) -> int:
-    exports = " ".join(f"{key}={shlex.quote(value)}" for key, value in env.items())
-    shell = f"cd {shlex.quote(remote_repo)} && "
-    if exports:
-        shell += f"export {exports}; "
-    shell += f"exec bash -lc {shlex.quote(command)}"
-    completed = subprocess.run([*ssh_base(station), shell], timeout=timeout, check=False)
-    return int(completed.returncode)
+def run_command(station: int, lease_id: str, command: str, timeout: int, env: dict[str, str]) -> int:
+    encoded_env = encode(json.dumps(env, separators=(",", ":")))
+    original = f"codex-ci exec {lease_id} {encode(command)} {encoded_env}"
+    return subprocess.run([*ssh_base(station), original], timeout=timeout, check=False).returncode
 
 
 def parse_env(values: list[str]) -> dict[str, str]:
@@ -253,7 +206,7 @@ def parse_env(values: list[str]) -> dict[str, str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Dispatch one CI command to the shared Codex KVM pool")
-    parser.add_argument("--owner", required=True, help="stable runner/bot owner shown in lab history")
+    parser.add_argument("--owner", required=True)
     parser.add_argument("--project", default=None)
     parser.add_argument("--workspace", default=os.environ.get("GITHUB_WORKSPACE", "."))
     parser.add_argument("--command", required=True)
@@ -277,11 +230,11 @@ def main() -> int:
         station, payload = acquire(args.owner, args.project, args.wait_seconds, args.ttl_minutes)
         print(f"codex_ci_station={station}")
         print(f"codex_ci_worker={worker_ip(station)}")
-        remote_repo = stream_snapshot(station, payload, workspace)
-        rc = run_command(station, remote_repo, args.command, max(1, args.timeout), env)
+        stream_snapshot(station, payload["leaseId"], workspace)
+        rc = run_command(station, payload["leaseId"], args.command, max(1, args.timeout), env)
         if args.artifact:
             destination = pathlib.Path(args.artifact_dest or workspace).resolve()
-            pull_artifacts(station, remote_repo, args.artifact, destination)
+            pull_artifacts(station, payload["leaseId"], args.artifact, destination)
         status = "succeeded" if rc == 0 else "failed"
         return rc
     except subprocess.TimeoutExpired:
