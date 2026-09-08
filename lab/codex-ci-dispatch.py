@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""Dispatch a clean GitHub Actions checkout to one shared Codex KVM worker.
+"""Dispatch CI work to an elastic project-scoped headless KVM.
 
-The SSH key used by this client is deliberately restricted on every worker to
-codex-ci-worker-rpc.py. The runner cannot bypass the shared VM claim locks or
-access another lease's workspace.
+No automatic path in this client targets codex-lab-vm-01..06. Those persistent
+VMs remain available for explicitly interactive/browser/manual work.
 """
-
 from __future__ import annotations
 
 import argparse
@@ -13,309 +11,191 @@ import base64
 import json
 import os
 import pathlib
+import signal
 import subprocess
 import sys
 import time
-import urllib.request
 import uuid
-from datetime import datetime, timedelta, timezone
 
-MAX_STATIONS = max(1, min(int(os.environ.get("CODEX_CI_MAX_STATIONS", "6")), 8))
-WORKER_BASE = os.environ.get("CODEX_CI_WORKER_BASE", "192.168.122.229")
-SSH_USER = os.environ.get("CODEX_CI_SSH_USER", "mark")
-SSH_KEY = os.environ.get("CODEX_CI_SSH_KEY", "/var/lib/codex-ci/ssh/id_ed25519_codex_ci")
-KNOWN_HOSTS = os.environ.get("CODEX_CI_KNOWN_HOSTS", "/var/lib/codex-ci/ssh/known_hosts")
-SCHEDULER_URL = os.environ.get("CODEX_LAB_SCHEDULER_URL", "http://192.168.122.1:8766").rstrip("/")
+MANAGER=os.environ.get("CODEX_CI_HEADLESS_MANAGER","/home/mark/.local/bin/codex-ci-headless")
+SSH_USER=os.environ.get("CODEX_CI_SSH_USER","mark")
+SSH_KEY=os.environ.get("CODEX_CI_SSH_KEY","/home/mark/.local/share/codex-ci/ssh/id_ed25519_codex_ci")
+KNOWN_HOSTS=os.environ.get("CODEX_CI_KNOWN_HOSTS","/home/mark/.local/share/codex-ci/ssh/known_hosts")
 
 
-def encode(value: str) -> str:
-    return base64.urlsafe_b64encode(value.encode()).rstrip(b"=").decode()
+def enc(value): return base64.urlsafe_b64encode(value.encode()).rstrip(b"=").decode()
 
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def manager(*args,timeout=120):
+    cp=subprocess.run([MANAGER,*map(str,args)],text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout,check=False)
+    if cp.returncode: raise RuntimeError(cp.stderr.strip() or cp.stdout.strip() or f"headless manager rc={cp.returncode}")
+    try: return json.loads(cp.stdout)
+    except json.JSONDecodeError as exc: raise RuntimeError(f"invalid manager response: {cp.stdout[:500]}") from exc
 
 
-def worker_ip(station: int) -> str:
-    prefix, last = WORKER_BASE.rsplit(".", 1)
-    return f"{prefix}.{int(last) + int(station)}"
+def ssh_base(rec):
+    return ["ssh","-i",SSH_KEY,"-o","IdentitiesOnly=yes","-o","BatchMode=yes",
+            "-o",f"UserKnownHostsFile={KNOWN_HOSTS}","-o","StrictHostKeyChecking=accept-new",
+            "-o",f"HostKeyAlias=codex-ci-{rec['id']}","-o","ConnectTimeout=5",f"{SSH_USER}@{rec['ip']}"]
 
 
-def ssh_base(station: int) -> list[str]:
-    return [
-        "ssh", "-i", SSH_KEY,
-        "-o", "IdentitiesOnly=yes",
-        "-o", "BatchMode=yes",
-        "-o", f"UserKnownHostsFile={KNOWN_HOSTS}",
-        "-o", "StrictHostKeyChecking=accept-new",
-        "-o", "ConnectTimeout=5",
-        f"{SSH_USER}@{worker_ip(station)}",
-    ]
+def ssh_capture(rec,cmd,input_bytes=None,timeout=30):
+    return subprocess.run([*ssh_base(rec),cmd],input=input_bytes,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout,check=False)
 
 
-def ssh_capture(station: int, original_command: str, *, input_bytes: bytes | None = None,
-                timeout: int = 30) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        [*ssh_base(station), original_command], input=input_bytes,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False,
-    )
+def wait_ready(rec,seconds=180):
+    deadline=time.monotonic()+seconds; last=""
+    while time.monotonic()<deadline:
+        try: cp=ssh_capture(rec,"codex-ci probe",timeout=8)
+        except subprocess.TimeoutExpired: cp=None
+        if cp and cp.returncode==0:
+            try: payload=json.loads(cp.stdout.decode())
+            except Exception: payload={}
+            if payload.get("ready") and payload.get("mode")=="headless": return payload
+            last=f"unexpected probe {payload!r}"
+        elif cp: last=(cp.stderr or cp.stdout).decode(errors="replace").strip()
+        time.sleep(2)
+    raise RuntimeError(f"headless worker did not become ready: {last}")
 
 
-def post_usage(payload: dict) -> None:
-    data = json.dumps(payload, separators=(",", ":")).encode()
-    request = urllib.request.Request(
-        SCHEDULER_URL + "/api/usage", data=data, method="POST",
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=2):
-            return
-    except Exception as exc:
-        print(f"warning: scheduler usage record failed: {exc}", file=sys.stderr)
+def safe_path(value,allow_git=False):
+    p=pathlib.PurePosixPath(value)
+    if p.is_absolute() or not p.parts or ".." in p.parts or (not allow_git and p.parts[0]==".git"):
+        raise ValueError(f"unsafe repository-relative path: {value}")
+    return str(p)
 
 
-def lease_payload(lease_id: str, owner: str, project: str | None, ttl_minutes: int) -> dict:
-    acquired = datetime.now(timezone.utc)
-    return {
-        "leaseId": lease_id,
-        "owner": owner,
-        "project": project,
-        "chatLabel": None,
-        "chatUrl": None,
-        "source": "github-actions",
-        "acquiredAt": acquired.isoformat(),
-        "expiresAt": (acquired + timedelta(minutes=ttl_minutes)).isoformat(),
-    }
-
-
-def acquire(owner: str, project: str | None, wait_seconds: int, ttl_minutes: int) -> tuple[int, dict]:
-    deadline = time.monotonic() + max(1, wait_seconds)
-    while True:
-        start = int(uuid.uuid4().int % MAX_STATIONS) + 1
-        for offset in range(MAX_STATIONS):
-            station = ((start - 1 + offset) % MAX_STATIONS) + 1
-            probe = ssh_capture(station, "codex-ci probe", timeout=6)
-            if probe.returncode != 0:
-                continue
-            payload = lease_payload(uuid.uuid4().hex, owner, project, ttl_minutes)
-            claim = ssh_capture(
-                station,
-                "codex-ci claim " + encode(json.dumps(payload, separators=(",", ":"))),
-                timeout=8,
-            )
-            if claim.returncode != 0:
-                continue
-            post_usage({
-                "action": "start", "kind": "ci", "refId": payload["leaseId"],
-                "station": station, "owner": owner, "project": project,
-                "startedAt": payload["acquiredAt"], "source": "github-actions",
-            })
-            return station, payload
-        if time.monotonic() >= deadline:
-            raise TimeoutError(f"No shared Codex KVM became free within {wait_seconds}s")
-        time.sleep(1)
-
-
-def release(station: int, payload: dict, status: str) -> None:
-    lease_id = payload["leaseId"]
-    result = ssh_capture(station, f"codex-ci release {lease_id}", timeout=20)
-    if result.returncode != 0:
-        print(
-            f"warning: worker release failed on VM {station}: "
-            f"{result.stderr.decode(errors='replace').strip()}", file=sys.stderr,
-        )
-    post_usage({
-        "action": "end", "kind": "ci", "refId": lease_id,
-        "station": station, "owner": payload["owner"], "project": payload.get("project"),
-        "startedAt": payload["acquiredAt"], "finishedAt": now_iso(),
-        "status": status, "source": "github-actions",
-    })
-
-
-def safe_input(value: str) -> str:
-    path = pathlib.PurePosixPath(value)
-    if path.is_absolute() or not path.parts or ".." in path.parts or path.parts[0] == ".git":
-        raise ValueError(f"input path must be repository-relative and outside .git: {value}")
-    return str(path)
-
-
-def git_paths(workspace: pathlib.Path, command: list[str]) -> set[str]:
-    result = subprocess.run(
-        command, cwd=workspace, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.decode(errors="replace").strip() or "git workspace inspection failed")
-    return {
-        item.decode(errors="surrogateescape")
-        for item in result.stdout.split(b"\0")
-        if item
-    }
-
-
-def check_workspace_inputs(workspace: pathlib.Path, inputs: list[str]) -> None:
-    """Reject undeclared workspace mutations while permitting explicit overlay inputs.
-
-    GitHub Actions commonly downloads or generates artifacts after checkout. Those
-    files must be declared with --input before they can be streamed into a leased
-    worker. Any modified, staged, or untracked path outside those declared roots
-    still fails closed, preserving the committed-checkout boundary.
-    """
-    probe = subprocess.run(
-        ["git", "rev-parse", "--is-inside-work-tree"], cwd=workspace,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
-    )
-    if probe.returncode != 0 or probe.stdout.strip() != "true":
-        raise RuntimeError("workspace is not a Git checkout")
-
-    allowed = [pathlib.PurePosixPath(safe_input(item)) for item in inputs]
-    dirty = set()
-    dirty |= git_paths(workspace, ["git", "diff", "--no-renames", "--name-only", "-z"])
-    dirty |= git_paths(workspace, ["git", "diff", "--cached", "--no-renames", "--name-only", "-z"])
-    dirty |= git_paths(workspace, ["git", "ls-files", "--others", "--exclude-standard", "-z"])
-
-    def permitted(value: str) -> bool:
-        path = pathlib.PurePosixPath(value)
-        return any(path == root or root in path.parents for root in allowed)
-
-    unexpected = sorted(path for path in dirty if not permitted(path))
-    if unexpected:
-        sample = ", ".join(unexpected[:20])
-        suffix = " ..." if len(unexpected) > 20 else ""
-        raise RuntimeError(
-            "workspace contains undeclared changes; dispatch only committed checkout plus explicit --input paths: "
-            + sample + suffix
-        )
-
-
-def stream_snapshot(station: int, lease_id: str, workspace: pathlib.Path) -> None:
-    archive = subprocess.Popen(
-        ["git", "archive", "--format=tar", "HEAD"], cwd=workspace,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
-    assert archive.stdout is not None
-    remote = subprocess.Popen(
-        [*ssh_base(station), f"codex-ci import {lease_id}"],
-        stdin=archive.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
-    archive.stdout.close()
-    _, remote_stderr = remote.communicate(timeout=120)
-    archive_stderr = archive.stderr.read() if archive.stderr is not None else b""
-    archive_rc = archive.wait(timeout=10)
-    if archive_rc != 0:
-        raise RuntimeError(f"git archive failed: {archive_stderr.decode(errors='replace').strip()}")
-    if remote.returncode != 0:
-        raise RuntimeError(f"worker snapshot import failed: {remote_stderr.decode(errors='replace').strip()}")
-
-
-def push_inputs(station: int, lease_id: str, workspace: pathlib.Path, inputs: list[str]) -> None:
-    if not inputs:
-        return
-    clean = [safe_input(item) for item in inputs]
-    for item in clean:
-        if not (workspace / item).exists():
-            raise FileNotFoundError(f"input path does not exist: {item}")
-    archive = subprocess.Popen(
-        ["tar", "-cf", "-", "--", *clean], cwd=workspace, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
-    assert archive.stdout is not None
-    remote = subprocess.Popen(
-        [*ssh_base(station), f"codex-ci overlay {lease_id}"],
-        stdin=archive.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
-    archive.stdout.close()
-    _, remote_stderr = remote.communicate(timeout=300)
-    archive_stderr = archive.stderr.read() if archive.stderr is not None else b""
-    archive_rc = archive.wait(timeout=10)
-    if archive_rc != 0:
-        raise RuntimeError(f"input archive failed: {archive_stderr.decode(errors='replace').strip()}")
-    if remote.returncode != 0:
-        raise RuntimeError(f"worker input overlay failed: {remote_stderr.decode(errors='replace').strip()}")
-
-
-def safe_artifact(value: str) -> str:
-    path = pathlib.PurePosixPath(value)
-    if path.is_absolute() or not path.parts or ".." in path.parts:
-        raise ValueError(f"artifact path must be repository-relative: {value}")
-    return str(path)
-
-
-def pull_artifacts(station: int, lease_id: str, artifacts: list[str], destination: pathlib.Path) -> None:
-    if not artifacts:
-        return
-    clean = [safe_artifact(item) for item in artifacts]
-    destination.mkdir(parents=True, exist_ok=True)
-    remote_cmd = "codex-ci artifact " + lease_id + " " + " ".join(encode(item) for item in clean)
-    remote = subprocess.Popen([*ssh_base(station), remote_cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    assert remote.stdout is not None
-    extract = subprocess.run(["tar", "-xf", "-", "-C", str(destination)], stdin=remote.stdout, check=False)
-    remote.stdout.close()
-    stderr = remote.stderr.read() if remote.stderr is not None else b""
-    rc = remote.wait(timeout=300)
-    if rc != 0 or extract.returncode != 0:
-        raise RuntimeError(f"artifact transfer failed: {stderr.decode(errors='replace').strip()}")
-
-
-def run_command(station: int, lease_id: str, command: str, timeout: int, env: dict[str, str]) -> int:
-    encoded_env = encode(json.dumps(env, separators=(",", ":")))
-    original = f"codex-ci exec {lease_id} {encode(command)} {encoded_env}"
-    return subprocess.run([*ssh_base(station), original], timeout=timeout, check=False).returncode
-
-
-def parse_env(values: list[str]) -> dict[str, str]:
-    out: dict[str, str] = {}
-    for item in values:
-        if "=" not in item:
-            raise ValueError(f"--env requires KEY=VALUE, got {item!r}")
-        key, value = item.split("=", 1)
-        if not key or not key.replace("_", "a").isalnum() or not (key[0].isalpha() or key[0] == "_"):
-            raise ValueError(f"invalid environment name: {key}")
-        out[key] = value
+def dirty_paths(workspace):
+    out=set()
+    for cmd in (["git","diff","--no-renames","--name-only","-z"],["git","diff","--cached","--no-renames","--name-only","-z"],["git","ls-files","--others","--exclude-standard","-z"]):
+        cp=subprocess.run(cmd,cwd=workspace,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
+        if cp.returncode: raise RuntimeError(cp.stderr.decode(errors="replace").strip() or "git workspace inspection failed")
+        out|={x.decode(errors="surrogateescape") for x in cp.stdout.split(b"\0") if x}
     return out
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Dispatch one CI command to the shared Codex KVM pool")
-    parser.add_argument("--owner", required=True)
-    parser.add_argument("--project", default=None)
-    parser.add_argument("--workspace", default=os.environ.get("GITHUB_WORKSPACE", "."))
-    parser.add_argument("--command", required=True)
-    parser.add_argument("--timeout", type=int, default=3600)
-    parser.add_argument("--wait-seconds", type=int, default=600)
-    parser.add_argument("--ttl-minutes", type=int, default=180)
-    parser.add_argument("--input", action="append", default=[], help="repository-relative path to overlay after the clean Git snapshot")
-    parser.add_argument("--artifact", action="append", default=[])
-    parser.add_argument("--artifact-dest", default=None)
-    parser.add_argument("--env", action="append", default=[])
-    args = parser.parse_args()
+def validate_workspace(workspace,inputs):
+    cp=subprocess.run(["git","rev-parse","--is-inside-work-tree"],cwd=workspace,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
+    if cp.returncode or cp.stdout.strip()!="true": raise RuntimeError("workspace is not a Git checkout")
+    roots=[pathlib.PurePosixPath(safe_path(x)) for x in inputs]
+    def allowed(x):
+        p=pathlib.PurePosixPath(x); return any(p==r or r in p.parents for r in roots)
+    unexpected=sorted(x for x in dirty_paths(workspace) if not allowed(x))
+    if unexpected: raise RuntimeError("workspace contains undeclared changes: "+", ".join(unexpected[:20]))
 
-    workspace = pathlib.Path(args.workspace).resolve()
-    if not workspace.is_dir():
-        raise SystemExit(f"workspace does not exist: {workspace}")
-    check_workspace_inputs(workspace, args.input)
-    env = parse_env(args.env)
-    station = 0
-    payload = None
-    status = "failed"
-    try:
-        station, payload = acquire(args.owner, args.project, args.wait_seconds, args.ttl_minutes)
-        print(f"codex_ci_station={station}")
-        print(f"codex_ci_worker={worker_ip(station)}")
-        stream_snapshot(station, payload["leaseId"], workspace)
-        push_inputs(station, payload["leaseId"], workspace, args.input)
-        rc = run_command(station, payload["leaseId"], args.command, max(1, args.timeout), env)
-        if args.artifact:
-            destination = pathlib.Path(args.artifact_dest or workspace).resolve()
-            pull_artifacts(station, payload["leaseId"], args.artifact, destination)
-        status = "succeeded" if rc == 0 else "failed"
-        return rc
+
+def stream_snapshot(rec,iid,workspace):
+    archive=subprocess.Popen(["git","archive","--format=tar","HEAD"],cwd=workspace,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    remote=subprocess.Popen([*ssh_base(rec),f"codex-ci import {iid}"],stdin=archive.stdout,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    archive.stdout.close(); _,rerr=remote.communicate(timeout=180); aerr=archive.stderr.read(); arc=archive.wait(timeout=10)
+    if arc: raise RuntimeError("git archive failed: "+aerr.decode(errors="replace").strip())
+    if remote.returncode: raise RuntimeError("worker import failed: "+rerr.decode(errors="replace").strip())
+
+
+def push_inputs(rec,iid,workspace,inputs):
+    for raw in inputs:
+        item=safe_path(raw)
+        if not (workspace/item).exists(): raise FileNotFoundError(f"input path does not exist: {item}")
+        tar=subprocess.Popen(["tar","-cf","-","--",item],cwd=workspace,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        remote=subprocess.Popen([*ssh_base(rec),f"codex-ci overlay {iid}"],stdin=tar.stdout,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        tar.stdout.close(); _,rerr=remote.communicate(timeout=300); terr=tar.stderr.read(); trc=tar.wait(timeout=10)
+        if trc: raise RuntimeError("input archive failed: "+terr.decode(errors="replace").strip())
+        if remote.returncode: raise RuntimeError("worker overlay failed: "+rerr.decode(errors="replace").strip())
+
+
+def cancel(rec,iid):
+    try: ssh_capture(rec,f"codex-ci cancel {iid}",timeout=15)
+    except Exception: pass
+
+
+def run_command(rec,iid,command,timeout,env):
+    original=f"codex-ci exec {iid} {enc(command)} {enc(json.dumps(env,separators=(',',':')))}"
+    proc=subprocess.Popen([*ssh_base(rec),original])
+    try: return proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        status = "timed_out"
-        print("Codex CI worker command timed out", file=sys.stderr)
-        return 124
+        proc.terminate()
+        try: proc.wait(timeout=5)
+        except subprocess.TimeoutExpired: proc.kill()
+        cancel(rec,iid); raise
+
+
+def pull_artifacts(rec,iid,artifacts,destination):
+    if not artifacts: return
+    clean=[safe_path(x,allow_git=True) for x in artifacts]; destination.mkdir(parents=True,exist_ok=True)
+    cmd="codex-ci artifact "+iid+" "+" ".join(enc(x) for x in clean)
+    remote=subprocess.Popen([*ssh_base(rec),cmd],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    extract=subprocess.run(["tar","-xf","-","-C",str(destination)],stdin=remote.stdout,check=False)
+    remote.stdout.close(); err=remote.stderr.read(); rc=remote.wait(timeout=300)
+    if rc or extract.returncode: raise RuntimeError("artifact transfer failed: "+err.decode(errors="replace").strip())
+
+
+def parse_env(values):
+    out={}
+    for item in values:
+        if "=" not in item: raise ValueError(f"--env requires KEY=VALUE: {item}")
+        k,v=item.split("=",1)
+        if not k or not k.replace("_","a").isalnum() or not (k[0].isalpha() or k[0]=="_"): raise ValueError(f"invalid environment name: {k}")
+        out[k]=v
+    return out
+
+
+def acquire(a):
+    deadline=time.monotonic()+max(1,a.wait_seconds); last=""
+    ttl=max(a.timeout+600,a.ttl_minutes*60,int(a.persist_hours*3600) if a.persist_hours else 0)
+    while True:
+        argv=["acquire","--owner",a.owner,"--project",a.project or "","--ttl-seconds",str(ttl),
+              "--memory-mib",str(a.memory_mib),"--max-memory-mib",str(a.max_memory_mib),
+              "--vcpus",str(a.vcpus),"--disk-gib",str(a.disk_gib)]
+        if a.session_key: argv += ["--session-key",a.session_key]
+        try: return manager(*argv,timeout=150)
+        except RuntimeError as exc:
+            last=str(exc)
+            if time.monotonic()>=deadline: raise TimeoutError(f"no safe headless KVM capacity within {a.wait_seconds}s: {last}")
+            time.sleep(2)
+
+
+def main():
+    p=argparse.ArgumentParser(description="Dispatch one CI command to an elastic project-scoped headless KVM")
+    p.add_argument("--owner",required=True); p.add_argument("--project",default="")
+    p.add_argument("--workspace",default=os.environ.get("GITHUB_WORKSPACE",".")); p.add_argument("--command",required=True)
+    p.add_argument("--timeout",type=int,default=3600); p.add_argument("--wait-seconds",type=int,default=600); p.add_argument("--ttl-minutes",type=int,default=180)
+    p.add_argument("--persist-hours",type=float,default=0); p.add_argument("--session-key",default="")
+    p.add_argument("--memory-mib",type=int,default=int(os.environ.get("CODEX_CI_HEADLESS_MEMORY_MIB","2048")))
+    p.add_argument("--max-memory-mib",type=int,default=int(os.environ.get("CODEX_CI_HEADLESS_MAX_MEMORY_MIB","4096")))
+    p.add_argument("--vcpus",type=int,default=int(os.environ.get("CODEX_CI_HEADLESS_VCPUS","2"))); p.add_argument("--disk-gib",type=int,default=40)
+    p.add_argument("--input",action="append",default=[]); p.add_argument("--artifact",action="append",default=[]); p.add_argument("--artifact-dest",default=None); p.add_argument("--env",action="append",default=[])
+    a=p.parse_args()
+    if a.persist_hours and not a.session_key: p.error("--persist-hours requires --session-key")
+    workspace=pathlib.Path(a.workspace).resolve(); validate_workspace(workspace,a.input); env=parse_env(a.env)
+    rec=None; iid=None; claimed=False; rc=1; status="failed"; old={}
+    class Interrupted(Exception): pass
+    def interrupted(_sig,_frame): raise Interrupted()
+    try:
+        rec=acquire(a); print(f"codex_ci_instance={rec['id']}"); print(f"codex_ci_vm={rec['name']}"); print(f"codex_ci_worker={rec['ip']}"); print(f"codex_ci_reused={str(bool(rec.get('reused'))).lower()}")
+        wait_ready(rec); iid=uuid.uuid4().hex
+        payload={"leaseId":iid,"owner":a.owner,"project":a.project or None,"source":"github-actions"}
+        cp=ssh_capture(rec,"codex-ci claim "+enc(json.dumps(payload,separators=(",", ":"))),timeout=15)
+        if cp.returncode: raise RuntimeError("headless worker claim failed: "+(cp.stderr or cp.stdout).decode(errors="replace").strip())
+        claimed=True
+        for sig in (signal.SIGTERM,signal.SIGINT): old[sig]=signal.signal(sig,interrupted)
+        stream_snapshot(rec,iid,workspace); push_inputs(rec,iid,workspace,a.input)
+        rc=run_command(rec,iid,a.command,max(1,a.timeout),env)
+        pull_artifacts(rec,iid,a.artifact,pathlib.Path(a.artifact_dest or workspace).resolve())
+        status="succeeded" if rc==0 else "failed"; return rc
+    except subprocess.TimeoutExpired:
+        status="timed_out"; print("Codex CI worker command timed out",file=sys.stderr); return 124
+    except Interrupted:
+        status="cancelled"; print("Codex CI dispatch interrupted",file=sys.stderr); return 130
     finally:
-        if station and payload:
-            release(station, payload, status)
+        for sig,handler in old.items(): signal.signal(sig,handler)
+        if rec and iid and claimed:
+            if status in ("timed_out","cancelled"): cancel(rec,iid)
+            try: ssh_capture(rec,f"codex-ci release {iid}",timeout=20)
+            except Exception: pass
+        if rec:
+            keep=max(0,int(a.persist_hours*3600))
+            try: manager("finish",rec["id"],"--status",status,"--exit-code",str(rc),"--reason",status,"--keep-seconds",str(keep),timeout=90)
+            except Exception as exc: print(f"warning: headless lifecycle cleanup failed: {exc}",file=sys.stderr)
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+if __name__=="__main__": raise SystemExit(main())

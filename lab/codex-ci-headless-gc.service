@@ -1,0 +1,6 @@
+[Unit]
+Description=Reap expired Codex headless CI KVMs
+
+[Service]
+Type=oneshot
+ExecStart=/home/mark/.local/bin/codex-ci-headless gc
