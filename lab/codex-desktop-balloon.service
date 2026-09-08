@@ -1,0 +1,6 @@
+[Unit]
+Description=Rebalance memory for persistent interactive Codex desktops
+
+[Service]
+Type=oneshot
+ExecStart=/home/mark/.local/bin/codex-ci-headless rebalance-desktops

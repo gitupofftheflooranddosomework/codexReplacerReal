@@ -1,0 +1,11 @@
+[Unit]
+Description=Rebalance idle/active memory for persistent interactive Codex desktops
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=15s
+AccuracySec=5s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

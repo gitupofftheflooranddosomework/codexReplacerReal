@@ -1,0 +1,430 @@
+#!/usr/bin/env python3
+"""Elastic project-scoped headless KVM allocator for CI/build/test overflow.
+
+The persistent codex-lab-vm-01..06 desktop pool is deliberately excluded.
+Instances are disposable by default, optionally retained behind a session key
+for a bounded TTL, and always recorded in durable lifecycle history.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import json
+import os
+import pathlib
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+
+URI = os.environ.get("CODEX_CI_LIBVIRT_URI", "qemu:///system")
+NETWORK = os.environ.get("CODEX_CI_NETWORK", "default")
+ROOT = pathlib.Path(os.environ.get("CODEX_CI_HEADLESS_ROOT", "/tank/vm/codex-ci-headless"))
+DB = pathlib.Path(os.environ.get("CODEX_CI_HEADLESS_DB", str(ROOT / "lifecycle.sqlite3")))
+STATE = pathlib.Path(os.environ.get("CODEX_CI_HEADLESS_STATE", str(ROOT / "state.json")))
+LOCK = pathlib.Path(os.environ.get("CODEX_CI_HEADLESS_LOCK", str(ROOT / "allocator.lock")))
+BASE = os.environ.get("CODEX_CI_HEADLESS_BASE", "codex-ci-base-v1.qcow2")
+STORES = [pathlib.Path(x.strip()) for x in os.environ.get(
+    "CODEX_CI_HEADLESS_STORAGE_ROOTS",
+    "/tank/vm/codex-ci-headless,/tank2/vm/codex-ci-headless,/tank3/vm/codex-ci-headless",
+).split(",") if x.strip()]
+IP_FIRST = int(os.environ.get("CODEX_CI_HEADLESS_IP_START", "240"))
+IP_LAST = int(os.environ.get("CODEX_CI_HEADLESS_IP_END", "253"))
+MAX_ACTIVE = max(1, int(os.environ.get("CODEX_CI_HEADLESS_MAX_ACTIVE", "12")))
+PROJECT_MAX = max(1, int(os.environ.get("CODEX_CI_HEADLESS_PROJECT_MAX_ACTIVE", str(MAX_ACTIVE))))
+MEM_MIB = max(768, int(os.environ.get("CODEX_CI_HEADLESS_MEMORY_MIB", "2048")))
+MAX_MEM_MIB = max(MEM_MIB, int(os.environ.get("CODEX_CI_HEADLESS_MAX_MEMORY_MIB", "4096")))
+VCPUS = max(1, int(os.environ.get("CODEX_CI_HEADLESS_VCPUS", "2")))
+DISK_GIB = max(10, int(os.environ.get("CODEX_CI_HEADLESS_DISK_GIB", "40")))
+HOST_RESERVE_MIB = max(4096, int(os.environ.get("CODEX_CI_HOST_RESERVE_MIB", "12288")))
+MAX_LOAD_PER_CPU = max(.5, float(os.environ.get("CODEX_CI_MAX_LOAD_PER_CPU", "2.0")))
+DESKTOP_IDLE_MIB = max(2048, int(os.environ.get("CODEX_DESKTOP_IDLE_MIB", "4096")))
+DESKTOP_ACTIVE_MIB = max(DESKTOP_IDLE_MIB, int(os.environ.get("CODEX_DESKTOP_ACTIVE_MIB", "8192")))
+SCHEDULER = os.environ.get("CODEX_LAB_SCHEDULER_URL", "http://127.0.0.1:8766").rstrip("/")
+ACTIVE = ("creating", "running", "idle", "releasing")
+
+
+def now():
+    return datetime.now(timezone.utc)
+
+
+def stamp(value=None):
+    return (value or now()).isoformat()
+
+
+def parse_stamp(value):
+    try:
+        return datetime.fromisoformat(value) if value else None
+    except ValueError:
+        return None
+
+
+def slug(value, limit=18):
+    out = re.sub(r"[^a-z0-9]+", "-", str(value or "ci").lower()).strip("-")
+    return (out or "ci")[:limit]
+
+
+def run(argv, timeout=60, check=True):
+    return subprocess.run(argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          timeout=timeout, check=check)
+
+
+def virsh(*args, timeout=30, check=True):
+    return run(["virsh", "--connect", URI, *map(str, args)], timeout=timeout, check=check)
+
+
+def db():
+    ROOT.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("""CREATE TABLE IF NOT EXISTS instances(
+      id TEXT PRIMARY KEY,name TEXT NOT NULL UNIQUE,ip TEXT NOT NULL,mac TEXT NOT NULL,
+      owner TEXT NOT NULL,project TEXT,session_key TEXT,storage_root TEXT NOT NULL,
+      memory_mib INTEGER NOT NULL,max_memory_mib INTEGER NOT NULL,vcpus INTEGER NOT NULL,
+      disk_gib INTEGER NOT NULL,created_at TEXT NOT NULL,started_at TEXT,finished_at TEXT,
+      expires_at TEXT NOT NULL,destroyed_at TEXT,status TEXT NOT NULL,exit_code INTEGER,
+      teardown_reason TEXT,error TEXT)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS events(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,instance_id TEXT NOT NULL,at TEXT NOT NULL,
+      event TEXT NOT NULL,detail TEXT)""")
+    conn.execute("CREATE INDEX IF NOT EXISTS ci_status ON instances(status,created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS ci_project ON instances(project,status,created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS ci_session ON instances(project,session_key,status)")
+    conn.commit()
+    return conn
+
+
+@contextlib.contextmanager
+def locked():
+    ROOT.mkdir(parents=True, exist_ok=True)
+    LOCK.touch(mode=0o600, exist_ok=True)
+    with LOCK.open("r+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def active_rows(conn):
+    marks = ",".join("?" for _ in ACTIVE)
+    return conn.execute(f"SELECT * FROM instances WHERE status IN ({marks}) ORDER BY created_at", ACTIVE).fetchall()
+
+
+def event(conn, iid, kind, detail=None):
+    conn.execute("INSERT INTO events(instance_id,at,event,detail) VALUES(?,?,?,?)",
+                 (iid, stamp(), kind, detail))
+
+
+def meminfo():
+    values = {}
+    try:
+        for line in pathlib.Path("/proc/meminfo").read_text().splitlines():
+            if ":" in line:
+                key, rest = line.split(":", 1)
+                values[key] = int(rest.strip().split()[0]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return values.get("MemTotal", 0), values.get("MemAvailable", 0)
+
+
+def load_ok():
+    try:
+        return os.getloadavg()[0] <= max(1, os.cpu_count() or 1) * MAX_LOAD_PER_CPU
+    except OSError:
+        return True
+
+
+def reservations():
+    xml = virsh("net-dumpxml", NETWORK, timeout=15, check=False).stdout or ""
+    return set(re.findall(r"\bip=['\"]([^'\"]+)['\"]", xml))
+
+
+def choose_slot(conn):
+    used = {row["ip"] for row in active_rows(conn)} | reservations()
+    for last in range(IP_FIRST, IP_LAST + 1):
+        ip = f"192.168.122.{last}"
+        if ip not in used:
+            return ip, f"52:54:00:ce:00:{last:02x}"
+    raise RuntimeError("no free headless KVM network slot")
+
+
+def choose_store(conn):
+    counts = {str(root): 0 for root in STORES}
+    for row in active_rows(conn):
+        if row["storage_root"] in counts:
+            counts[row["storage_root"]] += 1
+    choices = []
+    for root in STORES:
+        if not (root / BASE).is_file():
+            continue
+        try:
+            free = shutil.disk_usage(root).free
+        except OSError:
+            free = 0
+        choices.append((counts[str(root)], -free, str(root), root))
+    if not choices:
+        raise RuntimeError(f"headless base image {BASE} is missing from all storage roots")
+    return sorted(choices)[0][3]
+
+
+def state_data(conn=None, history_limit=100):
+    own = conn is None
+    conn = conn or db()
+    try:
+        marks = ",".join("?" for _ in ACTIVE)
+        current = [dict(x) for x in conn.execute(
+            f"SELECT * FROM instances WHERE status IN ({marks}) ORDER BY created_at DESC", ACTIVE)]
+        history = [dict(x) for x in conn.execute(
+            f"SELECT * FROM instances WHERE status NOT IN ({marks}) "
+            "ORDER BY COALESCE(destroyed_at,finished_at,created_at) DESC LIMIT ?",
+            (*ACTIVE, int(history_limit)))]
+        total, available = meminfo()
+        return {"time": stamp(), "capacity": {"maxActive": MAX_ACTIVE,
+                "projectMaxActive": PROJECT_MAX, "active": len(current),
+                "freeSlots": max(0, MAX_ACTIVE - len(current)),
+                "hostMemTotalMiB": total, "hostMemAvailableMiB": available,
+                "hostReserveMiB": HOST_RESERVE_MIB,
+                "load1": os.getloadavg()[0] if hasattr(os, "getloadavg") else None},
+                "active": current, "history": history}
+    finally:
+        if own:
+            conn.close()
+
+
+def write_state(conn=None):
+    ROOT.mkdir(parents=True, exist_ok=True)
+    tmp = STATE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state_data(conn), indent=2, sort_keys=True) + "\n")
+    os.chmod(tmp, 0o644)
+    tmp.replace(STATE)
+
+
+def reserve(owner, project, ttl, session_key, memory, max_memory, vcpus, disk):
+    current = now()
+    with locked():
+        conn = db()
+        try:
+            if session_key:
+                row = conn.execute("SELECT * FROM instances WHERE project IS ? AND session_key=? "
+                                   "AND status='idle' ORDER BY created_at DESC LIMIT 1",
+                                   (project, session_key)).fetchone()
+                if row and (parse_stamp(row["expires_at"]) or current) > current:
+                    expiry = current + timedelta(seconds=max(60, ttl))
+                    conn.execute("UPDATE instances SET status='running',expires_at=?,error=NULL WHERE id=?",
+                                 (expiry.isoformat(), row["id"]))
+                    event(conn, row["id"], "reused", f"ttl={ttl}")
+                    conn.commit(); write_state(conn)
+                    return dict(conn.execute("SELECT * FROM instances WHERE id=?", (row["id"],)).fetchone()), True
+            rows = active_rows(conn)
+            if len(rows) >= MAX_ACTIVE:
+                raise RuntimeError(f"headless KVM capacity reached ({len(rows)}/{MAX_ACTIVE})")
+            if sum(1 for r in rows if r["project"] == project) >= PROJECT_MAX:
+                raise RuntimeError(f"project headless KVM capacity reached ({PROJECT_MAX})")
+            _, available = meminfo()
+            if available and available - max_memory < HOST_RESERVE_MIB:
+                raise RuntimeError(f"host RAM guard: {available} MiB available; {HOST_RESERVE_MIB} MiB reserve required")
+            if not load_ok():
+                raise RuntimeError("host load guard is active")
+            store = choose_store(conn)
+            ip, mac = choose_slot(conn)
+            iid = __import__("uuid").uuid4().hex
+            name = f"ci-{slug(project or owner)}-{iid[:8]}"
+            expiry = current + timedelta(seconds=max(60, ttl))
+            conn.execute("INSERT INTO instances VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (iid,name,ip,mac,owner,project,session_key,str(store),memory,max_memory,vcpus,disk,
+                 current.isoformat(),None,None,expiry.isoformat(),None,"creating",None,None,None))
+            event(conn, iid, "reserved", f"ip={ip} store={store}")
+            conn.commit(); write_state(conn)
+            return dict(conn.execute("SELECT * FROM instances WHERE id=?", (iid,)).fetchone()), False
+        finally:
+            conn.close()
+
+
+def add_dhcp(rec):
+    xml = f"<host mac='{rec['mac']}' name='{rec['name']}' ip='{rec['ip']}'/>"
+    virsh("net-update", NETWORK, "add", "ip-dhcp-host", xml, "--live", "--config")
+
+
+def del_dhcp(rec):
+    xml = f"<host mac='{rec['mac']}' name='{rec['name']}' ip='{rec['ip']}'/>"
+    virsh("net-update", NETWORK, "delete", "ip-dhcp-host", xml, "--live", "--config", check=False)
+
+
+def destroy_resources(rec):
+    virsh("destroy", rec["name"], timeout=20, check=False)
+    virsh("undefine", rec["name"], timeout=20, check=False)
+    del_dhcp(rec)
+    shutil.rmtree(pathlib.Path(rec["storage_root"]) / rec["name"], ignore_errors=True)
+
+
+def provision(rec):
+    store = pathlib.Path(rec["storage_root"])
+    base = store / BASE
+    root = store / rec["name"]
+    disk = root / f"{rec['name']}.qcow2"
+    root.mkdir(parents=True, exist_ok=False)
+    try:
+        run(["qemu-img", "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", str(base), str(disk), f"{rec['disk_gib']}G"])
+        add_dhcp(rec)
+        run(["virt-install", "--connect", URI, "--name", rec["name"],
+             "--memory", f"memory={rec['memory_mib']},maxmemory={rec['max_memory_mib']}",
+             "--vcpus", str(rec["vcpus"]), "--cpu", "host-passthrough",
+             "--disk", f"path={disk},format=qcow2,bus=virtio",
+             "--network", f"network={NETWORK},model=virtio,mac={rec['mac']}",
+             "--os-variant", "debian11", "--graphics", "none", "--noautoconsole", "--import"], timeout=90)
+        with locked():
+            conn = db()
+            try:
+                conn.execute("UPDATE instances SET status='running',started_at=?,error=NULL WHERE id=?", (stamp(), rec["id"]))
+                event(conn, rec["id"], "started", f"domain={rec['name']}")
+                conn.commit(); write_state(conn)
+                return dict(conn.execute("SELECT * FROM instances WHERE id=?", (rec["id"],)).fetchone())
+            finally: conn.close()
+    except Exception as exc:
+        destroy_resources(rec)
+        with locked():
+            conn = db()
+            try:
+                conn.execute("UPDATE instances SET status='failed',finished_at=?,destroyed_at=?,error=?,teardown_reason='provision_failed' WHERE id=?",
+                             (stamp(), stamp(), str(exc)[:2000], rec["id"]))
+                event(conn, rec["id"], "provision_failed", str(exc)[:2000])
+                conn.commit(); write_state(conn)
+            finally: conn.close()
+        raise
+
+
+def finish(iid, status="finished", exit_code=None, reason="job_finished", keep=0):
+    with locked():
+        conn = db()
+        try:
+            row = conn.execute("SELECT * FROM instances WHERE id=?", (iid,)).fetchone()
+            if not row: raise RuntimeError(f"unknown headless instance {iid}")
+            rec = dict(row)
+            if rec["status"] in ("destroyed", "failed"): return rec
+            if keep > 0:
+                expiry = now() + timedelta(seconds=max(60, keep))
+                conn.execute("UPDATE instances SET status='idle',finished_at=?,expires_at=?,exit_code=?,teardown_reason=? WHERE id=?",
+                             (stamp(), expiry.isoformat(), exit_code, reason, iid))
+                event(conn, iid, "retained", expiry.isoformat()); conn.commit(); write_state(conn)
+                return dict(conn.execute("SELECT * FROM instances WHERE id=?", (iid,)).fetchone())
+            conn.execute("UPDATE instances SET status='releasing',finished_at=?,exit_code=?,teardown_reason=? WHERE id=?",
+                         (stamp(), exit_code, reason, iid))
+            event(conn, iid, "releasing", f"status={status} reason={reason}"); conn.commit(); write_state(conn)
+        finally: conn.close()
+    destroy_resources(rec)
+    with locked():
+        conn = db()
+        try:
+            conn.execute("UPDATE instances SET status='destroyed',destroyed_at=?,error=NULL WHERE id=?", (stamp(), iid))
+            event(conn, iid, "destroyed", reason); conn.commit(); write_state(conn)
+            return dict(conn.execute("SELECT * FROM instances WHERE id=?", (iid,)).fetchone())
+        finally: conn.close()
+
+
+def renew(iid, ttl):
+    expiry = now() + timedelta(seconds=max(60, ttl))
+    with locked():
+        conn = db()
+        try:
+            row = conn.execute("SELECT * FROM instances WHERE id=?", (iid,)).fetchone()
+            if not row or row["status"] not in ACTIVE: raise RuntimeError(f"headless instance {iid} is not active")
+            conn.execute("UPDATE instances SET expires_at=? WHERE id=?", (expiry.isoformat(), iid))
+            event(conn, iid, "renewed", expiry.isoformat()); conn.commit(); write_state(conn)
+            return dict(conn.execute("SELECT * FROM instances WHERE id=?", (iid,)).fetchone())
+        finally: conn.close()
+
+
+def gc():
+    conn = db()
+    try: rows = [dict(x) for x in active_rows(conn)]
+    finally: conn.close()
+    expired = []
+    for rec in rows:
+        expiry = parse_stamp(rec["expires_at"])
+        if expiry and expiry <= now():
+            try:
+                finish(rec["id"], "expired", rec["exit_code"], "ttl_expired", 0); expired.append(rec["id"])
+            except Exception as exc:
+                with locked():
+                    conn = db()
+                    try:
+                        conn.execute("UPDATE instances SET error=? WHERE id=?", (str(exc)[:2000], rec["id"]))
+                        event(conn, rec["id"], "gc_error", str(exc)[:2000]); conn.commit(); write_state(conn)
+                    finally: conn.close()
+    return expired
+
+
+def scheduler_workers():
+    import urllib.request
+    req = urllib.request.Request(SCHEDULER + "/api/workers", headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=4) as response:
+        return list((json.load(response) or {}).get("workers") or [])
+
+
+def rebalance_desktops():
+    changed, errors = [], []
+    for worker in scheduler_workers():
+        try: station = int(worker.get("station"))
+        except Exception: continue
+        if not 1 <= station <= 6: continue
+        name = f"codex-lab-vm-{station:02d}"
+        busy = bool(worker.get("activeJob") or worker.get("exclusive") or worker.get("schedulerBusy") or worker.get("lease"))
+        target = DESKTOP_ACTIVE_MIB if busy else DESKTOP_IDLE_MIB
+        if virsh("dominfo", name, timeout=5, check=False).returncode:
+            errors.append(f"{name}: unavailable"); continue
+        live = virsh("setmem", name, f"{target}MiB", "--live", timeout=8, check=False)
+        conf = virsh("setmem", name, f"{target}MiB", "--config", timeout=8, check=False)
+        if live.returncode == 0 and conf.returncode == 0:
+            changed.append({"name": name, "busy": busy, "targetMiB": target})
+        else:
+            errors.append(f"{name}: {(live.stderr or conf.stderr or live.stdout or conf.stdout).strip()}")
+    return {"changed": changed, "errors": errors}
+
+
+def acquire_cmd(a):
+    gc()
+    rec, reused = reserve(a.owner, a.project or None, a.ttl_seconds, a.session_key or None,
+                          a.memory_mib, max(a.memory_mib, a.max_memory_mib), a.vcpus, a.disk_gib)
+    if reused:
+        state = virsh("domstate", rec["name"], timeout=5, check=False)
+        if state.returncode: raise RuntimeError(f"retained VM {rec['name']} no longer exists")
+        if "running" not in (state.stdout or "").lower(): virsh("start", rec["name"], timeout=30)
+    else:
+        rec = provision(rec)
+    print(json.dumps({**rec, "reused": reused}, separators=(",", ":"))); return 0
+
+
+def parser():
+    p = argparse.ArgumentParser(description="Elastic project-scoped headless KVM allocator")
+    s = p.add_subparsers(dest="cmd", required=True)
+    q = s.add_parser("acquire"); q.add_argument("--owner", required=True); q.add_argument("--project", default="")
+    q.add_argument("--ttl-seconds", type=int, default=7200); q.add_argument("--session-key", default="")
+    q.add_argument("--memory-mib", type=int, default=MEM_MIB); q.add_argument("--max-memory-mib", type=int, default=MAX_MEM_MIB)
+    q.add_argument("--vcpus", type=int, default=VCPUS); q.add_argument("--disk-gib", type=int, default=DISK_GIB); q.set_defaults(fn=acquire_cmd)
+    q = s.add_parser("finish"); q.add_argument("instance_id"); q.add_argument("--status", default="finished")
+    q.add_argument("--exit-code", type=int); q.add_argument("--reason", default="job_finished"); q.add_argument("--keep-seconds", type=int, default=0)
+    q.set_defaults(fn=lambda a: (print(json.dumps(finish(a.instance_id,a.status,a.exit_code,a.reason,a.keep_seconds), separators=(",", ":"))) or 0))
+    q = s.add_parser("renew"); q.add_argument("instance_id"); q.add_argument("--ttl-seconds", type=int, required=True)
+    q.set_defaults(fn=lambda a: (print(json.dumps(renew(a.instance_id,a.ttl_seconds), separators=(",", ":"))) or 0))
+    q = s.add_parser("gc"); q.set_defaults(fn=lambda a: (print(json.dumps({"destroyed":gc()}, separators=(",", ":"))) or 0))
+    q = s.add_parser("state"); q.add_argument("--history-limit", type=int, default=100)
+    q.set_defaults(fn=lambda a: (print(json.dumps(state_data(history_limit=a.history_limit), separators=(",", ":"))) or 0))
+    q = s.add_parser("rebalance-desktops"); q.set_defaults(fn=lambda a: (print(json.dumps(rebalance_desktops(), separators=(",", ":"))) or 0))
+    return p
+
+
+def main():
+    a = parser().parse_args()
+    try: return int(a.fn(a) or 0)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr); return 75
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
