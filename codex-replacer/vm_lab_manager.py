@@ -147,12 +147,26 @@ def host_status():
         if len(parts)>=5: rows[int(parts[0])]={"name":parts[1],"ip":parts[2],"state":parts[3],"autostart":parts[4]}
     return rows
 
+class RemoteLeaseProbeUnavailable(RuntimeError):
+    pass
+
+
 def _remote_exclusive_lease(station):
-    result = ssh_guest(
-        station,
-        "cat /home/mark/.local/share/codex-worker/exclusive.lock 2>/dev/null",
-        5,
-    )
+    try:
+        result = ssh_guest(
+            station,
+            "cat /home/mark/.local/share/codex-worker/exclusive.lock 2>/dev/null",
+            5,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RemoteLeaseProbeUnavailable(
+            f"worker {int(station)} lease probe timed out"
+        ) from exc
+    if result.returncode == 255:
+        raise RemoteLeaseProbeUnavailable(
+            (result.stderr or result.stdout).strip()
+            or f"worker {int(station)} lease probe transport failed"
+        )
     if result.returncode != 0 or not result.stdout.strip():
         return None
     try:
@@ -238,7 +252,12 @@ def reconcile_lost_leases(state):
     for record in state.setdefault("stations", {}).values():
         if record.get("status") != "leased":
             continue
-        remote = _remote_exclusive_lease(record["station"])
+        try:
+            remote = _remote_exclusive_lease(record["station"])
+        except RemoteLeaseProbeUnavailable:
+            # A transport failure is not evidence that the remote ownership
+            # lock disappeared. Leave the lease intact and retry later.
+            continue
         if remote and remote.get("leaseId") == record.get("leaseId"):
             continue
         old = _mark_free(record, "remote-lock-lost")
@@ -349,7 +368,10 @@ def validate_lease(lease_id, station=None):
     lock, state = locked_state()
     try:
         expire(state)
-        reconcile_lost_leases(state)
+        # Validate only the requested lease here. Global reconciliation can
+        # involve multiple SSH probes and belongs in acquire/list/gc paths;
+        # making every exec/browser call depend on unrelated workers causes
+        # latency amplification and cross-worker failures.
         record = find_active(state, lease_id=lease_id)
         if station is not None and int(record.get("station", 0)) != int(station):
             raise KeyError(f"Lease {lease_id} belongs to station {record.get('station')}, not station {station}")
