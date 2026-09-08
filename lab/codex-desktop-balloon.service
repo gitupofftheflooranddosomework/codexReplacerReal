@@ -3,4 +3,5 @@ Description=Rebalance memory for persistent interactive Codex desktops
 
 [Service]
 Type=oneshot
+Environment=CODEX_LAB_SCHEDULER_URL=http://192.168.122.1:8766
 ExecStart=/home/mark/.local/bin/codex-ci-headless rebalance-desktops
