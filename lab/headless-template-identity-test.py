@@ -54,7 +54,22 @@ with tempfile.TemporaryDirectory() as td:
     def fake_finish(iid, status="finished", exit_code=None, reason="job_finished", keep=0):
         calls.append((iid, status, reason)); return {"id": iid}
     mod.finish = fake_finish
+    # A live creator/waiter marker prevents stale-create GC from reaping a
+    # healthy process that is queued behind the libvirt mutation lock.
+    mod.PROVISIONERS.mkdir(parents=True, exist_ok=True)
+    marker = mod.PROVISIONERS / "old.json"
+    marker.write_text(__import__("json").dumps({"pid": os.getpid(), "started_at": mod.stamp()}) + "\n")
+    assert mod.provision_owner_alive("old") is True
+    assert mod.gc() == [], calls
+    assert calls == [], calls
+    marker.unlink()
     assert mod.gc() == ["old"], calls
     assert calls == [("old", "failed", "stale_creating")], calls
+    err = __import__("subprocess").CalledProcessError(1, ["virt-install", "--import"], output="OUT", stderr="REAL_LIBVIRT_ERROR")
+    formatted = mod.process_error(err)
+    assert "rc=1" in formatted and "REAL_LIBVIRT_ERROR" in formatted and "OUT" in formatted, formatted
+    assert 'def provision_locked' in (ROOT / "codex-ci-headless.py").read_text()
+    assert 'provision_wait' in (ROOT / "codex-ci-headless.py").read_text()
+    assert 'provision_enter' in (ROOT / "codex-ci-headless.py").read_text()
 
 print("headless_template_identity_test=ok")
