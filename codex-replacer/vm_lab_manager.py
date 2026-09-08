@@ -25,6 +25,7 @@ GUEST_KEY = os.environ.get("CODEX_VM_LAB_GUEST_KEY", "/home/mark/.ssh/id_ed25519
 KNOWN_HOSTS = os.environ.get("CODEX_VM_LAB_KNOWN_HOSTS", "/home/mark/.ssh/codex_lab_known_hosts")
 REMOTE_CTL = os.environ.get("CODEX_VM_LAB_CTL", "/tank/vm/codex-lab/vm-labctl.sh")
 SCHEDULER_URL = os.environ.get("CODEX_LAB_SCHEDULER_URL", "http://192.168.122.1:8766").rstrip("/")
+VAULT_URL = os.environ.get("CODEX_VAULT_URL", "https://vault.markshaw.ca").rstrip("/")
 
 
 def now(): return datetime.now(timezone.utc)
@@ -160,6 +161,18 @@ def _remote_exclusive_lease(station):
         return None
 
 
+def reset_worker_vault(station):
+    """Remove reusable Bitwarden state before a shared VM changes hands."""
+    command = (
+        "if command -v bw >/dev/null 2>&1; then "
+        "bw logout >/dev/null 2>&1 || true; "
+        f"bw config server {shlex.quote(VAULT_URL)} >/dev/null 2>&1 || true; "
+        "fi"
+    )
+    result = ssh_guest(int(station), command, 12)
+    return result.returncode == 0
+
+
 def _mark_free(record, reason, released_at=None):
     old = record.copy()
     record.update({
@@ -234,6 +247,7 @@ def acquire(owner, project=None, ttl_minutes=180, chat_label=None, chat_url=None
             r=record_for(state,s)
             if r.get("status")=="leased": continue
             ensure_station(s)
+            reset_worker_vault(s)
             repair = ssh_guest(
                 s,
                 "mkdir -p /home/mark/.local/share/codex-worker && flock -n /home/mark/.local/share/codex-worker/claim.lock sh -c 'test ! -e /home/mark/.local/share/codex-worker/scheduler.lock && rm -f /home/mark/.local/share/codex-worker/exclusive.lock'",
@@ -320,6 +334,7 @@ def release(lease_id=None, station=None, reason="released", recycle=False):
                 f"Could not clear exclusive lock on worker {station_number}: "
                 f"{(clear.stderr or clear.stdout).strip()}"
             )
+        reset_worker_vault(station_number)
         _mark_free(record, reason)
         save_state(state)
         audit(
