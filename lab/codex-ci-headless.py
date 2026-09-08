@@ -634,21 +634,34 @@ def rebalance_desktops():
 def main(argv=None):
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="action", required=True)
-    p = sub.add_parser("reserve")
-    p.add_argument("--owner", required=True); p.add_argument("--project", default="")
-    p.add_argument("--ttl-seconds", type=int, default=3600); p.add_argument("--session-key")
-    p.add_argument("--memory-mib", type=int, default=MEM_MIB); p.add_argument("--max-memory-mib", type=int, default=MAX_MEM_MIB)
-    p.add_argument("--vcpus", type=int, default=VCPUS); p.add_argument("--disk-gib", type=int, default=DISK_GIB)
+    def add_acquire_args(p):
+        p.add_argument("--owner", required=True); p.add_argument("--project", default="")
+        p.add_argument("--ttl-seconds", type=int, default=3600); p.add_argument("--session-key")
+        p.add_argument("--memory-mib", type=int, default=MEM_MIB); p.add_argument("--max-memory-mib", type=int, default=MAX_MEM_MIB)
+        p.add_argument("--vcpus", type=int, default=VCPUS); p.add_argument("--disk-gib", type=int, default=DISK_GIB)
+    p = sub.add_parser("acquire"); add_acquire_args(p)
+    p = sub.add_parser("reserve"); add_acquire_args(p)
     p = sub.add_parser("provision"); p.add_argument("id")
     p = sub.add_parser("finish"); p.add_argument("id"); p.add_argument("--status", default="finished"); p.add_argument("--exit-code", type=int); p.add_argument("--reason", default="job_finished"); p.add_argument("--keep-seconds", type=int, default=0)
     p = sub.add_parser("renew"); p.add_argument("id"); p.add_argument("--ttl-seconds", type=int, required=True)
     p = sub.add_parser("state"); p.add_argument("--history-limit", type=int, default=40)
     sub.add_parser("gc"); sub.add_parser("rebalance-desktops")
     args = parser.parse_args(argv)
-    if args.action == "reserve":
+    if args.action in ("acquire", "reserve"):
+        gc()
         rec, reused = reserve(args.owner, args.project, args.ttl_seconds, args.session_key,
                               args.memory_mib, args.max_memory_mib, args.vcpus, args.disk_gib)
-        print(json.dumps({"instance": rec, "reused": reused}, separators=(",", ":"))); return 0
+        if args.action == "reserve":
+            print(json.dumps({"instance": rec, "reused": reused}, separators=(",", ":"))); return 0
+        if reused:
+            state = virsh("domstate", rec["name"], timeout=5, check=False)
+            if state.returncode:
+                raise RuntimeError(f"retained VM {rec['name']} no longer exists")
+            if "running" not in (state.stdout or "").lower():
+                virsh("start", rec["name"], timeout=30)
+        else:
+            rec = provision(rec)
+        print(json.dumps({**rec, "reused": reused}, separators=(",", ":"))); return 0
     if args.action == "provision":
         conn = db()
         try: row = conn.execute("SELECT * FROM instances WHERE id=?", (args.id,)).fetchone()

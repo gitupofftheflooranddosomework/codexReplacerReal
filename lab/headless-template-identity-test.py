@@ -72,4 +72,20 @@ with tempfile.TemporaryDirectory() as td:
     assert 'provision_wait' in (ROOT / "codex-ci-headless.py").read_text()
     assert 'provision_enter' in (ROOT / "codex-ci-headless.py").read_text()
 
+    # Existing dispatchers invoke the one-shot `acquire` command. Preserve that
+    # public contract while the internal reserve/provision split is available
+    # for focused orchestration and testing.
+    import contextlib, io, json
+    mod.gc = lambda: []
+    mod.reserve = lambda *args, **kwargs: ({
+        "id": "compat", "name": "ci-compat", "ip": "192.168.122.199",
+        "mac": "52:54:00:ce:00:c7", "status": "creating"
+    }, False)
+    mod.provision = lambda rec: {**rec, "status": "running"}
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        assert mod.main(["acquire", "--owner", "compat-test", "--project", "serverworkerbot"]) == 0
+    payload = json.loads(output.getvalue())
+    assert payload["id"] == "compat" and payload["status"] == "running" and payload["reused"] is False, payload
+
 print("headless_template_identity_test=ok")
