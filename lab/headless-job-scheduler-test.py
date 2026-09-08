@@ -3,6 +3,8 @@ import importlib.util
 import os
 import pathlib
 import tempfile
+import threading
+import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 LAB = ROOT / "lab"
@@ -33,6 +35,44 @@ def main():
         canceled = sched.cancel_job(job["id"])
         assert canceled["status"] == "canceled", canceled
         assert not canceled.get("worker"), canceled
+
+        # API reconciliation and the background scheduler may call
+        # scheduler_iteration concurrently. One queued row must still receive
+        # exactly one launcher; launcher_pid=0 is the atomic pre-Popen claim.
+        race = sched.submit_job({"owner":"race","project":"p","command":"echo race","timeout":123})
+        launches = []
+        errors = []
+        barrier = threading.Barrier(8)
+
+        def fake_launch(row):
+            launches.append(row["id"])
+            time.sleep(0.05)
+            with sched.DB_LOCK:
+                conn = sched.db()
+                current = conn.execute("SELECT status,launcher_pid FROM jobs WHERE id=?", (row["id"],)).fetchone()
+                assert current["status"] == "queued" and current["launcher_pid"] == 0, dict(current)
+                conn.execute("UPDATE jobs SET launcher_pid=? WHERE id=?", (os.getpid(), row["id"]))
+                conn.commit(); conn.close()
+
+        sched.launch_row = fake_launch
+
+        def race_iteration():
+            try:
+                barrier.wait()
+                sched.scheduler_iteration()
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=race_iteration) for _ in range(8)]
+        for thread in threads: thread.start()
+        for thread in threads: thread.join(timeout=5)
+        assert all(not thread.is_alive() for thread in threads), 'scheduler race threads did not finish'
+        assert not errors, errors
+        assert launches == [race["id"]], launches
+        conn = sched.db()
+        claimed = conn.execute("SELECT launcher_pid FROM jobs WHERE id=?", (race["id"],)).fetchone()[0]
+        conn.close()
+        assert claimed == os.getpid(), claimed
 
     runner = load(LAB / "headless-job-runner.py", "headless_job_runner_tested")
     assert runner.resources("io") == (1024, 2048, 1)

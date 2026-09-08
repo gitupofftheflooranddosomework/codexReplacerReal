@@ -144,7 +144,9 @@ def launch_row(row: sqlite3.Row) -> None:
     with DB_LOCK:
         conn = db()
         current = conn.execute("SELECT status,launcher_pid FROM jobs WHERE id=?", (row["id"],)).fetchone()
-        if current and current["status"] == "queued" and current["launcher_pid"] is None:
+        # scheduler_iteration atomically claims a queued row with launcher_pid=0
+        # before releasing DB_LOCK. Only that claim may be replaced by a real PID.
+        if current and current["status"] == "queued" and current["launcher_pid"] == 0:
             conn.execute("UPDATE jobs SET launcher_pid=?,updated_at=?,error=NULL WHERE id=?", (proc.pid, stamp, row["id"]))
             conn.commit()
         else:
@@ -193,14 +195,27 @@ def scheduler_iteration() -> None:
         pending = conn.execute(
             "SELECT * FROM jobs WHERE status='queued' AND launcher_pid IS NULL ORDER BY created_at LIMIT ?", (room,)
         ).fetchall() if room else []
+        claimed = []
+        claim_stamp = now_iso()
+        for row in pending:
+            # Claim under DB_LOCK before Popen. API GETs and the background loop can
+            # call scheduler_iteration concurrently; without this claim they can
+            # both spawn a runner for the same job and race on one workspace.
+            changed = conn.execute(
+                "UPDATE jobs SET launcher_pid=0,updated_at=? WHERE id=? AND status='queued' AND launcher_pid IS NULL",
+                (claim_stamp, row["id"]),
+            ).rowcount
+            if changed == 1:
+                claimed.append(row)
+        conn.commit()
         conn.close()
-    for row in pending:
+    for row in claimed:
         try:
             launch_row(row)
         except Exception as exc:
             with DB_LOCK:
                 conn = db(); stamp = now_iso()
-                conn.execute("UPDATE jobs SET status='failed',finished_at=?,updated_at=?,error=? WHERE id=?",
+                conn.execute("UPDATE jobs SET status='failed',finished_at=?,updated_at=?,launcher_pid=NULL,error=? WHERE id=?",
                              (stamp, stamp, str(exc)[:2000], row["id"]))
                 conn.commit(); conn.close()
 
