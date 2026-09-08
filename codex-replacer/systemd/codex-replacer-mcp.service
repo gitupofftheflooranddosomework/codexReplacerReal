@@ -1,0 +1,35 @@
+[Unit]
+Description=Codex Replacer persistent local MCP service
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/mark/docker/markshaw-private-mcp/codex-replacer
+Environment=CODEX_REPLACER_MAX_WORKERS=20
+Environment=CODEX_REPLACER_HTTP_HOST=127.0.0.1
+Environment=CODEX_REPLACER_HTTP_PORT=8791
+Environment=CODEX_REPLACER_HTTP_PATH=/mcp
+Environment=CODEX_REPLACER_HOST_EXEC_FOREGROUND_SECONDS=20
+Environment=CODEX_REPLACER_HOST_EXEC_WAIT_PROMOTION_SECONDS=3
+Environment=CODEX_REPLACER_HOST_EXEC_NICE=5
+Environment=CODEX_LAB_MAX_STATIONS=6
+Environment=CODEX_LAB_PREWARM_STATIONS=0
+Environment=CODEX_LAB_ROOT=/tank/codex-lab
+Environment=CODEX_VM_LAB_MAX_STATIONS=6
+Environment=CODEX_VM_LAB_PREWARM=6
+Environment=CODEX_VM_LAB_ROOT=/tank/codex-lab-vm
+Environment=CODEX_VM_LAB_HOST=home-server
+Environment=CODEX_VM_LAB_HOME_KEY=/home/mark/.ssh/id_ed25519_home_server
+Environment=CODEX_VM_LAB_GUEST_KEY=/home/mark/.ssh/id_ed25519_codex_lab_vm
+Environment=CODEX_VM_LAB_KNOWN_HOSTS=/home/mark/.ssh/codex_lab_known_hosts
+Environment=CODEX_VM_LAB_CTL=/tank/vm/codex-lab/vm-labctl.sh
+Environment=CODEX_LAB_SCHEDULER_URL=http://192.168.122.1:8766
+ExecStart=/usr/bin/python3 /home/mark/docker/markshaw-private-mcp/codex-replacer/http-server.py
+Restart=always
+RestartSec=2
+TimeoutStopSec=30
+UMask=0077
+
+[Install]
+WantedBy=default.target
