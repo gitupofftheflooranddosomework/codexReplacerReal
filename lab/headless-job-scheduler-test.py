@@ -24,14 +24,20 @@ def main():
         os.environ["CODEX_VM_JOB_WORK_ROOT"] = str(root / "scheduler" / "jobs")
         os.environ["CODEX_VM_JOB_HOST"] = "127.0.0.1"
         sched = load(LAB / "headless-job-scheduler.py", "headless_job_scheduler_tested")
-        assert sched.MAX_LAUNCHERS == 48
+        assert sched.MAX_LAUNCHERS == 96
         job = sched.submit_job({"owner":"test","project":"p","command":"echo ok","timeout":123})
         assert job["status"] == "queued"
         assert job["execution"] == "ephemeral-headless-kvm"
         assert job["timeout"] == 123
         assert not job.get("worker")
+        canceled = sched.cancel_job(job["id"])
+        assert canceled["status"] == "canceled", canceled
+        assert not canceled.get("worker"), canceled
 
     runner = load(LAB / "headless-job-runner.py", "headless_job_runner_tested")
+    assert runner.resources("io") == (1024, 2048, 1)
+    assert runner.resources("cpu") == (1536, 3072, 2)
+    assert runner.resources("build") == (3072, 5120, 2)
     assert runner.normalize_cwd("/workspace") == "."
     assert runner.normalize_cwd("/workspace/sub/dir") == "sub/dir"
     try:
@@ -42,7 +48,7 @@ def main():
         raise AssertionError("absolute cwd escaped /workspace")
 
     headless = (LAB / "codex-ci-headless.py").read_text()
-    assert 'CODEX_CI_HEADLESS_MAX_ACTIVE", "48"' in headless
+    assert 'CODEX_CI_HEADLESS_MAX_ACTIVE", "96"' in headless
     assert 'CODEX_CI_HEADLESS_IP_START", "100"' in headless
     assert 'CODEX_CI_HEADLESS_IP_END", "199"' in headless
     assert 'net-dhcp-leases' in headless
