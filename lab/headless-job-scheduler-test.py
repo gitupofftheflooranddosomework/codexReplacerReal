@@ -55,9 +55,29 @@ def main():
     assert 'MAX_IO_PSI_AVG10' in headless and 'MAX_MEMORY_PSI_AVG10' in headless
     assert 'NEW_WORKER_HEADROOM_MIB' in headless
 
-    client = (ROOT / "codex-replacer" / "vm_job_scheduler.py").read_text()
+    client_path = ROOT / "codex-replacer" / "vm_job_scheduler.py"
+    client = client_path.read_text()
+    assert 'CODEX_VM_JOB_SCHEDULER_URL' in client
+    assert 'os.environ.get("CODEX_LAB_SCHEDULER_URL"' not in client
     assert 'http://192.168.122.1:8767' in client
     assert 'ThreadPoolExecutor(max_workers=min(48, len(jobs)))' in client
+
+    previous_lab = os.environ.get("CODEX_LAB_SCHEDULER_URL")
+    previous_job = os.environ.pop("CODEX_VM_JOB_SCHEDULER_URL", None)
+    os.environ["CODEX_LAB_SCHEDULER_URL"] = "http://192.168.122.1:8766"
+    routed = load(client_path, "vm_job_scheduler_interactive_env_collision")
+    assert routed.BASE_URL == "http://192.168.122.1:8767", routed.BASE_URL
+    os.environ["CODEX_VM_JOB_SCHEDULER_URL"] = "http://127.0.0.1:9876/"
+    overridden = load(client_path, "vm_job_scheduler_explicit_override")
+    assert overridden.BASE_URL == "http://127.0.0.1:9876", overridden.BASE_URL
+    if previous_lab is None:
+        os.environ.pop("CODEX_LAB_SCHEDULER_URL", None)
+    else:
+        os.environ["CODEX_LAB_SCHEDULER_URL"] = previous_lab
+    if previous_job is None:
+        os.environ.pop("CODEX_VM_JOB_SCHEDULER_URL", None)
+    else:
+        os.environ["CODEX_VM_JOB_SCHEDULER_URL"] = previous_job
 
     server = (ROOT / "codex-replacer" / "server.py").read_text()
     assert 'SERVER_VERSION = "2.5.0"' in server
