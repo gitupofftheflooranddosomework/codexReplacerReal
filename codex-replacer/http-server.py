@@ -216,26 +216,27 @@ def cleanup():
 
 
 def warm_dependencies():
-    started = time.monotonic()
-    try:
-        tools = server.BROWSER_CLIENT.list_tools()
-        event = {
-            "time": server.now_iso(),
-            "event": "mcp_dependency_warmed",
-            "dependency": "visual_browser",
-            "toolCount": len(tools),
-            "elapsedMs": round((time.monotonic() - started) * 1000, 2),
-        }
-    except Exception as error:
-        event = {
-            "time": server.now_iso(),
-            "event": "mcp_dependency_warm_failed",
-            "dependency": "visual_browser",
-            "error": str(error),
-            "elapsedMs": round((time.monotonic() - started) * 1000, 2),
-        }
-    sys.stderr.write(json.dumps(event, separators=(",", ":")) + "\n")
-    sys.stderr.flush()
+    if not server.BROKER_ONLY:
+        started = time.monotonic()
+        try:
+            tools = server.BROWSER_CLIENT.list_tools()
+            event = {
+                "time": server.now_iso(),
+                "event": "mcp_dependency_warmed",
+                "dependency": "visual_browser",
+                "toolCount": len(tools),
+                "elapsedMs": round((time.monotonic() - started) * 1000, 2),
+            }
+        except Exception as error:
+            event = {
+                "time": server.now_iso(),
+                "event": "mcp_dependency_warm_failed",
+                "dependency": "visual_browser",
+                "error": str(error),
+                "elapsedMs": round((time.monotonic() - started) * 1000, 2),
+            }
+        sys.stderr.write(json.dumps(event, separators=(",", ":")) + "\n")
+        sys.stderr.flush()
 
     kvm_started = time.monotonic()
     try:
