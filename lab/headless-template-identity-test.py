@@ -30,6 +30,10 @@ with tempfile.TemporaryDirectory() as td:
     assert mod.effective_disk_gib(100 * gib, 40) == 100
     assert mod.effective_disk_gib(100 * gib, 120) == 120
     assert mod.effective_disk_gib(100 * gib + 1, 100) == 101
+    assert mod.desktop_target_mib({"memTotalMiB": 8192, "memAvailableMiB": 6500}, True) == 6144
+    assert mod.desktop_target_mib({"memTotalMiB": 8192, "memAvailableMiB": 1000}, True) == 8192
+    assert mod.desktop_target_mib({"memTotalMiB": 8192, "memAvailableMiB": 6500}, False) == 4096
+    assert mod.desktop_target_mib({}, True) == 8192
     conn = mod.db()
     future = mod.stamp(mod.now() + timedelta(hours=1))
     old = mod.stamp(mod.now() - timedelta(minutes=10))

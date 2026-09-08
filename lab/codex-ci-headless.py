@@ -42,7 +42,10 @@ DISK_GIB = max(10, int(os.environ.get("CODEX_CI_HEADLESS_DISK_GIB", "40")))
 HOST_RESERVE_MIB = max(4096, int(os.environ.get("CODEX_CI_HOST_RESERVE_MIB", "12288")))
 MAX_LOAD_PER_CPU = max(.5, float(os.environ.get("CODEX_CI_MAX_LOAD_PER_CPU", "2.0")))
 DESKTOP_IDLE_MIB = max(2048, int(os.environ.get("CODEX_DESKTOP_IDLE_MIB", "4096")))
-DESKTOP_ACTIVE_MIB = max(DESKTOP_IDLE_MIB, int(os.environ.get("CODEX_DESKTOP_ACTIVE_MIB", "8192")))
+DESKTOP_ACTIVE_FLOOR_MIB = max(DESKTOP_IDLE_MIB, int(os.environ.get("CODEX_DESKTOP_ACTIVE_FLOOR_MIB", "6144")))
+DESKTOP_ACTIVE_MIB = max(DESKTOP_ACTIVE_FLOOR_MIB, int(os.environ.get("CODEX_DESKTOP_ACTIVE_MIB", "8192")))
+DESKTOP_HEADROOM_MIB = max(512, int(os.environ.get("CODEX_DESKTOP_HEADROOM_MIB", "2048")))
+DESKTOP_BALLOON_STEP_MIB = max(256, int(os.environ.get("CODEX_DESKTOP_BALLOON_STEP_MIB", "512")))
 STALE_CREATING_SECONDS = max(120, int(os.environ.get("CODEX_CI_STALE_CREATING_SECONDS", "300")))
 SCHEDULER = os.environ.get("CODEX_LAB_SCHEDULER_URL", "http://127.0.0.1:8766").rstrip("/")
 ACTIVE = ("creating", "running", "idle", "releasing")
@@ -399,6 +402,23 @@ def scheduler_workers():
         return list((json.load(response) or {}).get("workers") or [])
 
 
+def desktop_target_mib(worker, busy):
+    if not busy:
+        return DESKTOP_IDLE_MIB
+    try:
+        total = float(worker["memTotalMiB"])
+        available = float(worker["memAvailableMiB"])
+        if total <= 0 or available < 0 or available > total:
+            raise ValueError("invalid guest memory metrics")
+        used = max(0.0, total - available)
+    except (KeyError, TypeError, ValueError):
+        # Fail safe: never shrink an active desktop when live guest metrics are missing.
+        return DESKTOP_ACTIVE_MIB
+    wanted = int(used + DESKTOP_HEADROOM_MIB + DESKTOP_BALLOON_STEP_MIB - 1)
+    wanted = (wanted // DESKTOP_BALLOON_STEP_MIB) * DESKTOP_BALLOON_STEP_MIB
+    return min(DESKTOP_ACTIVE_MIB, max(DESKTOP_ACTIVE_FLOOR_MIB, wanted))
+
+
 def rebalance_desktops():
     changed, errors = [], []
     for worker in scheduler_workers():
@@ -407,7 +427,7 @@ def rebalance_desktops():
         if not 1 <= station <= 6: continue
         name = f"codex-lab-vm-{station:02d}"
         busy = bool(worker.get("activeJob") or worker.get("exclusive") or worker.get("schedulerBusy") or worker.get("lease"))
-        target = DESKTOP_ACTIVE_MIB if busy else DESKTOP_IDLE_MIB
+        target = desktop_target_mib(worker, busy)
         if virsh("dominfo", name, timeout=5, check=False).returncode:
             errors.append(f"{name}: unavailable"); continue
         live = virsh("setmem", name, f"{target}MiB", "--live", timeout=8, check=False)
