@@ -4,7 +4,7 @@ set -euo pipefail
 URI=${CODEX_CI_LIBVIRT_URI:-qemu:///system}
 NETWORK=${CODEX_CI_NETWORK:-default}
 SOURCE=${CODEX_CI_BASE_SOURCE:-/tank/vm/codex-lab-v2/codex-lab-base-browser-v2.qcow2}
-OUT_NAME=${CODEX_CI_HEADLESS_BASE:-codex-ci-base-v1.qcow2}
+OUT_NAME=${CODEX_CI_HEADLESS_BASE:-codex-ci-base-v2.qcow2}
 STORES=${CODEX_CI_HEADLESS_STORAGE_ROOTS:-/tank/vm/codex-ci-headless,/tank2/vm/codex-ci-headless,/tank3/vm/codex-ci-headless}
 RPC=${CODEX_CI_WORKER_RPC:-/home/mark/.local/share/codex-ci/codex-ci-worker-rpc.py}
 CI_PUB=${CODEX_CI_PUBLIC_KEY:-/home/mark/.local/share/codex-ci/ssh/id_ed25519_codex_ci.pub}
@@ -20,7 +20,7 @@ fail(){ echo "ERROR: $*" >&2; exit 1; }
 [[ $(hostname) == home-server ]] || fail "must run on home-server"
 [[ $(id -un) == mark ]] || fail "must run as mark"
 for f in "$SOURCE" "$RPC" "$CI_PUB" "$ADMIN_KEY"; do [[ -r $f ]] || fail "missing $f"; done
-for c in virsh virt-install qemu-img ssh; do command -v "$c" >/dev/null || fail "missing $c"; done
+for c in virsh virt-install qemu-img ssh virt-customize; do command -v "$c" >/dev/null || fail "missing $c"; done
 mkdir -p "$TMP"
 
 cleanup(){
@@ -58,6 +58,18 @@ virsh --connect "$URI" shutdown "$BUILDER" >/dev/null || true
 for _ in $(seq 1 60); do state=$(virsh --connect "$URI" domstate "$BUILDER" 2>/dev/null || true); [[ $state != running ]] && break; sleep 1; done
 virsh --connect "$URI" destroy "$BUILDER" >/dev/null 2>&1 || true
 qemu-img convert -p -O qcow2 "$OVERLAY" "$FLAT"
+
+# The online builder acquires a machine-id and DHCP client identity. Never
+# publish those values into a clone template: systemd-networkd derives its
+# DHCP client identifier from machine-id, so cloned guests can collide even
+# when libvirt assigns each one a unique MAC and reservation.
+LIBGUESTFS_BACKEND=direct virt-customize -a "$FLAT" \
+  --run-command 'truncate -s 0 /etc/machine-id' \
+  --run-command 'rm -f /var/lib/dbus/machine-id' \
+  --run-command 'rm -f /var/lib/dhcp/* /var/lib/NetworkManager/*lease* /var/lib/systemd/network/* 2>/dev/null || true' \
+  --run-command 'rm -f /etc/udev/rules.d/70-persistent-net.rules 2>/dev/null || true' \
+  --run-command 'sync'
+
 IFS=',' read -ra roots <<< "$STORES"
 for root in "${roots[@]}"; do root=${root// /}; mkdir -p "$root"; tmp="$root/$OUT_NAME.tmp"; cp --reflink=auto "$FLAT" "$tmp"; chmod 664 "$tmp"; mv -f "$tmp" "$root/$OUT_NAME"; done
 sha256sum "$FLAT" "${roots[0]// /}/$OUT_NAME"
