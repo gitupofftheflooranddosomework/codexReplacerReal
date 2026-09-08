@@ -110,8 +110,14 @@ with tempfile.TemporaryDirectory() as td:
     formatted = mod.process_error(err)
     assert "rc=1" in formatted and "REAL_LIBVIRT_ERROR" in formatted and "OUT" in formatted, formatted
     assert 'def provision_locked' in (ROOT / "codex-ci-headless.py").read_text()
-    assert 'provision_wait' in (ROOT / "codex-ci-headless.py").read_text()
-    assert 'provision_enter' in (ROOT / "codex-ci-headless.py").read_text()
+    source = (ROOT / "codex-ci-headless.py").read_text()
+    assert 'provision_wait' in source
+    assert 'provision_enter' in source
+    assert 'backing_store={base}' in source
+    assert 'backing_format=qcow2' in source
+    assert 'sparse=yes' in source
+    provision_source = source[source.index('def provision(rec):'):source.index('def finish(', source.index('def provision(rec):'))]
+    assert 'qemu-img", "create"' not in provision_source
 
     # Existing dispatchers invoke the one-shot `acquire` command. Preserve that
     # public contract while the internal reserve/provision split is available
