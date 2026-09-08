@@ -26,6 +26,8 @@ ROOT = pathlib.Path(os.environ.get("CODEX_CI_HEADLESS_ROOT", "/tank/vm/codex-ci-
 DB = pathlib.Path(os.environ.get("CODEX_CI_HEADLESS_DB", str(ROOT / "lifecycle.sqlite3")))
 STATE = pathlib.Path(os.environ.get("CODEX_CI_HEADLESS_STATE", str(ROOT / "state.json")))
 LOCK = pathlib.Path(os.environ.get("CODEX_CI_HEADLESS_LOCK", str(ROOT / "allocator.lock")))
+PROVISION_LOCK = pathlib.Path(os.environ.get("CODEX_CI_HEADLESS_PROVISION_LOCK", str(ROOT / "provision.lock")))
+PROVISIONERS = pathlib.Path(os.environ.get("CODEX_CI_HEADLESS_PROVISIONERS", str(ROOT / "provisioners")))
 BASE = os.environ.get("CODEX_CI_HEADLESS_BASE", "codex-ci-base-v2.qcow2")
 STORES = [pathlib.Path(x.strip()) for x in os.environ.get(
     "CODEX_CI_HEADLESS_STORAGE_ROOTS",
@@ -117,6 +119,78 @@ def locked():
             yield
         finally:
             fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def provision_locked():
+    """Serialize only libvirt network/domain mutations, never guest execution."""
+    ROOT.mkdir(parents=True, exist_ok=True)
+    PROVISION_LOCK.touch(mode=0o600, exist_ok=True)
+    with PROVISION_LOCK.open("r+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def provision_marker(iid):
+    """Mark a creator process alive while it waits for/holds the libvirt lock."""
+    PROVISIONERS.mkdir(parents=True, exist_ok=True)
+    marker = PROVISIONERS / f"{iid}.json"
+    tmp = marker.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"pid": os.getpid(), "started_at": stamp()}, separators=(",", ":")) + "\n")
+    os.chmod(tmp, 0o600)
+    tmp.replace(marker)
+    try:
+        yield
+    finally:
+        try:
+            marker.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def provision_owner_alive(iid):
+    marker = PROVISIONERS / f"{iid}.json"
+    try:
+        payload = json.loads(marker.read_text())
+        pid = int(payload.get("pid") or 0)
+        if pid <= 0:
+            return False
+        os.kill(pid, 0)
+        return True
+    except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError, ProcessLookupError, PermissionError):
+        return False
+
+
+def process_error(exc):
+    if isinstance(exc, subprocess.CalledProcessError):
+        parts = [f"command failed rc={exc.returncode}: {exc.cmd!r}"]
+        if exc.stdout:
+            parts.append("stdout=" + str(exc.stdout)[-2000:])
+        if exc.stderr:
+            parts.append("stderr=" + str(exc.stderr)[-4000:])
+        return "\n".join(parts)
+    if isinstance(exc, subprocess.TimeoutExpired):
+        parts = [f"command timed out after {exc.timeout}s: {exc.cmd!r}"]
+        if exc.stdout:
+            parts.append("stdout=" + str(exc.stdout)[-2000:])
+        if exc.stderr:
+            parts.append("stderr=" + str(exc.stderr)[-4000:])
+        return "\n".join(parts)
+    return str(exc)
+
+
+def record_instance_event(iid, kind, detail=None):
+    with locked():
+        conn = db()
+        try:
+            event(conn, iid, kind, detail)
+            conn.commit(); write_state(conn)
+        finally:
+            conn.close()
 
 
 def active_rows(conn):
@@ -211,58 +285,57 @@ def psi_avg10(resource, level="some"):
 def pressure_reason():
     if not load_ok():
         return "host CPU/load high-water guard is active"
-    io = psi_avg10("io")
-    if io is not None and io >= MAX_IO_PSI_AVG10:
-        return f"host I/O pressure high-water guard is active ({io:.1f}% avg10)"
-    memory = psi_avg10("memory")
-    if memory is not None and memory >= MAX_MEMORY_PSI_AVG10:
-        return f"host memory pressure high-water guard is active ({memory:.1f}% avg10)"
+    io_psi = psi_avg10("io")
+    if io_psi is not None and io_psi > MAX_IO_PSI_AVG10:
+        return f"host I/O pressure high-water guard is active ({io_psi:.2f}>{MAX_IO_PSI_AVG10:.2f})"
+    memory_psi = psi_avg10("memory")
+    if memory_psi is not None and memory_psi > MAX_MEMORY_PSI_AVG10:
+        return f"host memory pressure high-water guard is active ({memory_psi:.2f}>{MAX_MEMORY_PSI_AVG10:.2f})"
     return None
 
 
-def reservations():
-    xml = virsh("net-dumpxml", NETWORK, timeout=15, check=False).stdout or ""
-    used = set(re.findall(r"\bip=['\"]([^'\"]+)['\"]", xml))
-    leases = virsh("net-dhcp-leases", NETWORK, timeout=15, check=False).stdout or ""
-    used.update(re.findall(r"\b(192\.168\.122\.\d+)(?:/\d+)?\b", leases))
-    return used
+def choose_store(conn):
+    active = active_rows(conn)
+    counts = {str(x): 0 for x in STORES}
+    for row in active:
+        if row["storage_root"] in counts: counts[row["storage_root"]] += 1
+    candidates = []
+    for root in STORES:
+        root.mkdir(parents=True, exist_ok=True)
+        base = root / BASE
+        if not base.exists(): continue
+        usage = shutil.disk_usage(root)
+        candidates.append((counts[str(root)], -(usage.free), str(root), root))
+    if not candidates: raise RuntimeError("no healthy headless storage root with base image is available")
+    candidates.sort()
+    return candidates[0][-1]
+
+
+def current_dhcp_leases():
+    leases = virsh("net-dhcp-leases", NETWORK, timeout=15, check=False)
+    text = (leases.stdout or "") + "\n" + (leases.stderr or "")
+    found = set()
+    for match in re.finditer(r"\b192\.168\.122\.(\d{1,3})\b", text):
+        found.add(int(match.group(1)))
+    return found
 
 
 def choose_slot(conn):
-    used = {row["ip"] for row in active_rows(conn)} | reservations()
+    used_ips = {int(r["ip"].rsplit(".",1)[1]) for r in active_rows(conn)}
+    used_ips |= current_dhcp_leases()
     for last in range(IP_FIRST, IP_LAST + 1):
-        ip = f"192.168.122.{last}"
-        if ip not in used:
-            return ip, f"52:54:00:ce:00:{last:02x}"
-    raise RuntimeError("no free headless KVM network slot")
+        if last in used_ips: continue
+        mac = f"52:54:00:ce:{last // 256:02x}:{last % 256:02x}"
+        return f"192.168.122.{last}", mac
+    raise RuntimeError("no headless IP slots are available")
 
 
-def choose_store(conn):
-    counts = {str(root): 0 for root in STORES}
-    for row in active_rows(conn):
-        if row["storage_root"] in counts:
-            counts[row["storage_root"]] += 1
-    choices = []
-    for root in STORES:
-        if not (root / BASE).is_file():
-            continue
-        try:
-            free = shutil.disk_usage(root).free
-        except OSError:
-            free = 0
-        choices.append((counts[str(root)], -free, str(root), root))
-    if not choices:
-        raise RuntimeError(f"headless base image {BASE} is missing from all storage roots")
-    return sorted(choices)[0][3]
-
-
-def state_data(conn=None, history_limit=100):
+def state_data(conn=None, history_limit=40):
     own = conn is None
     conn = conn or db()
     try:
         marks = ",".join("?" for _ in ACTIVE)
-        current = [dict(x) for x in conn.execute(
-            f"SELECT * FROM instances WHERE status IN ({marks}) ORDER BY created_at DESC", ACTIVE)]
+        current = [dict(x) for x in conn.execute(f"SELECT * FROM instances WHERE status IN ({marks}) ORDER BY created_at DESC", ACTIVE)]
         history = [dict(x) for x in conn.execute(
             f"SELECT * FROM instances WHERE status NOT IN ({marks}) "
             "ORDER BY COALESCE(destroyed_at,finished_at,created_at) DESC LIMIT ?",
@@ -382,9 +455,12 @@ def del_dhcp(rec):
 
 
 def destroy_resources(rec):
-    virsh("destroy", rec["name"], timeout=20, check=False)
-    virsh("undefine", rec["name"], timeout=20, check=False)
-    del_dhcp(rec)
+    # Libvirt's network/domain mutation paths are intentionally serialized. The
+    # expensive guest workload remains fully parallel once domains are started.
+    with provision_locked():
+        virsh("destroy", rec["name"], timeout=20, check=False)
+        virsh("undefine", rec["name"], timeout=20, check=False)
+        del_dhcp(rec)
     shutil.rmtree(pathlib.Path(rec["storage_root"]) / rec["name"], ignore_errors=True)
 
 
@@ -395,35 +471,47 @@ def provision(rec):
     disk = root / f"{rec['name']}.qcow2"
     root.mkdir(parents=True, exist_ok=False)
     try:
-        effective_gib = effective_disk_gib(base_virtual_bytes(base), rec["disk_gib"])
-        run(["qemu-img", "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", str(base), str(disk), f"{effective_gib}G"])
-        add_dhcp(rec)
-        run(["virt-install", "--connect", URI, "--name", rec["name"],
-             "--memory", f"memory={rec['memory_mib']},maxmemory={rec['max_memory_mib']}",
-             "--vcpus", str(rec["vcpus"]), "--cpu", "host-passthrough",
-             "--disk", f"path={disk},format=qcow2,bus=virtio",
-             "--network", f"network={NETWORK},model=virtio,mac={rec['mac']}",
-             "--os-variant", "debian11", "--graphics", "none", "--noautoconsole", "--import"], timeout=90)
-        with locked():
-            conn = db()
-            try:
-                conn.execute("UPDATE instances SET status='running',started_at=?,disk_gib=?,error=NULL WHERE id=?",
-                             (stamp(), effective_gib, rec["id"]))
-                event(conn, rec["id"], "started", f"domain={rec['name']}")
-                conn.commit(); write_state(conn)
-                return dict(conn.execute("SELECT * FROM instances WHERE id=?", (rec["id"],)).fetchone())
-            finally: conn.close()
+        with provision_marker(rec["id"]):
+            effective_gib = effective_disk_gib(base_virtual_bytes(base), rec["disk_gib"])
+            # Overlay creation is storage work and is safe to parallelize.
+            run(["qemu-img", "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", str(base), str(disk), f"{effective_gib}G"])
+            record_instance_event(rec["id"], "provision_wait", f"pid={os.getpid()}")
+            # Serialize only the DHCP mutation + domain definition/start.
+            with provision_locked():
+                record_instance_event(rec["id"], "provision_enter", f"pid={os.getpid()}")
+                add_dhcp(rec)
+                try:
+                    run(["virt-install", "--connect", URI, "--name", rec["name"],
+                         "--memory", f"memory={rec['memory_mib']},maxmemory={rec['max_memory_mib']}",
+                         "--vcpus", str(rec["vcpus"]), "--cpu", "host-passthrough",
+                         "--disk", f"path={disk},format=qcow2,bus=virtio",
+                         "--network", f"network={NETWORK},model=virtio,mac={rec['mac']}",
+                         "--os-variant", "debian11", "--graphics", "none", "--noautoconsole", "--import"], timeout=90)
+                except Exception:
+                    # Undo the reservation before another creator enters the lock.
+                    del_dhcp(rec)
+                    raise
+            with locked():
+                conn = db()
+                try:
+                    conn.execute("UPDATE instances SET status='running',started_at=?,disk_gib=?,error=NULL WHERE id=?",
+                                 (stamp(), effective_gib, rec["id"]))
+                    event(conn, rec["id"], "started", f"domain={rec['name']}")
+                    conn.commit(); write_state(conn)
+                    return dict(conn.execute("SELECT * FROM instances WHERE id=?", (rec["id"],)).fetchone())
+                finally: conn.close()
     except Exception as exc:
+        detail = process_error(exc)
         destroy_resources(rec)
         with locked():
             conn = db()
             try:
                 conn.execute("UPDATE instances SET status='failed',finished_at=?,destroyed_at=?,error=?,teardown_reason='provision_failed' WHERE id=?",
-                             (stamp(), stamp(), str(exc)[:2000], rec["id"]))
-                event(conn, rec["id"], "provision_failed", str(exc)[:2000])
+                             (stamp(), stamp(), detail[:6000], rec["id"]))
+                event(conn, rec["id"], "provision_failed", detail[:6000])
                 conn.commit(); write_state(conn)
             finally: conn.close()
-        raise
+        raise RuntimeError(detail) from exc
 
 
 def finish(iid, status="finished", exit_code=None, reason="job_finished", keep=0):
@@ -480,6 +568,7 @@ def gc():
             rec["status"] == "creating"
             and created is not None
             and (current - created).total_seconds() >= STALE_CREATING_SECONDS
+            and not provision_owner_alive(rec["id"])
         )
         expired = bool(expiry and expiry <= current)
         if not (expired or stale_creating):
@@ -533,53 +622,58 @@ def rebalance_desktops():
         busy = bool(worker.get("activeJob") or worker.get("exclusive") or worker.get("schedulerBusy") or worker.get("lease"))
         target = desktop_target_mib(worker, busy)
         if virsh("dominfo", name, timeout=5, check=False).returncode:
-            errors.append(f"{name}: unavailable"); continue
-        live = virsh("setmem", name, f"{target}MiB", "--live", timeout=8, check=False)
-        conf = virsh("setmem", name, f"{target}MiB", "--config", timeout=8, check=False)
-        if live.returncode == 0 and conf.returncode == 0:
-            changed.append({"name": name, "busy": busy, "targetMiB": target})
+            errors.append({"name": name, "error": "domain_missing"}); continue
+        setmem = virsh("setmem", name, f"{target}MiB", "--live", timeout=10, check=False)
+        if setmem.returncode:
+            errors.append({"name": name, "error": (setmem.stderr or setmem.stdout or "setmem failed").strip()})
         else:
-            errors.append(f"{name}: {(live.stderr or conf.stderr or live.stdout or conf.stdout).strip()}")
+            changed.append({"name": name, "busy": busy, "targetMiB": target})
     return {"changed": changed, "errors": errors}
 
 
-def acquire_cmd(a):
-    gc()
-    rec, reused = reserve(a.owner, a.project or None, a.ttl_seconds, a.session_key or None,
-                          a.memory_mib, max(a.memory_mib, a.max_memory_mib), a.vcpus, a.disk_gib)
-    if reused:
-        state = virsh("domstate", rec["name"], timeout=5, check=False)
-        if state.returncode: raise RuntimeError(f"retained VM {rec['name']} no longer exists")
-        if "running" not in (state.stdout or "").lower(): virsh("start", rec["name"], timeout=30)
-    else:
-        rec = provision(rec)
-    print(json.dumps({**rec, "reused": reused}, separators=(",", ":"))); return 0
-
-
-def parser():
-    p = argparse.ArgumentParser(description="Elastic project-scoped headless KVM allocator")
-    s = p.add_subparsers(dest="cmd", required=True)
-    q = s.add_parser("acquire"); q.add_argument("--owner", required=True); q.add_argument("--project", default="")
-    q.add_argument("--ttl-seconds", type=int, default=7200); q.add_argument("--session-key", default="")
-    q.add_argument("--memory-mib", type=int, default=MEM_MIB); q.add_argument("--max-memory-mib", type=int, default=MAX_MEM_MIB)
-    q.add_argument("--vcpus", type=int, default=VCPUS); q.add_argument("--disk-gib", type=int, default=DISK_GIB); q.set_defaults(fn=acquire_cmd)
-    q = s.add_parser("finish"); q.add_argument("instance_id"); q.add_argument("--status", default="finished")
-    q.add_argument("--exit-code", type=int); q.add_argument("--reason", default="job_finished"); q.add_argument("--keep-seconds", type=int, default=0)
-    q.set_defaults(fn=lambda a: (print(json.dumps(finish(a.instance_id,a.status,a.exit_code,a.reason,a.keep_seconds), separators=(",", ":"))) or 0))
-    q = s.add_parser("renew"); q.add_argument("instance_id"); q.add_argument("--ttl-seconds", type=int, required=True)
-    q.set_defaults(fn=lambda a: (print(json.dumps(renew(a.instance_id,a.ttl_seconds), separators=(",", ":"))) or 0))
-    q = s.add_parser("gc"); q.set_defaults(fn=lambda a: (print(json.dumps({"destroyed":gc()}, separators=(",", ":"))) or 0))
-    q = s.add_parser("state"); q.add_argument("--history-limit", type=int, default=100)
-    q.set_defaults(fn=lambda a: (print(json.dumps(state_data(history_limit=a.history_limit), separators=(",", ":"))) or 0))
-    q = s.add_parser("rebalance-desktops"); q.set_defaults(fn=lambda a: (print(json.dumps(rebalance_desktops(), separators=(",", ":"))) or 0))
-    return p
-
-
-def main():
-    a = parser().parse_args()
-    try: return int(a.fn(a) or 0)
-    except RuntimeError as exc:
-        print(str(exc), file=sys.stderr); return 75
+def main(argv=None):
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="action", required=True)
+    def add_acquire_args(p):
+        p.add_argument("--owner", required=True); p.add_argument("--project", default="")
+        p.add_argument("--ttl-seconds", type=int, default=3600); p.add_argument("--session-key")
+        p.add_argument("--memory-mib", type=int, default=MEM_MIB); p.add_argument("--max-memory-mib", type=int, default=MAX_MEM_MIB)
+        p.add_argument("--vcpus", type=int, default=VCPUS); p.add_argument("--disk-gib", type=int, default=DISK_GIB)
+    p = sub.add_parser("acquire"); add_acquire_args(p)
+    p = sub.add_parser("reserve"); add_acquire_args(p)
+    p = sub.add_parser("provision"); p.add_argument("id")
+    p = sub.add_parser("finish"); p.add_argument("id"); p.add_argument("--status", default="finished"); p.add_argument("--exit-code", type=int); p.add_argument("--reason", default="job_finished"); p.add_argument("--keep-seconds", type=int, default=0)
+    p = sub.add_parser("renew"); p.add_argument("id"); p.add_argument("--ttl-seconds", type=int, required=True)
+    p = sub.add_parser("state"); p.add_argument("--history-limit", type=int, default=40)
+    sub.add_parser("gc"); sub.add_parser("rebalance-desktops")
+    args = parser.parse_args(argv)
+    if args.action in ("acquire", "reserve"):
+        gc()
+        rec, reused = reserve(args.owner, args.project, args.ttl_seconds, args.session_key,
+                              args.memory_mib, args.max_memory_mib, args.vcpus, args.disk_gib)
+        if args.action == "reserve":
+            print(json.dumps({"instance": rec, "reused": reused}, separators=(",", ":"))); return 0
+        if reused:
+            state = virsh("domstate", rec["name"], timeout=5, check=False)
+            if state.returncode:
+                raise RuntimeError(f"retained VM {rec['name']} no longer exists")
+            if "running" not in (state.stdout or "").lower():
+                virsh("start", rec["name"], timeout=30)
+        else:
+            rec = provision(rec)
+        print(json.dumps({**rec, "reused": reused}, separators=(",", ":"))); return 0
+    if args.action == "provision":
+        conn = db()
+        try: row = conn.execute("SELECT * FROM instances WHERE id=?", (args.id,)).fetchone()
+        finally: conn.close()
+        if not row: raise RuntimeError(f"unknown headless instance {args.id}")
+        print(json.dumps(provision(dict(row)), separators=(",", ":"))); return 0
+    if args.action == "finish": print(json.dumps(finish(args.id,args.status,args.exit_code,args.reason,args.keep_seconds),separators=(",", ":"))); return 0
+    if args.action == "renew": print(json.dumps(renew(args.id,args.ttl_seconds),separators=(",", ":"))); return 0
+    if args.action == "state": print(json.dumps(state_data(history_limit=args.history_limit),separators=(",", ":"))); return 0
+    if args.action == "gc": print(json.dumps({"destroyed": gc()},separators=(",", ":"))); return 0
+    if args.action == "rebalance-desktops": print(json.dumps(rebalance_desktops(),separators=(",", ":"))); return 0
+    return 2
 
 
 if __name__ == "__main__":
