@@ -6,7 +6,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-BASE_URL = os.environ.get("CODEX_LAB_SCHEDULER_URL", "http://192.168.122.1:8767").rstrip("/")
+BASE_URL = os.environ.get("CODEX_VM_JOB_SCHEDULER_URL", "http://192.168.122.1:8767").rstrip("/")
 def request(method, path, payload=None, timeout=10):
     data = None if payload is None else json.dumps(payload, separators=(",", ":")).encode()
     req = urllib.request.Request(
