@@ -23,7 +23,14 @@ SCHEDULER_VERSION = "2.2.0"
 HOST = os.environ.get("CODEX_LAB_SCHEDULER_HOST", "0.0.0.0")
 PORT = int(os.environ.get("CODEX_LAB_SCHEDULER_PORT", "8766"))
 DB_PATH = Path(os.environ.get("CODEX_LAB_SCHEDULER_DB", "/tank/vm/codex-lab/scheduler.sqlite3"))
-TRUSTED_CLIENTS = {x.strip() for x in os.environ.get("CODEX_LAB_SCHEDULER_TRUSTED_CLIENTS", "127.0.0.1,192.168.122.225").split(",") if x.strip()}
+TRUSTED_CLIENTS = {
+    value.strip()
+    for value in os.environ.get(
+        "CODEX_LAB_SCHEDULER_TRUSTED_CLIENTS",
+        "127.0.0.1,192.168.122.225,192.168.122.226",
+    ).split(",")
+    if value.strip()
+}
 MAX_STATIONS = max(1, min(int(os.environ.get("CODEX_LAB_VM_MAX_STATIONS", "6")), 8))
 GUEST_KEY = os.environ.get("CODEX_LAB_GUEST_KEY", "/home/mark/.ssh/id_ed25519_codex_lab_vm")
 KNOWN_HOSTS = os.environ.get("CODEX_LAB_SCHEDULER_KNOWN_HOSTS", "/home/mark/.ssh/codex_lab_scheduler_known_hosts")
