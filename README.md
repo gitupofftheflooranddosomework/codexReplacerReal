@@ -141,7 +141,7 @@ Ordinary sign-out uses `vm_lab_release` without reimaging. `recycle=true` is res
 
 ### Central job scheduler
 
-Long or CPU-heavy transferable work should use `vm_job_submit` instead of running on the controller. When two or more independent heavy tasks exist, agents should use `vm_job_submit_batch`; dispatch is automatic, so agents do not pick station numbers and one batch can fill all six KVMs in a single MCP round trip. The scheduler is a persistent homeserver user service:
+Long or CPU-heavy transferable work should use `vm_job_submit` instead of running on the controller. When two or more independent heavy tasks exist, agents should use `vm_job_submit_batch`; dispatch is automatic, so agents do not pick station numbers and one batch can feed the elastic disposable headless-KVM pool in a single MCP round trip. The six persistent desktop VMs are interactive-only and are not the heavy-job concurrency limit. The scheduler is a persistent homeserver user service:
 
 - service: `codex-lab-scheduler.service`
 - listener: `192.168.122.1:8766` on the private libvirt network
@@ -158,7 +158,7 @@ Long or CPU-heavy transferable work should use `vm_job_submit` instead of runnin
 MCP scheduler tools:
 
 - `vm_job_submit` — enqueue one build/test/scan/other expensive command and return immediately with `jobId`; the caller never chooses a VM.
-- `vm_job_submit_batch` — submit up to 48 independent heavy jobs in one MCP call; the scheduler immediately fills all free workers (up to all six) and queues the remainder.
+- `vm_job_submit_batch` — submit up to 48 independent heavy jobs in one MCP call; the scheduler starts as many disposable headless KVMs as host CPU/RAM/I/O pressure safely permits and queues the remainder.
 - `vm_job_status` — read state and recent stdout/stderr; use this to poll instead of resubmitting work.
 - `vm_job_list` — inspect recent jobs across all six workers.
 - `vm_job_cancel` — cancel queued/running work.

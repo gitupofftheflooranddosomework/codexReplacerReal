@@ -31,9 +31,9 @@ STORES = [pathlib.Path(x.strip()) for x in os.environ.get(
     "CODEX_CI_HEADLESS_STORAGE_ROOTS",
     "/tank/vm/codex-ci-headless,/tank2/vm/codex-ci-headless,/tank3/vm/codex-ci-headless",
 ).split(",") if x.strip()]
-IP_FIRST = int(os.environ.get("CODEX_CI_HEADLESS_IP_START", "240"))
-IP_LAST = int(os.environ.get("CODEX_CI_HEADLESS_IP_END", "253"))
-MAX_ACTIVE = max(1, int(os.environ.get("CODEX_CI_HEADLESS_MAX_ACTIVE", "12")))
+IP_FIRST = int(os.environ.get("CODEX_CI_HEADLESS_IP_START", "100"))
+IP_LAST = int(os.environ.get("CODEX_CI_HEADLESS_IP_END", "199"))
+MAX_ACTIVE = max(1, int(os.environ.get("CODEX_CI_HEADLESS_MAX_ACTIVE", "48")))
 PROJECT_MAX = max(1, int(os.environ.get("CODEX_CI_HEADLESS_PROJECT_MAX_ACTIVE", str(MAX_ACTIVE))))
 MEM_MIB = max(768, int(os.environ.get("CODEX_CI_HEADLESS_MEMORY_MIB", "2048")))
 MAX_MEM_MIB = max(MEM_MIB, int(os.environ.get("CODEX_CI_HEADLESS_MAX_MEMORY_MIB", "4096")))
@@ -41,6 +41,8 @@ VCPUS = max(1, int(os.environ.get("CODEX_CI_HEADLESS_VCPUS", "2")))
 DISK_GIB = max(10, int(os.environ.get("CODEX_CI_HEADLESS_DISK_GIB", "40")))
 HOST_RESERVE_MIB = max(4096, int(os.environ.get("CODEX_CI_HOST_RESERVE_MIB", "12288")))
 MAX_LOAD_PER_CPU = max(.5, float(os.environ.get("CODEX_CI_MAX_LOAD_PER_CPU", "2.0")))
+MAX_IO_PSI_AVG10 = max(1.0, float(os.environ.get("CODEX_CI_MAX_IO_PSI_AVG10", "70.0")))
+MAX_MEMORY_PSI_AVG10 = max(1.0, float(os.environ.get("CODEX_CI_MAX_MEMORY_PSI_AVG10", "25.0")))
 DESKTOP_IDLE_MIB = max(2048, int(os.environ.get("CODEX_DESKTOP_IDLE_MIB", "4096")))
 DESKTOP_ACTIVE_FLOOR_MIB = max(DESKTOP_IDLE_MIB, int(os.environ.get("CODEX_DESKTOP_ACTIVE_FLOOR_MIB", "6144")))
 DESKTOP_ACTIVE_MIB = max(DESKTOP_ACTIVE_FLOOR_MIB, int(os.environ.get("CODEX_DESKTOP_ACTIVE_MIB", "8192")))
@@ -144,9 +146,37 @@ def load_ok():
         return True
 
 
+def psi_avg10(resource, level="some"):
+    try:
+        for line in pathlib.Path(f"/proc/pressure/{resource}").read_text().splitlines():
+            parts = line.split()
+            if parts and parts[0] == level:
+                for item in parts[1:]:
+                    if item.startswith("avg10="):
+                        return float(item.split("=", 1)[1])
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def pressure_reason():
+    if not load_ok():
+        return "host CPU/load high-water guard is active"
+    io = psi_avg10("io")
+    if io is not None and io >= MAX_IO_PSI_AVG10:
+        return f"host I/O pressure high-water guard is active ({io:.1f}% avg10)"
+    memory = psi_avg10("memory")
+    if memory is not None and memory >= MAX_MEMORY_PSI_AVG10:
+        return f"host memory pressure high-water guard is active ({memory:.1f}% avg10)"
+    return None
+
+
 def reservations():
     xml = virsh("net-dumpxml", NETWORK, timeout=15, check=False).stdout or ""
-    return set(re.findall(r"\bip=['\"]([^'\"]+)['\"]", xml))
+    used = set(re.findall(r"\bip=['\"]([^'\"]+)['\"]", xml))
+    leases = virsh("net-dhcp-leases", NETWORK, timeout=15, check=False).stdout or ""
+    used.update(re.findall(r"\b(192\.168\.122\.\d+)(?:/\d+)?\b", leases))
+    return used
 
 
 def choose_slot(conn):
@@ -194,7 +224,11 @@ def state_data(conn=None, history_limit=100):
                 "freeSlots": max(0, MAX_ACTIVE - len(current)),
                 "hostMemTotalMiB": total, "hostMemAvailableMiB": available,
                 "hostReserveMiB": HOST_RESERVE_MIB,
-                "load1": os.getloadavg()[0] if hasattr(os, "getloadavg") else None},
+                "load1": os.getloadavg()[0] if hasattr(os, "getloadavg") else None,
+                "loadPerCpuLimit": MAX_LOAD_PER_CPU,
+                "ioPsiAvg10": psi_avg10("io"),
+                "memoryPsiAvg10": psi_avg10("memory"),
+                "pressureReason": pressure_reason()},
                 "active": current, "history": history}
     finally:
         if own:
@@ -233,8 +267,9 @@ def reserve(owner, project, ttl, session_key, memory, max_memory, vcpus, disk):
             _, available = meminfo()
             if available and available - max_memory < HOST_RESERVE_MIB:
                 raise RuntimeError(f"host RAM guard: {available} MiB available; {HOST_RESERVE_MIB} MiB reserve required")
-            if not load_ok():
-                raise RuntimeError("host load guard is active")
+            pressure = pressure_reason()
+            if pressure:
+                raise RuntimeError(pressure)
             store = choose_store(conn)
             ip, mac = choose_slot(conn)
             iid = __import__("uuid").uuid4().hex
