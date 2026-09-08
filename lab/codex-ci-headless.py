@@ -247,6 +247,23 @@ def reserve(owner, project, ttl, session_key, memory, max_memory, vcpus, disk):
             conn.close()
 
 
+def effective_disk_gib(base_bytes, requested_gib):
+    gib = 1024 ** 3
+    base_gib = (int(base_bytes) + gib - 1) // gib
+    return max(int(requested_gib), base_gib)
+
+
+def base_virtual_bytes(base):
+    info = run(["qemu-img", "info", "--output=json", str(base)], timeout=30)
+    try:
+        size = int(json.loads(info.stdout or "{}")["virtual-size"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"unable to determine base virtual size for {base}: {exc}") from exc
+    if size <= 0:
+        raise RuntimeError(f"invalid base virtual size for {base}: {size}")
+    return size
+
+
 def add_dhcp(rec):
     xml = f"<host mac='{rec['mac']}' name='{rec['name']}' ip='{rec['ip']}'/>"
     virsh("net-update", NETWORK, "add", "ip-dhcp-host", xml, "--live", "--config")
@@ -271,7 +288,8 @@ def provision(rec):
     disk = root / f"{rec['name']}.qcow2"
     root.mkdir(parents=True, exist_ok=False)
     try:
-        run(["qemu-img", "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", str(base), str(disk), f"{rec['disk_gib']}G"])
+        effective_gib = effective_disk_gib(base_virtual_bytes(base), rec["disk_gib"])
+        run(["qemu-img", "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", str(base), str(disk), f"{effective_gib}G"])
         add_dhcp(rec)
         run(["virt-install", "--connect", URI, "--name", rec["name"],
              "--memory", f"memory={rec['memory_mib']},maxmemory={rec['max_memory_mib']}",
@@ -282,7 +300,8 @@ def provision(rec):
         with locked():
             conn = db()
             try:
-                conn.execute("UPDATE instances SET status='running',started_at=?,error=NULL WHERE id=?", (stamp(), rec["id"]))
+                conn.execute("UPDATE instances SET status='running',started_at=?,disk_gib=?,error=NULL WHERE id=?",
+                             (stamp(), effective_gib, rec["id"]))
                 event(conn, rec["id"], "started", f"domain={rec['name']}")
                 conn.commit(); write_state(conn)
                 return dict(conn.execute("SELECT * FROM instances WHERE id=?", (rec["id"],)).fetchone())
