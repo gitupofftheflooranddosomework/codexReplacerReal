@@ -26,7 +26,7 @@ ROOT = pathlib.Path(os.environ.get("CODEX_CI_HEADLESS_ROOT", "/tank/vm/codex-ci-
 DB = pathlib.Path(os.environ.get("CODEX_CI_HEADLESS_DB", str(ROOT / "lifecycle.sqlite3")))
 STATE = pathlib.Path(os.environ.get("CODEX_CI_HEADLESS_STATE", str(ROOT / "state.json")))
 LOCK = pathlib.Path(os.environ.get("CODEX_CI_HEADLESS_LOCK", str(ROOT / "allocator.lock")))
-BASE = os.environ.get("CODEX_CI_HEADLESS_BASE", "codex-ci-base-v1.qcow2")
+BASE = os.environ.get("CODEX_CI_HEADLESS_BASE", "codex-ci-base-v2.qcow2")
 STORES = [pathlib.Path(x.strip()) for x in os.environ.get(
     "CODEX_CI_HEADLESS_STORAGE_ROOTS",
     "/tank/vm/codex-ci-headless,/tank2/vm/codex-ci-headless,/tank3/vm/codex-ci-headless",
@@ -43,6 +43,7 @@ HOST_RESERVE_MIB = max(4096, int(os.environ.get("CODEX_CI_HOST_RESERVE_MIB", "12
 MAX_LOAD_PER_CPU = max(.5, float(os.environ.get("CODEX_CI_MAX_LOAD_PER_CPU", "2.0")))
 DESKTOP_IDLE_MIB = max(2048, int(os.environ.get("CODEX_DESKTOP_IDLE_MIB", "4096")))
 DESKTOP_ACTIVE_MIB = max(DESKTOP_IDLE_MIB, int(os.environ.get("CODEX_DESKTOP_ACTIVE_MIB", "8192")))
+STALE_CREATING_SECONDS = max(120, int(os.environ.get("CODEX_CI_STALE_CREATING_SECONDS", "300")))
 SCHEDULER = os.environ.get("CODEX_LAB_SCHEDULER_URL", "http://127.0.0.1:8766").rstrip("/")
 ACTIVE = ("creating", "running", "idle", "releasing")
 
@@ -344,20 +345,32 @@ def gc():
     conn = db()
     try: rows = [dict(x) for x in active_rows(conn)]
     finally: conn.close()
-    expired = []
+    reaped = []
+    current = now()
     for rec in rows:
         expiry = parse_stamp(rec["expires_at"])
-        if expiry and expiry <= now():
-            try:
-                finish(rec["id"], "expired", rec["exit_code"], "ttl_expired", 0); expired.append(rec["id"])
-            except Exception as exc:
-                with locked():
-                    conn = db()
-                    try:
-                        conn.execute("UPDATE instances SET error=? WHERE id=?", (str(exc)[:2000], rec["id"]))
-                        event(conn, rec["id"], "gc_error", str(exc)[:2000]); conn.commit(); write_state(conn)
-                    finally: conn.close()
-    return expired
+        created = parse_stamp(rec["created_at"])
+        stale_creating = (
+            rec["status"] == "creating"
+            and created is not None
+            and (current - created).total_seconds() >= STALE_CREATING_SECONDS
+        )
+        expired = bool(expiry and expiry <= current)
+        if not (expired or stale_creating):
+            continue
+        reason = "stale_creating" if stale_creating else "ttl_expired"
+        status = "failed" if stale_creating else "expired"
+        try:
+            finish(rec["id"], status, rec["exit_code"], reason, 0)
+            reaped.append(rec["id"])
+        except Exception as exc:
+            with locked():
+                conn = db()
+                try:
+                    conn.execute("UPDATE instances SET error=? WHERE id=?", (str(exc)[:2000], rec["id"]))
+                    event(conn, rec["id"], "gc_error", str(exc)[:2000]); conn.commit(); write_state(conn)
+                finally: conn.close()
+    return reaped
 
 
 def scheduler_workers():
