@@ -163,6 +163,38 @@ def stream_snapshot(station: int, lease_id: str, workspace: pathlib.Path) -> Non
         raise RuntimeError(f"worker snapshot import failed: {remote_stderr.decode(errors='replace').strip()}")
 
 
+def safe_input(value: str) -> str:
+    path = pathlib.PurePosixPath(value)
+    if path.is_absolute() or not path.parts or ".." in path.parts or path.parts[0] == ".git":
+        raise ValueError(f"input path must be repository-relative and outside .git: {value}")
+    return str(path)
+
+
+def push_inputs(station: int, lease_id: str, workspace: pathlib.Path, inputs: list[str]) -> None:
+    if not inputs:
+        return
+    clean = [safe_input(item) for item in inputs]
+    for item in clean:
+        if not (workspace / item).exists():
+            raise FileNotFoundError(f"input path does not exist: {item}")
+    archive = subprocess.Popen(
+        ["tar", "-cf", "-", "--", *clean], cwd=workspace, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    assert archive.stdout is not None
+    remote = subprocess.Popen(
+        [*ssh_base(station), f"codex-ci overlay {lease_id}"],
+        stdin=archive.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    archive.stdout.close()
+    _, remote_stderr = remote.communicate(timeout=120)
+    archive_stderr = archive.stderr.read() if archive.stderr is not None else b""
+    archive_rc = archive.wait(timeout=10)
+    if archive_rc != 0:
+        raise RuntimeError(f"input archive failed: {archive_stderr.decode(errors='replace').strip()}")
+    if remote.returncode != 0:
+        raise RuntimeError(f"worker input overlay failed: {remote_stderr.decode(errors='replace').strip()}")
+
+
 def safe_artifact(value: str) -> str:
     path = pathlib.PurePosixPath(value)
     if path.is_absolute() or not path.parts or ".." in path.parts:
@@ -213,6 +245,7 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--wait-seconds", type=int, default=600)
     parser.add_argument("--ttl-minutes", type=int, default=180)
+    parser.add_argument("--input", action="append", default=[], help="repository-relative path to overlay after the clean Git snapshot")
     parser.add_argument("--artifact", action="append", default=[])
     parser.add_argument("--artifact-dest", default=None)
     parser.add_argument("--env", action="append", default=[])
@@ -231,6 +264,7 @@ def main() -> int:
         print(f"codex_ci_station={station}")
         print(f"codex_ci_worker={worker_ip(station)}")
         stream_snapshot(station, payload["leaseId"], workspace)
+        push_inputs(station, payload["leaseId"], workspace, args.input)
         rc = run_command(station, payload["leaseId"], args.command, max(1, args.timeout), env)
         if args.artifact:
             destination = pathlib.Path(args.artifact_dest or workspace).resolve()

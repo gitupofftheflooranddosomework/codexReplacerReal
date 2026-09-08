@@ -12,7 +12,6 @@ import shlex
 import shutil
 import subprocess
 import sys
-from datetime import datetime, timezone
 
 STATE_DIR = pathlib.Path("/home/mark/.local/share/codex-worker")
 CLAIM_LOCK = STATE_DIR / "claim.lock"
@@ -138,6 +137,17 @@ def parse_env(encoded: str) -> dict[str, str]:
     return {str(k): str(v) for k, v in data.items()}
 
 
+def action_overlay(args: list[str]) -> int:
+    if len(args) != 2:
+        die("overlay requires lease id")
+    lease_id = safe_lease(args[1])
+    require_lease(lease_id)
+    repo = lease_dir(lease_id) / "repo"
+    if not repo.is_dir():
+        die("lease workspace is missing", 5)
+    return subprocess.run(["tar", "-xf", "-", "-C", str(repo)], stdin=sys.stdin.buffer, check=False).returncode
+
+
 def action_exec(args: list[str]) -> int:
     if len(args) != 4:
         die("exec requires lease id, encoded command, encoded env")
@@ -205,6 +215,7 @@ def main() -> int:
         "probe": action_probe,
         "claim": action_claim,
         "import": action_import,
+        "overlay": action_overlay,
         "exec": action_exec,
         "artifact": action_artifact,
         "release": action_release,
