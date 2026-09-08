@@ -583,10 +583,11 @@ def provision(rec):
     try:
         with provision_marker(rec["id"]):
             effective_gib = effective_disk_gib(base_virtual_bytes(base), rec["disk_gib"])
-            # Overlay creation is storage work and is safe to parallelize.
-            run(["qemu-img", "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", str(base), str(disk), f"{effective_gib}G"])
             record_instance_event(rec["id"], "provision_wait", f"pid={os.getpid()}")
-            # Serialize only the DHCP mutation + domain definition/start.
+            # Let libvirt create the sparse backed overlay inside the serialized
+            # storage/domain mutation section. Pre-creating it as the scheduler
+            # user leaves a mark-owned qcow2 that qemu (uid 64055) cannot open on
+            # tank2/tank3; virt-install creates the same overlay as libvirt-qemu.
             with provision_locked():
                 record_instance_event(rec["id"], "provision_enter", f"pid={os.getpid()}")
                 add_dhcp(rec)
@@ -594,7 +595,8 @@ def provision(rec):
                     run(["virt-install", "--connect", URI, "--name", rec["name"],
                          "--memory", f"memory={rec['memory_mib']},maxmemory={rec['max_memory_mib']}",
                          "--vcpus", str(rec["vcpus"]), "--cpu", "host-passthrough",
-                         "--disk", f"path={disk},format=qcow2,bus=virtio",
+                         "--disk", (f"path={disk},size={effective_gib},format=qcow2,"
+                                    f"backing_store={base},backing_format=qcow2,bus=virtio,sparse=yes"),
                          "--network", f"network={NETWORK},model=virtio,mac={rec['mac']}",
                          "--os-variant", "debian11", "--graphics", "none", "--noautoconsole", "--import"], timeout=90)
                 except Exception:
