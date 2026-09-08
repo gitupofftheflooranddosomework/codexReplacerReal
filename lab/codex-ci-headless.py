@@ -33,7 +33,7 @@ STORES = [pathlib.Path(x.strip()) for x in os.environ.get(
 ).split(",") if x.strip()]
 IP_FIRST = int(os.environ.get("CODEX_CI_HEADLESS_IP_START", "100"))
 IP_LAST = int(os.environ.get("CODEX_CI_HEADLESS_IP_END", "199"))
-MAX_ACTIVE = max(1, int(os.environ.get("CODEX_CI_HEADLESS_MAX_ACTIVE", "48")))
+MAX_ACTIVE = max(1, int(os.environ.get("CODEX_CI_HEADLESS_MAX_ACTIVE", "96")))
 PROJECT_MAX = max(1, int(os.environ.get("CODEX_CI_HEADLESS_PROJECT_MAX_ACTIVE", str(MAX_ACTIVE))))
 MEM_MIB = max(768, int(os.environ.get("CODEX_CI_HEADLESS_MEMORY_MIB", "2048")))
 MAX_MEM_MIB = max(MEM_MIB, int(os.environ.get("CODEX_CI_HEADLESS_MAX_MEMORY_MIB", "4096")))

@@ -29,7 +29,7 @@ JOB_ROOT = pathlib.Path(os.environ.get("CODEX_VM_JOB_WORK_ROOT", str(ROOT / "job
 RUNNER = os.environ.get("CODEX_VM_JOB_RUNNER", "/home/mark/.local/bin/codex-headless-job-runner")
 MANAGER = os.environ.get("CODEX_CI_HEADLESS_MANAGER", "/home/mark/.local/bin/codex-ci-headless")
 INTERACTIVE_URL = os.environ.get("CODEX_LAB_INTERACTIVE_SCHEDULER_URL", "http://192.168.122.1:8766").rstrip("/")
-MAX_LAUNCHERS = max(1, int(os.environ.get("CODEX_VM_JOB_MAX_LAUNCHERS", "48")))
+MAX_LAUNCHERS = max(1, int(os.environ.get("CODEX_VM_JOB_MAX_LAUNCHERS", "96")))
 MAX_TAIL = 1024 * 1024
 POLL_SECONDS = max(0.2, float(os.environ.get("CODEX_VM_JOB_POLL_SECONDS", "0.5")))
 TERMINAL = {"succeeded", "failed", "timed_out", "canceled"}
@@ -148,7 +148,7 @@ def launch_row(row: sqlite3.Row) -> None:
             conn.execute("UPDATE jobs SET launcher_pid=?,updated_at=?,error=NULL WHERE id=?", (proc.pid, stamp, row["id"]))
             conn.commit()
         else:
-            try: os.kill(proc.pid, signal.SIGTERM)
+            try: os.killpg(proc.pid, signal.SIGTERM)
             except ProcessLookupError: pass
         conn.close()
 
@@ -323,10 +323,21 @@ def cancel_job(job_id: str) -> dict | None:
         if row["status"] in TERMINAL:
             out = public_job(row); conn.close(); return out
         stamp = now_iso()
+        pid = int(row["launcher_pid"] or 0)
+        if not pid:
+            # Make a never-started queued job terminal under the same DB lock.
+            # launch_row rechecks status after spawning and kills its process group
+            # if a selection raced this cancellation.
+            conn.execute(
+                "UPDATE jobs SET status='canceled',cancel_requested=1,finished_at=?,updated_at=? WHERE id=?",
+                (stamp, stamp, job_id),
+            )
+            conn.commit(); row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone(); conn.close()
+            WAKE.set()
+            return public_job(row)
         conn.execute("UPDATE jobs SET cancel_requested=1,updated_at=? WHERE id=?", (stamp, job_id)); conn.commit(); conn.close()
-    pid = int(row["launcher_pid"] or 0)
-    if pid and pid_alive(pid):
-        try: os.kill(pid, signal.SIGTERM)
+    if pid_alive(pid):
+        try: os.killpg(pid, signal.SIGTERM)
         except ProcessLookupError: pass
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
@@ -340,8 +351,8 @@ def cancel_job(job_id: str) -> dict | None:
         if instance:
             subprocess.run([MANAGER, "finish", str(instance), "--status", "canceled", "--reason", "scheduler_cancel"],
                            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, check=False)
-        if pid and pid_alive(pid):
-            try: os.kill(pid, signal.SIGTERM)
+        if pid_alive(pid):
+            try: os.killpg(pid, signal.SIGTERM)
             except ProcessLookupError: pass
         with DB_LOCK:
             conn = db(); stamp = now_iso()

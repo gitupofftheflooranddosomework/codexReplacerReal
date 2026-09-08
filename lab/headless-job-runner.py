@@ -40,6 +40,19 @@ def normalize_cwd(value: str) -> str:
     return str(p) or "."
 
 
+def resources(job_class: str) -> tuple[int, int, int]:
+    # Current memory is the resident/boot target; max memory is balloon headroom.
+    # Keep small independent jobs cheap so aggregate concurrency can rise.
+    table = {
+        "io": (1024, 2048, 1),
+        "cpu": (1536, 3072, 2),
+        "test": (2048, 4096, 2),
+        "build": (3072, 5120, 2),
+        "browser": (2048, 4096, 2),
+    }
+    return table.get(str(job_class or "cpu"), table["cpu"])
+
+
 def prepare_workspace(payload: dict, job_dir: pathlib.Path) -> pathlib.Path:
     workspace = job_dir / "workspace"
     repo = str(payload.get("repoUrl") or "").strip()
@@ -84,6 +97,7 @@ def main() -> int:
     command = str(payload["command"])
     if cwd != ".":
         command = f"cd {shlex.quote(cwd)} && {command}"
+    memory_mib, max_memory_mib, vcpus = resources(str(payload.get("jobClass") or "cpu"))
     argv = [
         DISPATCH,
         "--owner", str(payload["owner"]),
@@ -92,6 +106,9 @@ def main() -> int:
         "--command", command,
         "--timeout", str(int(payload.get("timeout") or 3600)),
         "--wait-seconds", str(WAIT_SECONDS),
+        "--memory-mib", str(memory_mib),
+        "--max-memory-mib", str(max_memory_mib),
+        "--vcpus", str(vcpus),
     ]
     for key, value in (payload.get("env") or {}).items():
         argv += ["--env", f"{key}={value}"]
