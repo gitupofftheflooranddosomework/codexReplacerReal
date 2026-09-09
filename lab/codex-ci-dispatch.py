@@ -202,12 +202,17 @@ def main():
         print("Codex CI dispatch interrupted",file=sys.stderr); return rc
     finally:
         for sig,handler in old.items(): signal.signal(sig,handler)
+        released=False
         if rec and iid and claimed:
             if status in ("timed_out","cancelled"): cancel(rec,iid)
-            try: ssh_capture(rec,f"codex-ci release {iid}",timeout=20)
-            except Exception: pass
+            try:
+                release=ssh_capture(rec,f"codex-ci release {iid}",timeout=20)
+                released=release.returncode==0
+                if not released: print('worker release failed; destroying instead of retaining',file=sys.stderr)
+            except Exception as exc:
+                print(f'worker release failed; destroying instead of retaining: {exc}',file=sys.stderr)
         if rec:
-            keep=max(0,int(a.persist_hours*3600)) if claimed else 0
+            keep=max(0,int(a.persist_hours*3600)) if claimed and released else 0
             try: manager("finish",rec["id"],"--status",status,"--exit-code",str(rc),"--reason",status,"--keep-seconds",str(keep),timeout=90)
             except Exception as exc: print(f"warning: headless lifecycle cleanup failed: {exc}",file=sys.stderr)
 

@@ -76,4 +76,19 @@ class RecoveryTests(unittest.TestCase):
         self.assertFalse(result['ready'])
         self.assertIn('timed out',result['probeError'])
 
+    def test_release_without_vault_cli_clears_lease_and_local_credentials(self):
+        m=load('codex-ci-worker-rpc')
+        with tempfile.TemporaryDirectory() as tmp:
+            m.HOME=pathlib.Path(tmp)
+            m.STATE_DIR=m.HOME/'state';m.STATE_DIR.mkdir()
+            m.CLAIM_LOCK=m.STATE_DIR/'claim.lock';m.EXCLUSIVE=m.STATE_DIR/'exclusive.lock'
+            m.WORK_ROOT=m.HOME/'work'
+            iid='a'*32
+            m.EXCLUSIVE.write_text('{"leaseId":"'+iid+'","source":"github-actions"}')
+            data=m.HOME/'.config/Bitwarden CLI/data.json';data.parent.mkdir(parents=True);data.write_text('private')
+            with patch.object(m.shutil,'which',return_value=None):
+                self.assertEqual(m.action_release(['release',iid]),0)
+            self.assertFalse(data.exists())
+            self.assertFalse(m.EXCLUSIVE.exists())
+
 if __name__=='__main__': unittest.main()

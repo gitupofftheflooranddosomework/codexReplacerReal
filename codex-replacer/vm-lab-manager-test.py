@@ -25,6 +25,20 @@ class DummyLock:
 
 
 class LeaseValidationTests(unittest.TestCase):
+    def test_acquire_continues_past_unavailable_station(self):
+        state={'version':1,'stations':{}}
+        def ready(station):
+            if station==1: raise RuntimeError('station 1 SSH not ready')
+        with mock.patch.object(m,'locked_state',return_value=(DummyLock(),state)), \
+             mock.patch.object(m,'unlock'),mock.patch.object(m,'expire'), \
+             mock.patch.object(m,'reconcile_lost_leases'),mock.patch.object(m,'ensure_station',side_effect=ready), \
+             mock.patch.object(m,'reset_worker_vault',return_value=True), \
+             mock.patch.object(m,'ssh_guest',return_value=subprocess.CompletedProcess([],0,'','')), \
+             mock.patch.object(m,'save_state'),mock.patch.object(m,'audit'),mock.patch.object(m,'notify_usage'):
+            got=m.acquire('test')
+        self.assertEqual(got['station'],2)
+        self.assertEqual(state['stations']['1']['status'],'free')
+
     def test_validate_does_not_reconcile_unrelated_workers(self):
         state = {'version': 1, 'stations': {'2': lease(2, 'other'), '3': lease(3, 'wanted')}}
         with mock.patch.object(m, 'locked_state', return_value=(DummyLock(), state)), \

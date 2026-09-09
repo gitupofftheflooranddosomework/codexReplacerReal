@@ -311,10 +311,16 @@ def acquire(owner, project=None, ttl_minutes=180, chat_label=None, chat_url=None
     try:
         expire(state)
         reconcile_lost_leases(state)
+        unavailable = []
         for s in range(1,MAX_STATIONS+1):
             r=record_for(state,s)
             if r.get("status")=="leased": continue
-            ensure_station(s)
+            try:
+                ensure_station(s)
+            except (RuntimeError, subprocess.TimeoutExpired) as exc:
+                unavailable.append(s)
+                audit('station_unavailable', station=s, error=str(exc)[:500])
+                continue
             if not reset_worker_vault(s):
                 continue
             repair = ssh_guest(
@@ -354,7 +360,7 @@ def acquire(owner, project=None, ttl_minutes=180, chat_label=None, chat_url=None
                   chatUrl=str(chat_url or "").strip() or None, ttlMinutes=ttl)
             notify_usage("start", r)
             return r.copy()
-        raise RuntimeError(f"All {MAX_STATIONS} full-VM lab stations are leased")
+        raise RuntimeError(f"No available full-VM lab station; leased or unavailable (failed readiness: {unavailable})")
     finally: unlock(lock)
 
 def find_active(state, lease_id=None, station=None):

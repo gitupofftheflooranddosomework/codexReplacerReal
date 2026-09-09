@@ -183,7 +183,17 @@ def action_release(args):
         lease=load_lease()
         if lease.get("leaseId")!=iid or lease.get("source")!="github-actions": return 0
         kill_exec(iid)
-        subprocess.run(["bw","logout"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=False)
+        # Sanitized headless images need not contain the interactive vault CLI.
+        # Network logout is best effort; local credential removal is mandatory
+        # and must complete before releasing ownership for another claim.
+        if shutil.which('bw'):
+            try:
+                subprocess.run(['bw','logout'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+                               check=False,timeout=3)
+            except (OSError,subprocess.TimeoutExpired):
+                pass
+        vault_data = HOME / '.config/Bitwarden CLI/data.json'
+        vault_data.unlink(missing_ok=True)
         shutil.rmtree(root,ignore_errors=True)
         try: EXCLUSIVE.unlink()
         except FileNotFoundError: pass
