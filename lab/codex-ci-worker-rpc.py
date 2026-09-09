@@ -17,6 +17,7 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.parse
 
 HOME = pathlib.Path.home()
 STATE_DIR = HOME / ".local/share/codex-worker"
@@ -123,6 +124,62 @@ def action_import(args):
     print(repo); return 0
 
 
+
+def safe_git_head(value):
+    value=str(value or "").strip().lower()
+    if len(value) not in (40,64) or any(c not in "0123456789abcdef" for c in value): die("invalid expected Git HEAD")
+    return value
+
+
+def safe_origin(value):
+    value=str(value or "").strip()
+    if any(ord(ch)<32 for ch in value): die("invalid origin URL")
+    if len(value)>2048: die("origin URL is too long")
+    parsed=urllib.parse.urlsplit(value)
+    if parsed.scheme in ("http","https") and (parsed.username is not None or parsed.password is not None):
+        die("origin URL must not contain credentials")
+    return value
+
+
+def install_git_bundle(iid, expected_head, origin, stream):
+    iid=safe_lease(iid); expected=safe_git_head(expected_head); origin=safe_origin(origin); require_lease(iid)
+    root=lease_dir(iid); repo=root/"repo"; bundle=root/"repo.bundle"
+    shutil.rmtree(root,ignore_errors=True); root.mkdir(parents=True,exist_ok=True)
+    try:
+        with bundle.open("wb") as handle:
+            shutil.copyfileobj(stream,handle)
+        repo.mkdir(parents=True,exist_ok=True)
+        commands=(
+            ["git","init","-q"],
+            ["git","fetch","-q",str(bundle),"HEAD"],
+            ["git","checkout","-q","--detach",expected],
+        )
+        for cmd in commands:
+            cp=subprocess.run(cmd,cwd=repo,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
+            if cp.returncode: raise RuntimeError(cp.stderr.strip() or cp.stdout.strip() or f"Git import failed: {' '.join(cmd)}")
+        actual=subprocess.run(["git","rev-parse","HEAD"],cwd=repo,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
+        if actual.returncode or actual.stdout.strip().lower()!=expected:
+            raise RuntimeError(f"worker Git HEAD mismatch: expected {expected}, got {actual.stdout.strip() or 'unresolved'}")
+        if origin:
+            cp=subprocess.run(["git","remote","add","origin",origin],cwd=repo,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
+            if cp.returncode: raise RuntimeError(cp.stderr.strip() or "could not restore origin remote")
+        return repo
+    except Exception:
+        shutil.rmtree(root,ignore_errors=True)
+        raise
+    finally:
+        try: bundle.unlink()
+        except FileNotFoundError: pass
+
+
+def action_import_git(args):
+    if len(args)!=4: die("import-git requires lease id, expected HEAD, and encoded origin")
+    iid=safe_lease(args[1]); expected=decode(args[2]); origin=decode(args[3])
+    try: repo=install_git_bundle(iid,expected,origin,sys.stdin.buffer)
+    except Exception as exc:
+        print(f"Git bundle import failed: {exc}",file=sys.stderr); return 5
+    print(repo); return 0
+
 def parse_env(encoded):
     if not encoded: return {}
     try: data=json.loads(decode(encoded))
@@ -208,7 +265,7 @@ def main():
     except ValueError: die("invalid command quoting")
     if not args or args[0]!="codex-ci": die("restricted Codex CI key")
     action=args[1] if len(args)>1 else ""
-    handlers={"probe":action_probe,"claim":action_claim,"import":action_import,"overlay":action_overlay,
+    handlers={"probe":action_probe,"claim":action_claim,"import":action_import,"import-git":action_import_git,"overlay":action_overlay,
               "exec":action_exec,"cancel":action_cancel,"artifact":action_artifact,"release":action_release}
     fn=handlers.get(action)
     if fn is None: die("unsupported Codex CI action")

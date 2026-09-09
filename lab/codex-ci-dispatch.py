@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 import uuid
+import urllib.parse
 
 MANAGER=os.environ.get("CODEX_CI_HEADLESS_MANAGER","/home/mark/.local/bin/codex-ci-headless")
 SSH_USER=os.environ.get("CODEX_CI_SSH_USER","mark")
@@ -85,12 +86,30 @@ def validate_workspace(workspace,inputs):
     if unexpected: raise RuntimeError("workspace contains undeclared changes: "+", ".join(unexpected[:20]))
 
 
+def worker_origin(workspace):
+    cp=subprocess.run(["git","remote","get-url","origin"],cwd=workspace,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
+    if cp.returncode: return ""
+    value=cp.stdout.strip()
+    if not value: return ""
+    if any(ord(ch)<32 for ch in value): raise RuntimeError("origin URL contains control characters")
+    parsed=urllib.parse.urlsplit(value)
+    if parsed.scheme in ("http","https") and (parsed.username is not None or parsed.password is not None):
+        host=parsed.hostname or ""
+        if parsed.port is not None: host += f":{parsed.port}"
+        value=urllib.parse.urlunsplit((parsed.scheme,host,parsed.path,parsed.query,parsed.fragment))
+    return value
+
+
 def stream_snapshot(rec,iid,workspace):
-    archive=subprocess.Popen(["git","archive","--format=tar","HEAD"],cwd=workspace,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-    remote=subprocess.Popen([*ssh_base(rec),f"codex-ci import {iid}"],stdin=archive.stdout,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-    archive.stdout.close(); _,rerr=remote.communicate(timeout=180); aerr=archive.stderr.read(); arc=archive.wait(timeout=10)
-    if arc: raise RuntimeError("git archive failed: "+aerr.decode(errors="replace").strip())
-    if remote.returncode: raise RuntimeError("worker import failed: "+rerr.decode(errors="replace").strip())
+    head=subprocess.run(["git","rev-parse","HEAD"],cwd=workspace,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
+    if head.returncode: raise RuntimeError(head.stderr.strip() or "could not resolve workspace HEAD")
+    expected=head.stdout.strip().lower()
+    origin=worker_origin(workspace)
+    bundle=subprocess.Popen(["git","bundle","create","-","HEAD"],cwd=workspace,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    remote=subprocess.Popen([*ssh_base(rec),f"codex-ci import-git {iid} {enc(expected)} {enc(origin)}"],stdin=bundle.stdout,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    bundle.stdout.close(); _,rerr=remote.communicate(timeout=300); berr=bundle.stderr.read(); brc=bundle.wait(timeout=20)
+    if brc: raise RuntimeError("git bundle failed: "+berr.decode(errors="replace").strip())
+    if remote.returncode: raise RuntimeError("worker Git import failed: "+rerr.decode(errors="replace").strip())
 
 
 def push_inputs(rec,iid,workspace,inputs):
