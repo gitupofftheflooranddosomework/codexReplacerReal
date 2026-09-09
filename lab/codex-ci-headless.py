@@ -580,6 +580,11 @@ def provision(rec):
                 conn.close()
         raise RuntimeError(detail)
     root.mkdir(parents=True, exist_ok=False)
+    # Caller umasks differ between the scheduler service and GitHub runner
+    # services. Libvirt creates the qcow2 as libvirt-qemu, so QEMU must be
+    # able to search this mark-owned directory even when the caller uses 077.
+    # 0711 grants traversal without allowing other users to list its contents.
+    os.chmod(root, 0o711)
     try:
         with provision_marker(rec["id"]):
             effective_gib = effective_disk_gib(base_virtual_bytes(base), rec["disk_gib"])
