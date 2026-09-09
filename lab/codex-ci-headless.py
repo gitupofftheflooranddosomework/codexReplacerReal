@@ -28,7 +28,7 @@ STATE = pathlib.Path(os.environ.get("CODEX_CI_HEADLESS_STATE", str(ROOT / "state
 LOCK = pathlib.Path(os.environ.get("CODEX_CI_HEADLESS_LOCK", str(ROOT / "allocator.lock")))
 PROVISION_LOCK = pathlib.Path(os.environ.get("CODEX_CI_HEADLESS_PROVISION_LOCK", str(ROOT / "provision.lock")))
 PROVISIONERS = pathlib.Path(os.environ.get("CODEX_CI_HEADLESS_PROVISIONERS", str(ROOT / "provisioners")))
-BASE = os.environ.get("CODEX_CI_HEADLESS_BASE", "codex-ci-base-v2.qcow2")
+BASE = os.environ.get("CODEX_CI_HEADLESS_BASE", "codex-ci-base-v3.qcow2")
 STORES = [pathlib.Path(x.strip()) for x in os.environ.get(
     "CODEX_CI_HEADLESS_STORAGE_ROOTS",
     "/tank/vm/codex-ci-headless,/tank2/vm/codex-ci-headless,/tank3/vm/codex-ci-headless",

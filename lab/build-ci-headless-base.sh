@@ -4,7 +4,7 @@ set -euo pipefail
 URI=${CODEX_CI_LIBVIRT_URI:-qemu:///system}
 NETWORK=${CODEX_CI_NETWORK:-default}
 SOURCE=${CODEX_CI_BASE_SOURCE:-/tank/vm/codex-lab-v2/codex-lab-base-browser-v2.qcow2}
-OUT_NAME=${CODEX_CI_HEADLESS_BASE:-codex-ci-base-v2.qcow2}
+OUT_NAME=${CODEX_CI_HEADLESS_BASE:-codex-ci-base-v3.qcow2}
 STORES=${CODEX_CI_HEADLESS_STORAGE_ROOTS:-/tank/vm/codex-ci-headless,/tank2/vm/codex-ci-headless,/tank3/vm/codex-ci-headless}
 RPC=${CODEX_CI_WORKER_RPC:-/home/mark/.local/share/codex-ci/codex-ci-worker-rpc.py}
 CI_PUB=${CODEX_CI_PUBLIC_KEY:-/home/mark/.local/share/codex-ci/ssh/id_ed25519_codex_ci.pub}
@@ -33,7 +33,7 @@ cleanup
 rm -f "$OVERLAY" "$FLAT"
 qemu-img create -q -f qcow2 -F qcow2 -b "$SOURCE" "$OVERLAY" 100G
 virsh --connect "$URI" net-update "$NETWORK" add ip-dhcp-host "<host mac='$MAC' name='$BUILDER' ip='$IP'/>" --live --config >/dev/null
-virt-install --connect "$URI" --name "$BUILDER" --memory 4096 --vcpus 4 --cpu host-passthrough \
+virt-install --connect "$URI" --name "$BUILDER" --memory 4096 --vcpus 2 --cpu host-passthrough \
   --disk "path=$OVERLAY,format=qcow2,bus=virtio" --network "network=$NETWORK,model=virtio,mac=$MAC" \
   --os-variant debian11 --graphics none --noautoconsole --import >/dev/null
 
@@ -53,11 +53,13 @@ p=pathlib.Path.home()/'.ssh/authorized_keys'; p.touch(mode=0o600,exist_ok=True)
 rows=[x for x in p.read_text().splitlines() if blob not in x]; rows.append(line)
 p.write_text('\n'.join(rows)+'\n'); p.chmod(0o600)
 PY
+ssh_admin 'set -e; sudo -n env DEBIAN_FRONTEND=noninteractive apt-get update -qq; sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3 python3-dev python3-venv python3-pip python3-setuptools python3-wheel python3-reportlab python3-pytest python3-requests python3-yaml php-cli php-common php-curl php-mbstring php-xml php-zip php-intl php-sqlite3 php-mysql php-pgsql composer dnsutils; sudo -n apt-get clean; sudo -n rm -rf /var/lib/apt/lists/*; sudo -n touch /var/lib/codex-ci-toolchain-v3; command -v php composer dig >/dev/null; php -r '\''echo "php_runtime_ok\n";'\''; python3 -c '\''import reportlab, requests, yaml; print("python_runtime_ok")'\'''
 ssh_admin 'mkdir -p ~/.local/share/codex-ci; : > ~/.local/share/codex-ci/headless-v1; rm -f ~/.local/share/codex-worker/claim.lock ~/.local/share/codex-worker/exclusive.lock ~/.local/share/codex-worker/scheduler.lock; rm -rf /workspace/ci-dispatch/* 2>/dev/null || true; rm -f ~/.config/systemd/user/default.target.wants/codex-worker-desktop.service; systemctl --user disable --now codex-worker-desktop.service >/dev/null 2>&1 || true; pkill -f "chromium.*remote-debugging-port=9222" >/dev/null 2>&1 || true; pkill -f "Xvfb|x11vnc|websockify" >/dev/null 2>&1 || true; sync' || true
 virsh --connect "$URI" shutdown "$BUILDER" >/dev/null || true
 for _ in $(seq 1 60); do state=$(virsh --connect "$URI" domstate "$BUILDER" 2>/dev/null || true); [[ $state != running ]] && break; sleep 1; done
 virsh --connect "$URI" destroy "$BUILDER" >/dev/null 2>&1 || true
 qemu-img convert -p -O qcow2 "$OVERLAY" "$FLAT"
+qemu-img check "$FLAT"
 
 # The online builder acquires a machine-id and DHCP client identity. Never
 # publish those values into a clone template: systemd-networkd derives its
@@ -72,5 +74,10 @@ LIBGUESTFS_BACKEND=direct virt-customize -a "$FLAT" \
 
 IFS=',' read -ra roots <<< "$STORES"
 for root in "${roots[@]}"; do root=${root// /}; mkdir -p "$root"; tmp="$root/$OUT_NAME.tmp"; cp --reflink=auto "$FLAT" "$tmp"; chmod 664 "$tmp"; mv -f "$tmp" "$root/$OUT_NAME"; done
-sha256sum "$FLAT" "${roots[0]// /}/$OUT_NAME"
+hash=$(sha256sum "$FLAT" | awk '{print $1}')
+for root in "${roots[@]}"; do
+  root=${root// /}
+  [[ $(sha256sum "$root/$OUT_NAME" | awk '{print $1}') == "$hash" ]] || fail "base checksum mismatch: $root/$OUT_NAME"
+done
+printf 'base=%s sha256=%s\n' "$OUT_NAME" "$hash"
 echo "headless_base_ready=$OUT_NAME"
