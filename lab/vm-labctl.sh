@@ -13,6 +13,27 @@ VCPUS=${CODEX_LAB_VM_VCPUS:-4}
 DISK_GIB=${CODEX_LAB_VM_DISK_GIB:-100}
 MAX_STATIONS=${CODEX_LAB_VM_MAX_STATIONS:-6}
 PREWARM=${CODEX_LAB_VM_PREWARM:-6}
+ADMIN_KEY=${CODEX_LAB_ADMIN_KEY:-/home/mark/.ssh/id_ed25519_codex_lab_vm}
+ADMIN_KNOWN=${CODEX_LAB_ADMIN_KNOWN_HOSTS:-/home/mark/.ssh/codex_lab_scheduler_known_hosts}
+
+authorize_controller() {
+  encoded=$(printf '%s' "$pubkey" | base64 -w0)
+  timeout 15 ssh -i "$ADMIN_KEY" -o IdentitiesOnly=yes -o BatchMode=yes \
+    -o ConnectTimeout=5 -o "UserKnownHostsFile=$ADMIN_KNOWN" -o StrictHostKeyChecking=accept-new \
+    "mark@$IP" python3 - "$encoded" <<'PY'
+import base64, pathlib, sys
+key = base64.b64decode(sys.argv[1]).decode().strip()
+parts = key.split()
+if len(parts) < 2 or parts[0] not in ('ssh-ed25519', 'ssh-rsa', 'ecdsa-sha2-nistp256'):
+    raise ValueError('Invalid controller public key')
+p = pathlib.Path.home() / '.ssh/authorized_keys'
+content = p.read_text() if p.exists() else ''
+if not any(parts[1] in line.split() for line in content.splitlines()):
+    with p.open('a') as output:
+        output.write('\n' + key + '\n')
+    p.chmod(0o600)
+PY
+}
 
 station_values() {
   n=$1
@@ -76,6 +97,9 @@ create_station() {
       --os-variant debian11 --graphics none --noautoconsole --import >/dev/null
   fi
   if [ "$n" -le "$PREWARM" ]; then virsh --connect "$CONNECT" autostart "$NAME" >/dev/null; fi
+  # Rebuilt images contain the host administrator key, but may predate the
+  # current broker key. The ensure contract must actually install its key.
+  authorize_controller
   printf '%s\t%s\t%s\n' "$NAME" "$IP" "$(virsh --connect "$CONNECT" domstate "$NAME" | tr -d '\r')"
 }
 

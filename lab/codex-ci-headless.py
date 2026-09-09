@@ -107,6 +107,8 @@ def db():
     conn.execute("CREATE INDEX IF NOT EXISTS ci_status ON instances(status,created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS ci_project ON instances(project,status,created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS ci_session ON instances(project,session_key,status)")
+    conn.execute("""CREATE TABLE IF NOT EXISTS dispatch_owners(
+      instance_id TEXT PRIMARY KEY,pid INTEGER NOT NULL,identity TEXT NOT NULL)""")
     conn.execute("""CREATE TABLE IF NOT EXISTS storage_health(
       storage_root TEXT PRIMARY KEY,consecutive_failures INTEGER NOT NULL DEFAULT 0,
       last_failure_at TEXT,backoff_until TEXT,last_error TEXT,last_success_at TEXT)""")
@@ -247,7 +249,10 @@ def zfs_arc_capacity():
 def memory_capacity():
     total, available = meminfo()
     arc = zfs_arc_capacity()
-    effective = available + arc["reclaimableMiB"]
+    # ARC shrink is asynchronous and can stall under swap/I/O pressure. Admit
+    # only against RAM the kernel already reports available, not theoretical
+    # future reclaim (which previously overcommitted a heavily swapping host).
+    effective = available
     if total:
         effective = min(total, effective)
     return {
@@ -473,6 +478,28 @@ def write_state(conn=None):
     tmp.replace(STATE)
 
 
+def process_identity(pid):
+    """Distinguish a live dispatcher from PID reuse and a previous host boot."""
+    try:
+        stat = pathlib.Path(f"/proc/{int(pid)}/stat").read_text().rsplit(")", 1)[1].split()
+        if stat[0] == "Z":
+            return None
+        return pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip() + ':' + stat[19]
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+
+
+def record_dispatch_owner(conn, iid):
+    pid = int(os.environ.get('CODEX_CI_DISPATCH_PID', '0'))
+    if pid > 0:
+        identity = process_identity(pid)
+        if identity is None:
+            raise RuntimeError('dispatcher exited before instance reservation')
+        conn.execute('INSERT OR REPLACE INTO dispatch_owners VALUES(?,?,?)', (iid, pid, identity))
+    else:
+        conn.execute('DELETE FROM dispatch_owners WHERE instance_id=?', (iid,))
+
+
 def reserve(owner, project, ttl, session_key, memory, max_memory, vcpus, disk):
     current = now()
     with locked():
@@ -487,6 +514,7 @@ def reserve(owner, project, ttl, session_key, memory, max_memory, vcpus, disk):
                     conn.execute("UPDATE instances SET status='running',expires_at=?,error=NULL WHERE id=?",
                                  (expiry.isoformat(), row["id"]))
                     event(conn, row["id"], "reused", f"ttl={ttl}")
+                    record_dispatch_owner(conn, row['id'])
                     conn.commit(); write_state(conn)
                     return dict(conn.execute("SELECT * FROM instances WHERE id=?", (row["id"],)).fetchone()), True
             rows = active_rows(conn)
@@ -518,6 +546,7 @@ def reserve(owner, project, ttl, session_key, memory, max_memory, vcpus, disk):
                 (iid,name,ip,mac,owner,project,session_key,str(store),memory,max_memory,vcpus,disk,
                  current.isoformat(),None,None,expiry.isoformat(),None,"creating",None,None,None))
             event(conn, iid, "reserved", f"ip={ip} store={store}")
+            record_dispatch_owner(conn, iid)
             conn.commit(); write_state(conn)
             return dict(conn.execute("SELECT * FROM instances WHERE id=?", (iid,)).fetchone()), False
         finally:
@@ -742,7 +771,9 @@ def renew(iid, ttl):
 
 def gc():
     conn = db()
-    try: rows = [dict(x) for x in active_rows(conn)]
+    try:
+        rows = [dict(x) for x in active_rows(conn)]
+        owners = {r['instance_id']: dict(r) for r in conn.execute('SELECT * FROM dispatch_owners')}
     finally: conn.close()
     reaped = []
     current = now()
@@ -756,9 +787,16 @@ def gc():
             and not provision_owner_alive(rec["id"])
         )
         expired = bool(expiry and expiry <= current)
-        if not (expired or stale_creating):
+        owner = owners.get(rec['id'])
+        # A retained idle session deliberately outlives its dispatcher. A running
+        # job does not: process identity is authoritative even after SIGKILL.
+        abandoned = bool(owner and rec['status'] == 'running'
+                         and process_identity(owner['pid']) != owner['identity'])
+        retry_cleanup = rec['status'] == 'releasing'
+        if not (expired or stale_creating or retry_cleanup or abandoned):
             continue
-        reason = "stale_creating" if stale_creating else "ttl_expired"
+        reason = (rec['teardown_reason'] or 'cleanup_retry') if retry_cleanup else (
+            'dispatcher_lost' if abandoned else 'stale_creating' if stale_creating else 'ttl_expired')
         status = "failed" if stale_creating else "expired"
         try:
             finish(rec["id"], status, rec["exit_code"], reason, 0)
@@ -833,7 +871,8 @@ def main(argv=None):
     sub.add_parser("gc"); sub.add_parser("rebalance-desktops")
     args = parser.parse_args(argv)
     if args.action in ("acquire", "reserve"):
-        gc()
+        # The minute timer owns GC. Running teardown on every admission request
+        # serializes callers behind unrelated guests and loses the RPC deadline.
         rec, reused = reserve(args.owner, args.project, args.ttl_seconds, args.session_key,
                               args.memory_mib, args.max_memory_mib, args.vcpus, args.disk_gib)
         if args.action == "reserve":

@@ -27,7 +27,8 @@ def enc(value): return base64.urlsafe_b64encode(value.encode()).rstrip(b"=").dec
 
 
 def manager(*args,timeout=120):
-    cp=subprocess.run([MANAGER,*map(str,args)],text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout,check=False)
+    environ = dict(os.environ, CODEX_CI_DISPATCH_PID=str(os.getpid()))
+    cp=subprocess.run([MANAGER,*map(str,args)],text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout,check=False,env=environ)
     if cp.returncode: raise RuntimeError(cp.stderr.strip() or cp.stdout.strip() or f"headless manager rc={cp.returncode}")
     try: return json.loads(cp.stdout)
     except json.JSONDecodeError as exc: raise RuntimeError(f"invalid manager response: {cp.stdout[:500]}") from exc
@@ -143,11 +144,13 @@ def acquire(a):
     deadline=time.monotonic()+max(1,a.wait_seconds); last=""
     ttl=max(a.timeout+600,a.ttl_minutes*60,int(a.persist_hours*3600) if a.persist_hours else 0)
     while True:
-        argv=["acquire","--owner",a.owner,"--project",a.project or "","--ttl-seconds",str(ttl),
+        argv=["reserve","--owner",a.owner,"--project",a.project or "","--ttl-seconds",str(ttl),
               "--memory-mib",str(a.memory_mib),"--max-memory-mib",str(a.max_memory_mib),
               "--vcpus",str(a.vcpus),"--disk-gib",str(a.disk_gib)]
         if a.session_key: argv += ["--session-key",a.session_key]
-        try: return manager(*argv,timeout=150)
+        try:
+            reserved=manager(*argv,timeout=45)
+            return dict(reserved['instance'], reused=reserved['reused'])
         except RuntimeError as exc:
             last=str(exc)
             if time.monotonic()>=deadline: raise TimeoutError(f"no safe headless KVM capacity within {a.wait_seconds}s: {last}")
@@ -171,13 +174,18 @@ def main():
     class Interrupted(Exception): pass
     def interrupted(_sig,_frame): raise Interrupted()
     try:
+        for sig in (signal.SIGTERM,signal.SIGINT): old[sig]=signal.signal(sig,interrupted)
         rec=acquire(a); print(f"codex_ci_instance={rec['id']}"); print(f"codex_ci_vm={rec['name']}"); print(f"codex_ci_worker={rec['ip']}"); print(f"codex_ci_reused={str(bool(rec.get('reused'))).lower()}")
+        # Keep the durable identity before waiting for provisioning, so timeout
+        # and signal finalizers can always release the reserved VM.
+        sys.stdout.flush()
+        if not rec.get('reused'):
+            manager('provision',rec['id'],timeout=max(180,a.wait_seconds))
         wait_ready(rec); iid=uuid.uuid4().hex
         payload={"leaseId":iid,"owner":a.owner,"project":a.project or None,"source":"github-actions"}
         cp=ssh_capture(rec,"codex-ci claim "+enc(json.dumps(payload,separators=(",", ":"))),timeout=15)
         if cp.returncode: raise RuntimeError("headless worker claim failed: "+(cp.stderr or cp.stdout).decode(errors="replace").strip())
         claimed=True
-        for sig in (signal.SIGTERM,signal.SIGINT): old[sig]=signal.signal(sig,interrupted)
         stream_snapshot(rec,iid,workspace); push_inputs(rec,iid,workspace,a.input)
         rc=run_command(rec,iid,a.command,max(1,a.timeout),env)
         if rc != 0:
@@ -194,12 +202,17 @@ def main():
         print("Codex CI dispatch interrupted",file=sys.stderr); return rc
     finally:
         for sig,handler in old.items(): signal.signal(sig,handler)
+        released=False
         if rec and iid and claimed:
             if status in ("timed_out","cancelled"): cancel(rec,iid)
-            try: ssh_capture(rec,f"codex-ci release {iid}",timeout=20)
-            except Exception: pass
+            try:
+                release=ssh_capture(rec,f"codex-ci release {iid}",timeout=20)
+                released=release.returncode==0
+                if not released: print('worker release failed; destroying instead of retaining',file=sys.stderr)
+            except Exception as exc:
+                print(f'worker release failed; destroying instead of retaining: {exc}',file=sys.stderr)
         if rec:
-            keep=max(0,int(a.persist_hours*3600))
+            keep=max(0,int(a.persist_hours*3600)) if claimed and released else 0
             try: manager("finish",rec["id"],"--status",status,"--exit-code",str(rc),"--reason",status,"--keep-seconds",str(keep),timeout=90)
             except Exception as exc: print(f"warning: headless lifecycle cleanup failed: {exc}",file=sys.stderr)
 
