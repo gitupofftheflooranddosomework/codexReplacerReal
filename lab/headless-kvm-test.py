@@ -40,6 +40,17 @@ class HeadlessTests(unittest.TestCase):
         self.assertIn('status="failed"', text[failed:artifacts])
         self.assertIn('return rc', text[failed:artifacts])
 
+    def test_dispatcher_records_timeout_and_interrupt_exit_codes(self):
+        text=(ROOT/'codex-ci-dispatch.py').read_text()
+        timeout=text.index('except subprocess.TimeoutExpired:', text.index('def main():'))
+        interrupt=text.index('except Interrupted:', timeout)
+        finalizer=text.index('finally:', interrupt)
+        self.assertIn('rc=124', text[timeout:interrupt])
+        self.assertIn('return rc', text[timeout:interrupt])
+        self.assertIn('rc=130', text[interrupt:finalizer])
+        self.assertIn('return rc', text[interrupt:finalizer])
+        self.assertIn('"--exit-code",str(rc)', text[finalizer:])
+
     def test_destroy_timeout_continues_cleanup_and_unknown_state_preserves_disk(self):
         spec=importlib.util.spec_from_file_location('headless_cleanup_test', ROOT/'codex-ci-headless.py')
         module=importlib.util.module_from_spec(spec)
