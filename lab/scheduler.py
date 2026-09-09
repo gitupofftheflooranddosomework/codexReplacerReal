@@ -12,6 +12,8 @@ import subprocess
 import threading
 import time
 import uuid
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from http.cookies import SimpleCookie
@@ -19,9 +21,34 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
 
-SCHEDULER_VERSION = "2.2.0"
+SCHEDULER_VERSION = "2.3.0"
 HOST = os.environ.get("CODEX_LAB_SCHEDULER_HOST", "0.0.0.0")
 PORT = int(os.environ.get("CODEX_LAB_SCHEDULER_PORT", "8766"))
+HEADLESS_JOB_SCHEDULER_URL = os.environ.get(
+    "CODEX_HEADLESS_JOB_SCHEDULER_URL", "http://192.168.122.1:8767"
+).rstrip("/")
+# ISSUE336_HEADLESS_JOB_PROXY: desktop lease/dashboard responsibilities remain
+# on 8766, while its public /api/jobs compatibility surface delegates to the
+# ephemeral headless scheduler. Stale automated clients therefore fail safe.
+def headless_job_proxy(method, request_path, payload=None, timeout=15):
+    body = None if payload is None else json.dumps(payload, separators=(",", ":")).encode()
+    request = urllib.request.Request(
+        HEADLESS_JOB_SCHEDULER_URL + request_path,
+        data=body,
+        method=method,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read()
+            return (json.loads(raw) if raw else {}, int(response.status))
+    except urllib.error.HTTPError as exc:
+        raw = exc.read()
+        try:
+            parsed = json.loads(raw) if raw else {"error": str(exc)}
+        except Exception:
+            parsed = {"error": raw.decode(errors="replace")[:2000] or str(exc)}
+        return parsed, int(exc.code)
 DB_PATH = Path(os.environ.get("CODEX_LAB_SCHEDULER_DB", "/tank/vm/codex-lab/scheduler.sqlite3"))
 TRUSTED_CLIENTS = {
     value.strip()
@@ -39,6 +66,7 @@ SSH_CONTROL_DIR = os.environ.get("CODEX_LAB_SSH_CONTROL_DIR", "/tmp/codex-lab-ss
 POLL_SECONDS = max(0.2, float(os.environ.get("CODEX_LAB_SCHEDULER_POLL_SECONDS", "0.5")))
 MAX_TAIL = 1024 * 1024
 AUTH_PATH = Path(os.environ.get("CODEX_LAB_DASHBOARD_AUTH", "/tank/vm/codex-lab/dashboard-auth.json"))
+HEADLESS_STATE_PATH = Path(os.environ.get("CODEX_CI_HEADLESS_STATE", "/tank/vm/codex-ci-headless/state.json"))
 SESSION_COOKIE = "CodexLabSession"
 SESSION_SECONDS = max(900, min(int(os.environ.get("CODEX_LAB_DASHBOARD_SESSION_SECONDS", str(12 * 3600))), 7 * 24 * 3600))
 PASSWORD_ITERATIONS = 600_000
@@ -371,11 +399,18 @@ def ssh_args(station):
 
 
 def ssh(station, command, timeout=30, input_text=None):
-    return run([*ssh_args(station), command], timeout=timeout, input_text=input_text)
+    args = [*ssh_args(station), command]
+    try:
+        return run(args, timeout=timeout, input_text=input_text)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 255, '', f'worker {station} SSH probe timed out after {timeout}s')
 
 
 def virsh_state(station):
-    r = run(["virsh", "-c", "qemu:///system", "domstate", worker_name(station)], timeout=5)
+    try:
+        r = run(["virsh", "-c", "qemu:///system", "domstate", worker_name(station)], timeout=5)
+    except subprocess.TimeoutExpired:
+        return 'unknown'
     return r.stdout.strip() if r.returncode == 0 else "absent"
 
 
@@ -942,6 +977,19 @@ printf 'SCHEDULER '; test -e /home/mark/.local/share/codex-worker/scheduler.lock
     return out
 
 
+def headless_state_payload():
+    try:
+        payload = json.loads(HEADLESS_STATE_PATH.read_text())
+        if not isinstance(payload, dict):
+            raise ValueError("headless state is not an object")
+        payload.setdefault("active", [])
+        payload.setdefault("history", [])
+        payload.setdefault("capacity", {})
+        return payload
+    except Exception as exc:
+        return {"active": [], "history": [], "capacity": {}, "error": str(exc)}
+
+
 def state_payload():
     with DB_LOCK:
         conn = db()
@@ -974,6 +1022,7 @@ def state_payload():
         "workers": workers,
         "recentJobs": recent,
         "metrics": metrics,
+        "ephemeralHeadless": headless_state_payload(),
         "scheduler": {
             "mode": "automatic-six-way",
             "healthy": ready == MAX_STATIONS and workstation_ready == MAX_STATIONS and metrics.get("loopHealthy", False),
@@ -1197,7 +1246,8 @@ def dashboard_html(session):
 <section class="section"><div class="section-title"><h2>Scheduler health & throughput</h2><span id="timestamp">updating…</span></div><div class="metrics">
 <div class="metric" id="m-health"><span>Scheduler</span><strong>—</strong><small>loop health</small></div><div class="metric" id="m-throughput"><span>Throughput</span><strong>—</strong><small>jobs/min · 5m</small></div><div class="metric" id="m-queue"><span>Queue p95</span><strong>—</strong><small>start delay · 5m</small></div><div class="metric" id="m-success"><span>Success</span><strong>—</strong><small>completed · 1h</small></div><div class="metric" id="m-util"><span>Worker utilization</span><strong>—</strong><small>six VMs · 5m</small></div><div class="metric" id="m-runtime"><span>Runtime p95</span><strong>—</strong><small>job duration · 1h</small></div>
 </div><div class="graph-wrap"><div class="graph-head"><span>Last 30 minutes</span><span class="legend"><i></i>completed/min</span><span class="legend fail"><i></i>failed</span><span class="legend queue"><i></i>avg queue ms</span></div><svg id="throughput-svg" viewBox="0 0 600 120" preserveAspectRatio="none" aria-label="Scheduler throughput history"></svg></div></section>
-<section class="section"><div class="section-title"><h2>Six KVM workstations</h2><span>status, ownership, controls and history are attached to each live screen</span></div></section><main>{cards}</main>
+<section class="section"><div class="section-title"><h2>Interactive Desktop KVMs</h2><span>browser, GUI, CAPTCHA and manual-takeover workers; automatic CI does not consume these six</span></div></section><main>{cards}</main>
+<section class="section"><div class="section-title"><h2>Ephemeral Headless KVMs</h2><span id="headless-summary">loading lifecycle state…</span></div><div id="headless-list" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:8px"></div><div class="section-title" style="margin-top:12px"><h2>Recent headless lifecycle</h2></div><div id="headless-history" style="font-size:10px;color:#9aa8b7;display:grid;gap:4px"></div></section>
 <div id="job-modal" class="modal"><section class="modal-card"><div class="modal-head"><strong id="job-modal-title">Job logs</strong><span id="job-modal-meta"></span><span class="spacer"></span><button class="mini" id="job-refresh">Refresh</button><button class="mini" id="job-close">Close</button></div><pre id="job-output">Loading…</pre></section></div>
 <div id="history-modal" class="modal"><section class="modal-card"><div class="modal-head"><strong id="history-title">VM history</strong><span class="spacer"></span><button class="mini" id="history-close">Close</button></div><div id="history-list" class="history-modal-list">Loading…</div></section></div>
 <div id="submit-modal" class="modal"><section class="modal-card narrow"><div class="modal-head"><strong id="submit-title">Run job</strong><span class="spacer"></span><button class="mini" id="submit-close">Close</button></div><form id="submit-form" class="form-grid"><input type="hidden" id="submit-station"><div class="field"><label>Bot / owner</label><input id="submit-owner" required value="Mark Dashboard"></div><div class="field"><label>Project</label><input id="submit-project" placeholder="optional project"></div><div class="field"><label>Chat label</label><input id="submit-chat-label" placeholder="optional chat title"></div><div class="field"><label>Chat URL</label><input id="submit-chat-url" type="url" placeholder="https://chatgpt.com/..."></div><div class="field"><label>Job class</label><select id="submit-class"><option>test</option><option>build</option><option selected>cpu</option><option>io</option><option>browser</option></select></div><div class="field"><label>Timeout seconds</label><input id="submit-timeout" type="number" min="1" max="86400" value="3600"></div><div class="field wide"><label>Working directory</label><input id="submit-cwd" value="/workspace"></div><div class="field wide"><label>Command</label><textarea id="submit-command" required placeholder="npm test"></textarea></div><div class="form-note" id="submit-note">This job is pinned to the selected VM. If that VM is busy, it waits for that VM; normal agent jobs continue using automatic six-way scheduling.</div><div class="form-actions"><button type="button" class="mini" id="submit-cancel">Cancel</button><button type="submit" class="mini primary">Queue on this VM</button></div></form></section></div>
@@ -1215,7 +1265,8 @@ async function submitPinned(e){{e.preventDefault();const station=Number(document
 function metric(id,value,detail,kind=''){{const el=document.getElementById(id);el.classList.remove('good','warn','bad');if(kind)el.classList.add(kind);el.querySelector('strong').textContent=value;el.querySelector('small').textContent=detail}}function renderSvg(history){{const svg=document.getElementById('throughput-svg');svg.replaceChildren();if(!history?.length)return;const w=600,pad=8,base=105,maxJobs=Math.max(1,...history.map(x=>x.completed||0)),maxQueue=Math.max(1,...history.map(x=>x.avgQueueMs||0)),bw=(w-pad*2)/history.length;history.forEach((x,i)=>{{const bh=(x.completed||0)/maxJobs*72,rect=document.createElementNS(NS,'rect');rect.setAttribute('x',pad+i*bw+1);rect.setAttribute('y',base-bh);rect.setAttribute('width',Math.max(1,bw-2));rect.setAttribute('height',bh);rect.setAttribute('fill','#3895e8');svg.appendChild(rect);if(x.failed){{const fail=document.createElementNS(NS,'rect'),fh=Math.max(4,Math.min(bh,(x.failed/maxJobs)*72));fail.setAttribute('x',pad+i*bw+1);fail.setAttribute('y',base-fh);fail.setAttribute('width',Math.max(1,bw-2));fail.setAttribute('height',fh);fail.setAttribute('fill','#e65e70');svg.appendChild(fail)}}}});const line=document.createElementNS(NS,'polyline');line.setAttribute('points',history.map((x,i)=>`${{pad+i*bw+bw/2}},${{base-(x.avgQueueMs||0)/maxQueue*72}}`).join(' '));line.setAttribute('fill','none');line.setAttribute('stroke','#45d08b');line.setAttribute('stroke-width','2');line.setAttribute('vector-effect','non-scaling-stroke');svg.appendChild(line)}}function updateMetrics(s){{const m=s.metrics||{{}},w5=(m.windows||{{}})['5m']||{{}},w1=(m.windows||{{}})['1h']||{{}},health=m.loopHealthy&&s.scheduler?.healthy;metric('m-health',health?'Healthy':'Degraded',`${{ms(m.loopAgeMs)}} loop age · ${{m.errors||0}} errors`,health?'good':'bad');metric('m-throughput',`${{Number(w5.jobsPerMinute||0).toFixed(2)}}`,`${{w5.completed||0}} completed / 5m`,w5.jobsPerMinute>0?'good':'');metric('m-queue',ms(w5.p95QueueMs),`avg ${{ms(w5.avgQueueMs)}} · oldest ${{ms(m.oldestQueuedMs)}}`,(w5.p95QueueMs||0)>3000?'warn':'good');metric('m-success',w1.successRatePercent==null?'—':`${{w1.successRatePercent}}%`,`${{w1.succeeded||0}} ok · ${{w1.failed||0}} failed`,w1.failed?'warn':'good');metric('m-util',`${{w5.workerUtilizationPercent??0}}%`,`${{s.scheduler?.busy??0}} busy · ${{s.scheduler?.free??0}} free`);metric('m-runtime',ms(w1.p95RuntimeMs),`avg ${{ms(w1.avgRuntimeMs)}} · 1h`);renderSvg(m.history)}}
 function renderInlineHistory(el,history){{el.replaceChildren();if(!history?.length){{const empty=document.createElement('span');empty.className='history-empty';empty.textContent='No history yet';el.appendChild(empty);return}}history.slice(0,3).forEach(item=>{{const chip=document.createElement('span');chip.className='history-chip';chip.title=`${{item.kind}} · ${{item.status}} · ${{item.project||''}}`;if(validChat(item.chatUrl)){{const a=document.createElement('a');a.href=item.chatUrl;a.target='_blank';a.rel='noreferrer';a.textContent=item.owner||item.chatLabel||'chat';chip.appendChild(a)}}else chip.textContent=item.owner||item.chatLabel||item.project||item.kind;el.appendChild(chip)}})}}
 function updateWorker(w){{const busy=!!(w.activeJob||w.exclusive||w.schedulerBusy),installing=w.ready&&!w.workstationReady,cls=!w.ready?'down':installing?'installing':busy?'busy':'ready',identity=w.activeJob||w.lease||null,owner=identity?.owner||(w.schedulerBusy?'Scheduled job':'Idle'),project=identity?.chatLabel||identity?.project||(identity?'No project/chat label':'No bot assigned'),chatUrl=identity?.chatUrl,el=document.getElementById(`worker-${{w.station}}`);el.classList.remove('ready','busy','down','installing');el.classList.add(cls);el.querySelector('.worker-state').textContent=!w.ready?w.state:installing?'installing':busy?'busy':`ready`;el.querySelector('.worker-owner').textContent=owner;el.querySelector('.identity-owner').textContent=owner;el.querySelector('.identity-project').textContent=project;const chat=el.querySelector('.identity-chat');if(validChat(chatUrl)){{chat.href=chatUrl;chat.textContent='open chat';chat.hidden=false}}else{{chat.hidden=true;chat.removeAttribute('href')}}const age=w.activeJob?elapsed(w.activeJob.started_at):w.lease?elapsed(w.lease.acquiredAt):'';el.querySelector('.activity').textContent=w.activeJob?`${{w.activeJob.job_class||'job'}} · ${{w.activeJob.status}} · ${{age}}${{w.activeJob.requestedStation?` · pinned VM ${{w.activeJob.requestedStation}}`:''}}`:w.lease?`Interactive/browser lease · ${{age}}`:w.schedulerBusy?'Scheduled job':w.queuedPinned?.length?`${{w.queuedPinned.length}} pinned job${{w.queuedPinned.length===1?'':'s'}} waiting · next: ${{w.queuedPinned[0].owner||'unknown'}}`:'No active job';el.querySelector('.cpu').textContent=pct(w.cpuPercent);el.querySelector('.ram').textContent=pct(w.memUsedPercent);el.querySelector('.disk').textContent=pct(w.diskUsedPercent);el.querySelector('.uptime').textContent=uptime(w.uptimeSeconds);el.querySelector('.workstation').classList.toggle('ok',!!w.workstationReady);el.querySelector('.docker').classList.toggle('ok',!!w.dockerReady);el.querySelector('.browser').classList.toggle('ok',!!w.browserReady);el.querySelector('.cancel').hidden=!w.activeJob;el.querySelector('.logs').hidden=!w.activeJob;el.querySelector('.release').hidden=!w.lease;el.querySelector('.terminal').disabled=!w.ready;el.querySelector('.restart').disabled=!w.browserReady;renderInlineHistory(el.querySelector('.history-items'),w.history)}}
-async function refresh(){{try{{const s=await fetch('/state.json',{{cache:'no-store'}}).then(r=>{{if(!r.ok)throw new Error(`HTTP ${{r.status}}`);return r.json()}});lastState=s;const sched=s.scheduler||{{}};document.getElementById('summary').textContent=`${{sched.ready??0}}/6 ready · ${{sched.busy??0}} busy · ${{s.queuedJobs}} queued`;const badge=document.getElementById('dispatch');badge.textContent=`AUTO · ${{sched.capacity||6}}-way · ${{sched.free??0}} free`;badge.classList.toggle('bad',!sched.healthy);document.getElementById('timestamp').textContent=`updated ${{new Date(s.time).toLocaleTimeString()}}`;updateMetrics(s);for(const w of s.workers)updateWorker(w)}}catch(e){{document.getElementById('summary').textContent='status unavailable';toast(`Status refresh failed: ${{e.message}}`,true)}}}}
+function updateHeadless(h){{const active=h?.active||[],history=h?.history||[],cap=h?.capacity||{{}},sum=document.getElementById('headless-summary'),list=document.getElementById('headless-list'),hist=document.getElementById('headless-history');if(!sum||!list||!hist)return;sum.textContent=h?.error?`state unavailable · ${{h.error}}`:`${{active.length}}/${{cap.maxActive??'—'}} active · ${{cap.freeSlots??'—'}} free · ${{cap.hostMemAvailableMiB??'—'}} MiB host RAM available`;list.replaceChildren();if(!active.length){{const e=document.createElement('div');e.className='metric';e.textContent='No headless CI KVMs alive right now.';list.appendChild(e)}}for(const x of active){{const d=document.createElement('div');d.className='metric';const a=document.createElement('strong');a.textContent=x.name||x.id;const b=document.createElement('small');b.textContent=`${{x.status||'unknown'}} · ${{x.project||'unscoped'}} · ${{x.owner||'unknown'}} · ${{x.ip||''}}`;const c=document.createElement('small');c.textContent=`${{x.vcpus||'?'}} vCPU · ${{x.memory_mib||'?'}}/${{x.max_memory_mib||'?'}} MiB · ${{x.disk_gib||'?'}} GiB`;d.append(a,b,c);list.appendChild(d)}}hist.replaceChildren();for(const x of history.slice(0,20)){{const d=document.createElement('div');d.textContent=`${{x.name||x.id}} · ${{x.project||'unscoped'}} · ${{x.owner||'unknown'}} · ${{x.status||'unknown'}} · ${{x.destroyed_at||x.finished_at||x.created_at||''}}`;hist.appendChild(d)}}}}
+async function refresh(){{try{{const s=await fetch('/state.json',{{cache:'no-store'}}).then(r=>{{if(!r.ok)throw new Error(`HTTP ${{r.status}}`);return r.json()}});lastState=s;const sched=s.scheduler||{{}};document.getElementById('summary').textContent=`${{sched.ready??0}}/6 ready · ${{sched.busy??0}} busy · ${{s.queuedJobs}} queued`;const badge=document.getElementById('dispatch');badge.textContent=`AUTO · ${{sched.capacity||6}}-way · ${{sched.free??0}} free`;badge.classList.toggle('bad',!sched.healthy);document.getElementById('timestamp').textContent=`updated ${{new Date(s.time).toLocaleTimeString()}}`;updateMetrics(s);updateHeadless(s.ephemeralHeadless||{{}});for(const w of s.workers)updateWorker(w)}}catch(e){{document.getElementById('summary').textContent='status unavailable';toast(`Status refresh failed: ${{e.message}}`,true)}}}}
 document.addEventListener('click',e=>{{const a=e.target.closest('button[data-action]');if(a)action(Number(a.dataset.station),a.dataset.action);const v=e.target.closest('button[data-view]');if(v?.dataset.view==='logs')showLogs(Number(v.dataset.station));if(v?.dataset.view==='history')showHistory(Number(v.dataset.station));if(v?.dataset.view==='submit')openSubmit(Number(v.dataset.station))}});document.getElementById('job-refresh').addEventListener('click',refreshLogs);document.getElementById('job-close').addEventListener('click',closeLogs);document.getElementById('history-close').addEventListener('click',closeHistory);document.getElementById('submit-close').addEventListener('click',closeSubmit);document.getElementById('submit-cancel').addEventListener('click',closeSubmit);document.getElementById('submit-form').addEventListener('submit',submitPinned);for(const id of ['job-modal','history-modal','submit-modal'])document.getElementById(id).addEventListener('click',e=>{{if(e.target.id===id)document.getElementById(id).classList.remove('open')}});const savedOwner=localStorage.getItem('codexDashboardOwner');if(savedOwner)document.getElementById('submit-owner').value=savedOwner;refresh();setInterval(refresh,2000);
 </script></body></html>"""
 
@@ -1348,18 +1399,18 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/workers":
             return self.send_json(state_payload())
         if u.path == "/api/jobs":
-            q = parse_qs(u.query)
-            return self.send_json({"jobs": list_jobs((q.get("status") or [None])[0], (q.get("limit") or [50])[0])})
+            proxy_path = u.path + (("?" + u.query) if u.query else "")
+            result, status = headless_job_proxy("GET", proxy_path)
+            return self.send_json(result, status)
         if u.path.startswith("/api/history/"):
             station = int(u.path.rsplit("/", 1)[-1])
             with DB_LOCK:
                 conn = db(); rows = worker_usage_history(conn, station, 100); conn.close()
             return self.send_json({"station": station, "history": rows})
         if u.path.startswith("/api/jobs/"):
-            job_id = u.path.split("/")[3]
-            q = parse_qs(u.query)
-            job = get_job(job_id, True, (q.get("maxBytes") or [65536])[0])
-            return self.send_json(job or {"error": "not found"}, 200 if job else 404)
+            proxy_path = u.path + (("?" + u.query) if u.query else "")
+            result, status = headless_job_proxy("GET", proxy_path)
+            return self.send_json(result, status)
         return self.send_json({"error": "not found"}, 404)
 
     def do_POST(self):
@@ -1432,13 +1483,13 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"error": str(exc)}, 400)
         try:
             if u.path == "/api/jobs":
-                return self.send_json(submit_job(payload), 202)
+                result, status = headless_job_proxy("POST", u.path, payload, 20)
+                return self.send_json(result, status)
             if u.path == "/api/usage":
                 return self.send_json(record_external_usage(payload), 202)
             if u.path.startswith("/api/jobs/") and u.path.endswith("/cancel"):
-                job_id = u.path.split("/")[3]
-                job = cancel_job(job_id)
-                return self.send_json(job or {"error": "not found"}, 200 if job else 404)
+                result, status = headless_job_proxy("POST", u.path, payload, 45)
+                return self.send_json(result, status)
         except Exception as exc:
             return self.send_json({"error": str(exc)}, 500)
         return self.send_json({"error": "not found"}, 404)
