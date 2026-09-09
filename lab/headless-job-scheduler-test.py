@@ -87,6 +87,15 @@ def main():
     else:
         raise AssertionError("absolute cwd escaped /workspace")
 
+    runner_source = (LAB / "headless-job-runner.py").read_text()
+    assert '--depth=1' not in runner_source
+    assert '--filter=blob:none' not in runner_source
+    dispatcher_source = (LAB / "codex-ci-dispatch.py").read_text()
+    assert 'git","bundle","create","-","HEAD' in dispatcher_source
+    assert 'codex-ci import-git' in dispatcher_source
+    worker_source = (LAB / "codex-ci-worker-rpc.py").read_text()
+    assert '"import-git":action_import_git' in worker_source
+
     headless = (LAB / "codex-ci-headless.py").read_text()
     assert 'CODEX_CI_HEADLESS_MAX_ACTIVE", "96"' in headless
     assert 'CODEX_CI_HEADLESS_IP_START", "100"' in headless

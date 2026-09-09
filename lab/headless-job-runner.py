@@ -61,14 +61,14 @@ def prepare_workspace(payload: dict, job_dir: pathlib.Path) -> pathlib.Path:
         subprocess.run(["rm", "-rf", str(workspace)], check=True)
     if repo:
         cp = subprocess.run(
-            ["git", "clone", "--filter=blob:none", repo, str(workspace)],
+            ["git", "clone", "--no-tags", repo, str(workspace)],
             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
         )
         if cp.returncode:
             raise RuntimeError(cp.stderr.strip() or cp.stdout.strip() or "git clone failed")
         if revision:
             cp = subprocess.run(
-                ["git", "fetch", "--depth=1", "origin", revision], cwd=workspace,
+                ["git", "fetch", "--no-tags", "origin", revision], cwd=workspace,
                 text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
             )
             if cp.returncode:
