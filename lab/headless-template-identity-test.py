@@ -11,7 +11,10 @@ convert_at = build.index('qemu-img convert -p -O qcow2 "$OVERLAY" "$FLAT"')
 sanitize_at = build.index("truncate -s 0 /etc/machine-id")
 replicate_at = build.index("IFS=',' read -ra roots")
 assert convert_at < sanitize_at < replicate_at
-assert 'codex-ci-base-v2.qcow2' in build
+assert 'codex-ci-base-v3.qcow2' in build
+for package in ('python3-reportlab', 'php-cli', 'composer', 'dnsutils'):
+    assert package in build, package
+assert 'import reportlab, requests, yaml' in build
 for needle in ("/var/lib/dbus/machine-id", "/var/lib/dhcp/*", "/var/lib/NetworkManager/*lease*", "/var/lib/systemd/network/*"):
     assert needle in build, needle
 
@@ -26,7 +29,7 @@ with tempfile.TemporaryDirectory() as td:
     spec = importlib.util.spec_from_file_location("headless", ROOT / "codex-ci-headless.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    assert mod.BASE == "codex-ci-base-v2.qcow2"
+    assert mod.BASE == "codex-ci-base-v3.qcow2"
     gib = 1024 ** 3
     assert mod.effective_disk_gib(100 * gib, 40) == 100
     assert mod.effective_disk_gib(100 * gib, 120) == 120
