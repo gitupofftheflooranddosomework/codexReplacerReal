@@ -2,6 +2,33 @@
 
 Private MCP operator for the Codex Replacer VM.
 
+## DotMoose vault access
+
+The broker exposes two read-only, project-scoped tools backed by the `DotMoose`
+organization at `vault.markshaw.ca`:
+
+- `dotmoose_vault_list` lists login item names and which credential fields exist.
+- `dotmoose_vault_get` returns only explicitly requested username, password, or
+  current TOTP fields for one exact item name.
+
+The organization UUID is fixed in the broker service configuration, and the
+manager rejects non-login items, deleted items, and items returned outside that
+organization. The Bitwarden session is read from a mode-`0600` file and is passed
+to the CLI through its environment, never a process argument. Retrieval audit
+records contain only a one-way item-ID hash and requested field names.
+
+Install the Bitwarden CLI on the broker, then run the enrollment helper once in
+an interactive shell as the service user:
+
+```sh
+./codex-replacer/enroll-dotmoose-vault.sh
+systemctl --user restart codex-replacer-mcp.service
+```
+
+The helper prompts inside Bitwarden itself, writes no password to disk, stores
+only the resulting unlock session with mode `0600`, and prints only the number
+of available DotMoose login items.
+
 ## Conversation continuity
 
 Codex Replacer exposes `prepare_chat_handoff`. The MCP initialize instructions tell the model to use it proactively when a long conversation is approaching context risk, preserving the objective, current state, completed/pending work, blockers, constraints, exact references, and next actions.
@@ -41,6 +68,8 @@ Run:
 
 ```sh
 python3 -m py_compile codex-replacer/server.py codex-replacer/http-server.py codex-replacer/lab_manager.py codex-replacer/smoke-test.py codex-replacer/concurrency-test.py codex-replacer/http-concurrency-test.py codex-replacer/host-exec-promotion-test.py
+python3 codex-replacer/vault-manager-test.py
+python3 codex-replacer/broker-vault-test.py
 python3 codex-replacer/concurrency-test.py
 python3 codex-replacer/http-concurrency-test.py
 python3 codex-replacer/host-exec-promotion-test.py
@@ -190,6 +219,8 @@ Core controller verification:
 
 ```sh
 python3 -m py_compile codex-replacer/server.py codex-replacer/http-server.py codex-replacer/vm_lab_manager.py codex-replacer/vm_job_scheduler.py lab/scheduler.py
+python3 codex-replacer/vault-manager-test.py
+python3 codex-replacer/broker-vault-test.py
 python3 codex-replacer/concurrency-test.py
 python3 codex-replacer/http-concurrency-test.py
 python3 codex-replacer/host-exec-promotion-test.py
