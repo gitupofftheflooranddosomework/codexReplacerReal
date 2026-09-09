@@ -2,6 +2,7 @@
 Description=Rebalance idle/active memory for persistent interactive Codex desktops
 
 [Timer]
+OnActiveSec=15s
 OnBootSec=30s
 OnUnitActiveSec=15s
 AccuracySec=5s

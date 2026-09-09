@@ -115,7 +115,9 @@ class HeadlessTests(unittest.TestCase):
 
     def test_units_are_bounded_cleanup_and_balloon_loops(self):
         self.assertIn('OnUnitActiveSec=1min',(ROOT/'codex-ci-headless-gc.timer').read_text())
-        self.assertIn('OnUnitActiveSec=15s',(ROOT/'codex-desktop-balloon.timer').read_text())
+        balloon_timer=(ROOT/'codex-desktop-balloon.timer').read_text()
+        self.assertIn('OnActiveSec=15s',balloon_timer)
+        self.assertIn('OnUnitActiveSec=15s',balloon_timer)
         balloon=(ROOT/'codex-desktop-balloon.service').read_text()
         self.assertIn('CODEX_LAB_SCHEDULER_URL=http://192.168.122.1:8766',balloon)
         self.assertIn('rebalance-desktops',balloon)
