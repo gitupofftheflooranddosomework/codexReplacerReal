@@ -93,6 +93,26 @@ class LeaseValidationTests(unittest.TestCase):
         with mock.patch.object(m, 'ssh_guest', return_value=missing):
             self.assertIsNone(m._remote_exclusive_lease(1))
 
+    def test_release_returns_post_release_free_record(self):
+        state = {'version': 1, 'stations': {'3': lease(3, 'wanted')}}
+        cleared = subprocess.CompletedProcess([], 0, '', '')
+        with mock.patch.object(m, 'locked_state', return_value=(DummyLock(), state)), \
+             mock.patch.object(m, 'unlock'), \
+             mock.patch.object(m, 'reset_worker_vault', return_value=True), \
+             mock.patch.object(m, 'ssh_guest', return_value=cleared), \
+             mock.patch.object(m, 'save_state') as save, \
+             mock.patch.object(m, 'audit'), \
+             mock.patch.object(m, 'notify_usage'):
+            got = m.release(lease_id='wanted', reason='finished', recycle=False)
+        self.assertEqual(got['status'], 'free')
+        self.assertIsNone(got['leaseId'])
+        self.assertIsNone(got['owner'])
+        self.assertIsNone(got['project'])
+        self.assertTrue(got['releasedAt'])
+        self.assertEqual(got['releaseReason'], 'finished')
+        self.assertEqual(state['stations']['3']['status'], 'free')
+        save.assert_called_once_with(state)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

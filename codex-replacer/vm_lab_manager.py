@@ -429,7 +429,7 @@ def release(lease_id=None, station=None, reason="released", recycle=False):
         unlock(lock)
     if recycle:
         reset_station(station_number)
-    return old
+    return record.copy()
 
 
 def execute(command, lease_id=None, station=None, cwd="/workspace", timeout=120, env=None, as_root=False, max_bytes=1048576):
