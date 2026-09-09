@@ -19,6 +19,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 import server
+import slackcontroller_bridge
+
+slackcontroller_bridge.install(server)
 
 
 HOST = os.environ.get("CODEX_REPLACER_HTTP_HOST", "127.0.0.1")
