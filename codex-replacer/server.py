@@ -1325,7 +1325,7 @@ def handle_http_request(arguments):
 
 
 def handle_dotmoose_vault_list(_arguments):
-    items = vault_manager.VAULT.list_logins()
+    items = vault_manager.VAULT.list_items()
     return tool_result({
         "project": vault_manager.VAULT.project,
         "organization": vault_manager.VAULT.organization,
@@ -1335,7 +1335,7 @@ def handle_dotmoose_vault_list(_arguments):
 
 
 def handle_dotmoose_vault_get(arguments):
-    secret = vault_manager.VAULT.get_login(arguments.get("item"), arguments.get("fields"))
+    secret = vault_manager.VAULT.get_item(arguments.get("item"), arguments.get("fields"))
     audit = {
         "event": "vault_secret_read",
         "project": vault_manager.VAULT.project,
@@ -1870,8 +1870,8 @@ COMMON_COMMAND_PROPERTIES = {
 
 DIRECT_TOOLS = dict([
     tool("prepare_chat_handoff", "Prepare chat handoff", "Use this proactively when the current conversation is becoming long or context-risky. It formats a complete continuation summary for a new chat before context is exhausted.", object_schema({"objective": string(), "currentState": string(), "completed": {"type": "array", "items": {"type": "string"}}, "pending": {"type": "array", "items": {"type": "string"}}, "importantContext": {"type": "array", "items": {"type": "string"}}, "exactReferences": {"type": "array", "items": {"type": "string"}}, "blockers": {"type": "array", "items": {"type": "string"}}, "constraints": {"type": "array", "items": {"type": "string"}}, "nextActions": {"type": "array", "items": {"type": "string"}}}, ["objective", "currentState"]), handle_prepare_chat_handoff, annotations(True, False, False)),
-    tool("dotmoose_vault_list", "List DotMoose logins", "List login-item names and available field types from the project-scoped DotMoose Vaultwarden organization. This never returns secret values. Use only for DotMoose project work.", object_schema(), handle_dotmoose_vault_list, annotations(True, False, False)),
-    tool("dotmoose_vault_get", "Get DotMoose login", "Retrieve selected fields from one exact login item in the project-scoped DotMoose Vaultwarden organization. Request only fields required for the current DotMoose task and avoid repeating returned secrets in chat or logs.", object_schema({"item": string("Exact item name returned by dotmoose_vault_list."), "fields": {"type": "array", "minItems": 1, "uniqueItems": True, "items": {"type": "string", "enum": ["username", "password", "totp"]}, "default": ["username", "password"]}}, ["item"]), handle_dotmoose_vault_get, annotations(True, False, True)),
+    tool("dotmoose_vault_list", "List DotMoose credentials", "List item names, item types, and available credential fields from the project-scoped DotMoose Vaultwarden organization. This never returns secret values. Use only for DotMoose project work.", object_schema(), handle_dotmoose_vault_list, annotations(True, False, False)),
+    tool("dotmoose_vault_get", "Get DotMoose credential", "Retrieve selected fields from one exact item in the project-scoped DotMoose Vaultwarden organization. Request only fields required for the current DotMoose task and avoid repeating returned secrets in chat or logs.", object_schema({"item": string("Exact item name returned by dotmoose_vault_list."), "fields": {"type": "array", "minItems": 1, "uniqueItems": True, "items": {"type": "string", "enum": ["username", "password", "totp", "notes"]}, "default": ["username", "password"]}}, ["item"]), handle_dotmoose_vault_get, annotations(True, False, True)),
     tool("chatgpt_browser_status", "Inspect ChatGPT browser", "Check whether the dedicated normal headed Chromium session for ChatGPT is reachable and authenticated. This does not expose general control of that browser.", object_schema(), handle_chatgpt_browser_status, annotations(True, False, True)),
     tool("chatgpt_auth_begin", "Begin ChatGPT authentication", "Start or resume the normal Google authentication flow for the persistent headed ChatGPT browser using only user-approved passkey or phone-prompt methods. This tool intentionally cannot accept passwords, one-time codes, backup codes, passkey secrets, or MFA secrets.", object_schema({"method": {"type": "string", "enum": ["passkey", "phone_prompt"], "default": "passkey"}, "accountEmail": string("Optional Google account email used only to fill the account identifier field.")}), handle_chatgpt_auth_begin, annotations(False, False, True)),
     tool("chatgpt_start_chat", "Start ChatGPT chat", "Create a new ChatGPT conversation through the user's persistent headed Chromium session, optionally inside an existing ChatGPT Project, seed it with a message, submit it, and return the resulting conversation URL. Use this only when the user explicitly asks to start, hand off, or continue work in another ChatGPT chat.", object_schema({"message": string("First message to place in the new chat."), "project": string("Optional exact ChatGPT Project name."), "projectUrl": string("Optional exact https://chatgpt.com project URL; prefer when known."), "submit": {"type": "boolean", "default": True}}, ["message"]), handle_chatgpt_start_chat, annotations(False, False, True)),

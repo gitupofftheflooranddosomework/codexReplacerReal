@@ -29,8 +29,8 @@ def main():
             "CODEX_VAULT_SYNC_SECONDS": "60",
         }
         items = [
-            {"id": "login-1", "organizationId": ORG, "type": 1, "name": "Cloudflare", "login": {"username": "bot@example.com", "password": "secret", "totp": "seed"}},
-            {"id": "note-1", "organizationId": ORG, "type": 2, "name": "Private note", "secureNote": {}},
+            {"id": "login-1", "organizationId": ORG, "type": 1, "name": "Cloudflare", "notes": "account note", "login": {"username": "bot@example.com", "password": "secret", "totp": "seed"}},
+            {"id": "note-1", "organizationId": ORG, "type": 2, "name": "Private note", "notes": "note secret", "secureNote": {}},
             {"id": "other-1", "organizationId": "outside", "type": 1, "name": "Outside", "login": {"username": "x", "password": "y"}},
         ]
 
@@ -46,6 +46,8 @@ def main():
                 output = json.dumps(items)
             elif arguments == ["get", "item", "login-1"]:
                 output = json.dumps(items[0])
+            elif arguments == ["get", "item", "note-1"]:
+                output = json.dumps(items[1])
             elif arguments == ["get", "totp", "login-1"]:
                 output = "123456\n"
             else:
@@ -56,27 +58,33 @@ def main():
             "vault_manager.subprocess.run", side_effect=fake_run,
         ):
             vault = VaultManager(environment, clock=lambda: 100.0)
-            listing = vault.list_logins()
-            assert listing == [{"name": "Cloudflare", "username": True, "password": True, "totp": True}]
-            secret = vault.get_login("Cloudflare", ["username", "password", "totp"])
+            listing = vault.list_items()
+            assert listing == [
+                {"name": "Cloudflare", "type": "login", "username": True, "password": True, "totp": True, "notes": True},
+                {"name": "Private note", "type": "secure_note", "username": False, "password": False, "totp": False, "notes": True},
+            ]
+            secret = vault.get_item("Cloudflare", ["username", "password", "totp", "notes"])
             assert secret["values"] == {
-                "username": "bot@example.com", "password": "secret", "totp": "123456",
+                "username": "bot@example.com", "password": "secret", "totp": "123456", "notes": "account note",
             }
+            note = vault.get_item("Private note", ["notes"])
+            assert note["type"] == "secure_note"
+            assert note["values"] == {"notes": "note secret"}
             try:
-                vault.get_login("Outside", ["password"])
+                vault.get_item("Outside", ["password"])
             except VaultError as error:
-                assert "No DotMoose login" in str(error)
+                assert "No DotMoose vault item" in str(error)
             else:
                 raise AssertionError("outside-organization item was returned")
             if os.name != "nt":
                 session.chmod(0o644)
                 try:
-                    VaultManager(environment).list_logins()
+                    VaultManager(environment).list_items()
                 except VaultError as error:
                     assert "permissions" in str(error)
                 else:
                     raise AssertionError("insecure session permissions were accepted")
-    print(json.dumps({"ok": True, "scope": "DotMoose login items only"}))
+    print(json.dumps({"ok": True, "scope": "DotMoose login and secure-note items"}))
 
 
 if __name__ == "__main__":
