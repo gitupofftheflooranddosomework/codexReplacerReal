@@ -40,6 +40,8 @@ class VaultManager:
         self.sync_seconds = max(0, int(values.get("CODEX_VAULT_SYNC_SECONDS", "60")))
         self._clock = time.monotonic if clock is None else clock
         self._last_sync = 0.0
+        self._items_cache = None
+        self._items_cached_at = 0.0
         self._lock = threading.RLock()
 
     def _require_configuration(self):
@@ -100,6 +102,13 @@ class VaultManager:
         self._last_sync = now
 
     def _vault_items(self):
+        now = self._clock()
+        if (
+            self.sync_seconds
+            and self._items_cache is not None
+            and now - self._items_cached_at < self.sync_seconds
+        ):
+            return self._items_cache
         self._sync_if_due()
         try:
             items = json.loads(self._run([
@@ -109,12 +118,15 @@ class VaultManager:
             raise VaultError("Bitwarden returned an invalid vault response.") from error
         if not isinstance(items, list):
             raise VaultError("Bitwarden returned an unexpected vault response.")
-        return [
+        scoped = [
             item for item in items
             if item.get("type") in self.TYPE_NAMES
             and str(item.get("organizationId", "")).lower() == self.organization_id.lower()
             and not item.get("deletedDate")
         ]
+        self._items_cache = scoped
+        self._items_cached_at = now
+        return scoped
 
     def list_items(self):
         with self._lock:
@@ -148,11 +160,8 @@ class VaultManager:
                 raise VaultError(f"No DotMoose vault item exactly matches {requested_name!r}.")
             if len(matches) != 1:
                 raise VaultError(f"More than one DotMoose vault item is named {requested_name!r}.")
-            item_id = str(matches[0].get("id") or "")
-            try:
-                item = json.loads(self._run(["get", "item", item_id]))
-            except json.JSONDecodeError as error:
-                raise VaultError("Bitwarden returned an invalid item response.") from error
+            item = matches[0]
+            item_id = str(item.get("id") or "")
             if (
                 item.get("type") not in self.TYPE_NAMES
                 or str(item.get("organizationId", "")).lower() != self.organization_id.lower()

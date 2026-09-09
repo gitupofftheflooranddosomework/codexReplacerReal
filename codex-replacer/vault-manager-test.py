@@ -33,8 +33,10 @@ def main():
             {"id": "note-1", "organizationId": ORG, "type": 2, "name": "Private note", "notes": "note secret", "secureNote": {}},
             {"id": "other-1", "organizationId": "outside", "type": 1, "name": "Outside", "login": {"username": "x", "password": "y"}},
         ]
+        calls = []
 
         def fake_run(command, **kwargs):
+            calls.append(command[1:])
             assert kwargs["env"]["BW_SESSION"] == "session-key"
             assert kwargs["env"]["BITWARDENCLI_APPDATA_DIR"] == str(root / "config")
             assert "session-key" not in command
@@ -70,6 +72,8 @@ def main():
             note = vault.get_item("Private note", ["notes"])
             assert note["type"] == "secure_note"
             assert note["values"] == {"notes": "note secret"}
+            assert sum(arguments[:2] == ["list", "items"] for arguments in calls) == 1
+            assert not any(arguments[:2] == ["get", "item"] for arguments in calls)
             try:
                 vault.get_item("Outside", ["password"])
             except VaultError as error:
