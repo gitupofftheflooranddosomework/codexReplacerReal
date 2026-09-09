@@ -13,6 +13,12 @@ Environment=CODEX_REPLACER_HTTP_PATH=/mcp
 Environment=CODEX_REPLACER_HOST_EXEC_FOREGROUND_SECONDS=20
 Environment=CODEX_REPLACER_HOST_EXEC_WAIT_PROMOTION_SECONDS=3
 Environment=CODEX_REPLACER_HOST_EXEC_NICE=5
+Environment=CODEX_VAULT_PROJECT=DotMoose
+Environment=CODEX_VAULT_ORGANIZATION=DotMoose
+Environment=CODEX_VAULT_ORGANIZATION_ID=3e3b3667-0137-43d6-b297-bb7abc6fb202
+Environment=CODEX_VAULT_BW_CONFIG_DIR=/home/mark/.config/codex-replacer/bitwarden-dotmoose
+Environment=CODEX_VAULT_SESSION_FILE=/home/mark/.config/codex-replacer/dotmoose-vault.session
+Environment=CODEX_VAULT_SYNC_SECONDS=60
 Environment=CODEX_LAB_MAX_STATIONS=6
 Environment=CODEX_LAB_PREWARM_STATIONS=0
 Environment=CODEX_LAB_ROOT=/tank/codex-lab
