@@ -9,6 +9,7 @@ the tunnel may expire or reconnect individual HTTP requests without taking the
 MCP server, its process sessions, or other concurrent requests down with it.
 """
 
+import importlib.util
 import json
 import os
 import signal
@@ -18,6 +19,21 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
+
+def _preload_sibling_vm_job_scheduler():
+    """Force server.py to use the scheduler client shipped beside this file."""
+    module_name = "vm_job_scheduler"
+    module_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), module_name + ".py")
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to load sibling scheduler module: {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_preload_sibling_vm_job_scheduler()
 import server
 
 
