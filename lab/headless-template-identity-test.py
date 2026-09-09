@@ -22,6 +22,7 @@ with tempfile.TemporaryDirectory() as td:
     os.environ["CODEX_CI_HEADLESS_STATE"] = str(td / "state.json")
     os.environ["CODEX_CI_HEADLESS_LOCK"] = str(td / "allocator.lock")
     os.environ["CODEX_CI_STALE_CREATING_SECONDS"] = "300"
+    os.environ["CODEX_CI_HEADLESS_MAX_VCPUS"] = "8"
     spec = importlib.util.spec_from_file_location("headless", ROOT / "codex-ci-headless.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -38,6 +39,7 @@ with tempfile.TemporaryDirectory() as td:
     assert arc["protectedMiB"] == 16 * 1024, arc
     assert arc["reclaimableMiB"] == 76 * 1024, arc
     assert mod.admission_charge_mib(2048) == 2560
+    assert mod.MAX_HEADLESS_VCPUS == 8
 
     # Storage failures must quarantine only the failing root with exponential
     # backoff, leave healthy roots selectable, and recover immediately after a
@@ -90,6 +92,7 @@ with tempfile.TemporaryDirectory() as td:
     conn.execute("INSERT INTO instances VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", row("newer", recent))
     conn.commit()
     assert mod.pending_create_charge_mib(conn) == 5120
+    assert mod.active_vcpu_charge(conn) == 4
     conn.close()
     calls = []
     def fake_finish(iid, status="finished", exit_code=None, reason="job_finished", keep=0):

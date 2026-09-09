@@ -40,11 +40,15 @@ PROJECT_MAX = max(1, int(os.environ.get("CODEX_CI_HEADLESS_PROJECT_MAX_ACTIVE", 
 MEM_MIB = max(768, int(os.environ.get("CODEX_CI_HEADLESS_MEMORY_MIB", "2048")))
 MAX_MEM_MIB = max(MEM_MIB, int(os.environ.get("CODEX_CI_HEADLESS_MAX_MEMORY_MIB", "4096")))
 VCPUS = max(1, int(os.environ.get("CODEX_CI_HEADLESS_VCPUS", "2")))
+MAX_HEADLESS_VCPUS = max(1, int(os.environ.get(
+    "CODEX_CI_HEADLESS_MAX_VCPUS",
+    str(max(1, (os.cpu_count() or 1) // 2)),
+)))
 DISK_GIB = max(10, int(os.environ.get("CODEX_CI_HEADLESS_DISK_GIB", "40")))
 HOST_RESERVE_MIB = max(4096, int(os.environ.get("CODEX_CI_HOST_RESERVE_MIB", "12288")))
 ARC_FLOOR_MIB = max(4096, int(os.environ.get("CODEX_CI_ARC_FLOOR_MIB", "16384")))
 VM_MEMORY_OVERHEAD_MIB = max(256, int(os.environ.get("CODEX_CI_VM_MEMORY_OVERHEAD_MIB", "512")))
-MAX_LOAD_PER_CPU = max(.5, float(os.environ.get("CODEX_CI_MAX_LOAD_PER_CPU", "2.0")))
+MAX_LOAD_PER_CPU = max(.5, float(os.environ.get("CODEX_CI_MAX_LOAD_PER_CPU", "1.25")))
 MAX_IO_PSI_AVG10 = max(1.0, float(os.environ.get("CODEX_CI_MAX_IO_PSI_AVG10", "70.0")))
 MAX_MEMORY_PSI_AVG10 = max(1.0, float(os.environ.get("CODEX_CI_MAX_MEMORY_PSI_AVG10", "25.0")))
 DESKTOP_IDLE_MIB = max(2048, int(os.environ.get("CODEX_DESKTOP_IDLE_MIB", "4096")))
@@ -272,6 +276,10 @@ def pending_create_charge_mib(conn):
     return sum(admission_charge_mib(row["memory_mib"]) for row in rows)
 
 
+def active_vcpu_charge(conn):
+    return sum(max(1, int(row["vcpus"])) for row in active_rows(conn))
+
+
 def load_ok():
     try:
         return os.getloadavg()[0] <= max(1, os.cpu_count() or 1) * MAX_LOAD_PER_CPU
@@ -447,6 +455,8 @@ def state_data(conn=None, history_limit=40):
         return {"time": stamp(), "capacity": {"maxActive": MAX_ACTIVE,
                 "projectMaxActive": PROJECT_MAX, "active": len(current),
                 "freeSlots": max(0, MAX_ACTIVE - len(current)),
+                "maxHeadlessVcpus": MAX_HEADLESS_VCPUS,
+                "activeHeadlessVcpus": active_vcpu_charge(conn),
                 "hostMemTotalMiB": memory["totalMiB"],
                 "hostMemAvailableMiB": memory["availableMiB"],
                 "hostEffectiveAvailableMiB": memory["effectiveAvailableMiB"],
@@ -522,6 +532,12 @@ def reserve(owner, project, ttl, session_key, memory, max_memory, vcpus, disk):
                 raise RuntimeError(f"headless KVM capacity reached ({len(rows)}/{MAX_ACTIVE})")
             if sum(1 for r in rows if r["project"] == project) >= PROJECT_MAX:
                 raise RuntimeError(f"project headless KVM capacity reached ({PROJECT_MAX})")
+            active_vcpus = sum(max(1, int(row["vcpus"])) for row in rows)
+            if active_vcpus + vcpus > MAX_HEADLESS_VCPUS:
+                raise RuntimeError(
+                    f"headless vCPU capacity reached ({active_vcpus}/{MAX_HEADLESS_VCPUS}); "
+                    f"requested {vcpus}"
+                )
             memory_state = memory_capacity()
             pending_charge = pending_create_charge_mib(conn)
             new_charge = admission_charge_mib(memory)
