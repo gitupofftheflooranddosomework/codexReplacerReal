@@ -36,6 +36,8 @@ TERMINAL = {"succeeded", "failed", "timed_out", "canceled"}
 STOP = threading.Event()
 WAKE = threading.Event()
 DB_LOCK = threading.RLock()
+LAUNCHERS_LOCK = threading.Lock()
+LAUNCHERS: dict[int, subprocess.Popen] = {}
 
 
 def now_iso() -> str:
@@ -78,6 +80,13 @@ def pid_alive(pid: int | None) -> bool:
         return True
     except (ProcessLookupError, PermissionError):
         return False
+
+
+def reap_launchers() -> None:
+    with LAUNCHERS_LOCK:
+        finished = [pid for pid, process in LAUNCHERS.items() if process.poll() is not None]
+        for pid in finished:
+            LAUNCHERS.pop(pid, None)
 
 
 def load_json(path: pathlib.Path) -> dict:
@@ -138,6 +147,8 @@ def launch_row(row: sqlite3.Row) -> None:
             [RUNNER, str(payload)], stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
             start_new_session=True, close_fds=True,
         )
+        with LAUNCHERS_LOCK:
+            LAUNCHERS[proc.pid] = proc
     finally:
         stdout.close(); stderr.close()
     stamp = now_iso()
@@ -184,6 +195,7 @@ def reconcile_one(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
 
 
 def scheduler_iteration() -> None:
+    reap_launchers()
     with DB_LOCK:
         conn = db()
         active = conn.execute("SELECT * FROM jobs WHERE status IN ('queued','running') AND launcher_pid IS NOT NULL ORDER BY created_at").fetchall()

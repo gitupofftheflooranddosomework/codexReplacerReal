@@ -27,6 +27,12 @@ def main():
         os.environ["CODEX_VM_JOB_HOST"] = "127.0.0.1"
         sched = load(LAB / "headless-job-scheduler.py", "headless_job_scheduler_tested")
         assert sched.MAX_LAUNCHERS == 96
+        class FinishedProcess:
+            def poll(self):
+                return 0
+        sched.LAUNCHERS[123] = FinishedProcess()
+        sched.reap_launchers()
+        assert 123 not in sched.LAUNCHERS
         job = sched.submit_job({"owner":"test","project":"p","command":"echo ok","timeout":123})
         assert job["status"] == "queued"
         assert job["execution"] == "ephemeral-headless-kvm"
