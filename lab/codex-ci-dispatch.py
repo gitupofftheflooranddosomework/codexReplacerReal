@@ -180,8 +180,12 @@ def main():
         for sig in (signal.SIGTERM,signal.SIGINT): old[sig]=signal.signal(sig,interrupted)
         stream_snapshot(rec,iid,workspace); push_inputs(rec,iid,workspace,a.input)
         rc=run_command(rec,iid,a.command,max(1,a.timeout),env)
+        if rc != 0:
+            status="failed"
+            return rc
         pull_artifacts(rec,iid,a.artifact,pathlib.Path(a.artifact_dest or workspace).resolve())
-        status="succeeded" if rc==0 else "failed"; return rc
+        status="succeeded"
+        return 0
     except subprocess.TimeoutExpired:
         status="timed_out"; print("Codex CI worker command timed out",file=sys.stderr); return 124
     except Interrupted:

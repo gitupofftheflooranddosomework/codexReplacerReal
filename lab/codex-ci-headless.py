@@ -551,14 +551,64 @@ def del_dhcp(rec):
     virsh("net-update", NETWORK, "delete", "ip-dhcp-host", xml, "--live", "--config", check=False)
 
 
+def domain_presence(name):
+    """Return True/False when libvirt can prove presence/absence, else None."""
+    try:
+        cp = virsh("dominfo", name, timeout=5, check=False)
+    except subprocess.TimeoutExpired:
+        return None
+    if cp.returncode == 0:
+        return True
+    detail = ((cp.stderr or "") + "\n" + (cp.stdout or "")).lower()
+    if "domain not found" in detail or "failed to get domain" in detail:
+        return False
+    return None
+
+
 def destroy_resources(rec):
-    # Libvirt's network/domain mutation paths are intentionally serialized. The
-    # expensive guest workload remains fully parallel once domains are started.
+    # A stuck libvirt call must not skip later cleanup. We attempt each mutation
+    # independently, then prove the domain is absent before removing its disk.
+    # Transient errors are returned for lifecycle history; incomplete cleanup is
+    # raised so the instance remains `releasing` and GC can safely retry it.
+    warnings = []
+    fatal = []
+
+    def attempt(label, func):
+        try:
+            return func()
+        except Exception as exc:
+            warnings.append(f"{label}: {process_error(exc)}")
+            return None
+
     with provision_locked():
-        virsh("destroy", rec["name"], timeout=20, check=False)
-        virsh("undefine", rec["name"], timeout=20, check=False)
-        del_dhcp(rec)
-    shutil.rmtree(pathlib.Path(rec["storage_root"]) / rec["name"], ignore_errors=True)
+        attempt("destroy", lambda: virsh("destroy", rec["name"], timeout=12, check=False))
+        if domain_presence(rec["name"]) is True:
+            attempt("destroy_retry", lambda: virsh("destroy", rec["name"], timeout=12, check=False))
+        attempt("undefine", lambda: virsh("undefine", rec["name"], timeout=12, check=False))
+        try:
+            del_dhcp(rec)
+        except Exception as exc:
+            fatal.append(f"dhcp_cleanup: {process_error(exc)}")
+
+    presence = domain_presence(rec["name"])
+    root = pathlib.Path(rec["storage_root"]) / rec["name"]
+    if presence is False:
+        try:
+            shutil.rmtree(root, ignore_errors=False)
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            fatal.append(f"storage_cleanup: {process_error(exc)}")
+        if root.exists():
+            fatal.append(f"storage_cleanup: path still exists: {root}")
+    elif presence is True:
+        fatal.append(f"domain_cleanup: domain still exists: {rec['name']}")
+    else:
+        fatal.append(f"domain_cleanup: unable to prove domain absent: {rec['name']}")
+
+    if fatal:
+        raise RuntimeError("headless cleanup incomplete: " + "; ".join(warnings + fatal))
+    return warnings
 
 
 def provision(rec):
@@ -653,11 +703,25 @@ def finish(iid, status="finished", exit_code=None, reason="job_finished", keep=0
                          (stamp(), exit_code, reason, iid))
             event(conn, iid, "releasing", f"status={status} reason={reason}"); conn.commit(); write_state(conn)
         finally: conn.close()
-    destroy_resources(rec)
+    try:
+        warnings = destroy_resources(rec)
+    except Exception as exc:
+        detail = process_error(exc)[:6000]
+        with locked():
+            conn = db()
+            try:
+                conn.execute("UPDATE instances SET status='releasing',error=? WHERE id=?", (detail, iid))
+                event(conn, iid, "cleanup_incomplete", detail)
+                conn.commit(); write_state(conn)
+            finally:
+                conn.close()
+        raise
     with locked():
         conn = db()
         try:
             conn.execute("UPDATE instances SET status='destroyed',destroyed_at=?,error=NULL WHERE id=?", (stamp(), iid))
+            for warning in warnings:
+                event(conn, iid, "cleanup_warning", warning[:2000])
             event(conn, iid, "destroyed", reason); conn.commit(); write_state(conn)
             return dict(conn.execute("SELECT * FROM instances WHERE id=?", (iid,)).fetchone())
         finally: conn.close()
