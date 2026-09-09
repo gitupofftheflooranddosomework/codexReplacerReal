@@ -187,9 +187,11 @@ def main():
         status="succeeded"
         return 0
     except subprocess.TimeoutExpired:
-        status="timed_out"; print("Codex CI worker command timed out",file=sys.stderr); return 124
+        status="timed_out"; rc=124
+        print("Codex CI worker command timed out",file=sys.stderr); return rc
     except Interrupted:
-        status="cancelled"; print("Codex CI dispatch interrupted",file=sys.stderr); return 130
+        status="cancelled"; rc=130
+        print("Codex CI dispatch interrupted",file=sys.stderr); return rc
     finally:
         for sig,handler in old.items(): signal.signal(sig,handler)
         if rec and iid and claimed:
