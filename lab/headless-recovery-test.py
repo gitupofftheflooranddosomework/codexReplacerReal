@@ -60,6 +60,67 @@ class RecoveryTests(unittest.TestCase):
         self.assertIsNone(m.process_identity(2147483647))
         self.assertIsNotNone(m.process_identity(os.getpid()))
 
+    def test_provision_marker_records_current_process_identity(self):
+        m = load('codex-ci-headless')
+        with tempfile.TemporaryDirectory() as tmp:
+            m.PROVISIONERS = pathlib.Path(tmp) / 'provisioners'
+            iid = 'marker-current-process'
+            marker = m.PROVISIONERS / f'{iid}.json'
+            with m.provision_marker(iid):
+                import json
+                payload = json.loads(marker.read_text())
+                self.assertEqual(payload['pid'], os.getpid())
+                self.assertEqual(payload['identity'], m.process_identity(os.getpid()))
+                self.assertTrue(payload['identity'])
+                self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
+                self.assertTrue(m.provision_owner_alive(iid))
+            self.assertFalse(marker.exists())
+
+    def test_provision_owner_rejects_pid_reuse_identity_mismatch(self):
+        m = load('codex-ci-headless')
+        with tempfile.TemporaryDirectory() as tmp:
+            import json
+            m.PROVISIONERS = pathlib.Path(tmp) / 'provisioners'
+            m.PROVISIONERS.mkdir()
+            iid = 'pid-reuse'
+            marker = m.PROVISIONERS / f'{iid}.json'
+            marker.write_text(json.dumps({
+                'pid': os.getpid(),
+                'identity': 'previous-boot:reused-pid',
+                'started_at': m.stamp(),
+            }))
+            self.assertFalse(m.provision_owner_alive(iid))
+
+    def test_legacy_provision_marker_from_previous_boot_is_rejected(self):
+        m = load('codex-ci-headless')
+        with tempfile.TemporaryDirectory() as tmp:
+            import json
+            m.PROVISIONERS = pathlib.Path(tmp) / 'provisioners'
+            m.PROVISIONERS.mkdir()
+            iid = 'legacy-previous-boot'
+            marker = m.PROVISIONERS / f'{iid}.json'
+            marker.write_text(json.dumps({
+                'pid': os.getpid(),
+                'started_at': m.stamp(m.now() - timedelta(hours=2)),
+            }))
+            with patch.object(m, 'host_boot_started_at', return_value=m.now() - timedelta(hours=1)):
+                self.assertFalse(m.provision_owner_alive(iid))
+
+    def test_legacy_provision_marker_from_current_boot_remains_compatible(self):
+        m = load('codex-ci-headless')
+        with tempfile.TemporaryDirectory() as tmp:
+            import json
+            m.PROVISIONERS = pathlib.Path(tmp) / 'provisioners'
+            m.PROVISIONERS.mkdir()
+            iid = 'legacy-current-boot'
+            marker = m.PROVISIONERS / f'{iid}.json'
+            marker.write_text(json.dumps({
+                'pid': os.getpid(),
+                'started_at': m.stamp(m.now() - timedelta(minutes=5)),
+            }))
+            with patch.object(m, 'host_boot_started_at', return_value=m.now() - timedelta(hours=1)):
+                self.assertTrue(m.provision_owner_alive(iid))
+
     def test_admission_does_not_spend_unreclaimed_arc(self):
         m=load('codex-ci-headless')
         with patch.object(m,'meminfo',return_value=(192000,12000)), \
