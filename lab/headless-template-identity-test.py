@@ -11,9 +11,18 @@ convert_at = build.index('qemu-img convert -p -O qcow2 "$OVERLAY" "$FLAT"')
 sanitize_at = build.index("truncate -s 0 /etc/machine-id")
 replicate_at = build.index("IFS=',' read -ra roots")
 assert convert_at < sanitize_at < replicate_at
-assert 'codex-ci-base-v3.qcow2' in build
-for package in ('python3-reportlab', 'php-cli', 'composer', 'dnsutils'):
+assert 'codex-ci-base-v4.qcow2' in build
+for package in (
+    'python3-reportlab', 'nodejs', 'php8.4-cli', 'php8.4-common',
+    'php8.4-mbstring', 'composer', 'dnsutils'
+):
     assert package in build, package
+assert 'https://deb.nodesource.com/setup_22.x' in build
+assert 'https://packages.sury.org/php/' in build
+assert 'debsuryorg-archive-keyring.gpg' in build
+assert 'major !== 22 || minor < 12' in build
+assert 'PHP_MAJOR_VERSION !== 8 || PHP_MINOR_VERSION !== 4' in build
+assert '/var/lib/codex-ci-toolchain-v4' in build
 assert 'import reportlab, requests, yaml' in build
 for needle in ("/var/lib/dbus/machine-id", "/var/lib/dhcp/*", "/var/lib/NetworkManager/*lease*", "/var/lib/systemd/network/*"):
     assert needle in build, needle
@@ -29,7 +38,7 @@ with tempfile.TemporaryDirectory() as td:
     spec = importlib.util.spec_from_file_location("headless", ROOT / "codex-ci-headless.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    assert mod.BASE == "codex-ci-base-v3.qcow2"
+    assert mod.BASE == "codex-ci-base-v4.qcow2"
     gib = 1024 ** 3
     assert mod.effective_disk_gib(100 * gib, 40) == 100
     assert mod.effective_disk_gib(100 * gib, 120) == 120
