@@ -97,6 +97,9 @@ def main():
             raise RuntimeError("chatgpt_start_chat must be exposed exactly once.")
         if name_list.count("chatgpt_auth_begin") != 1:
             raise RuntimeError("chatgpt_auth_begin must be exposed exactly once.")
+        chat_tool = next(item for item in tools if item["name"] == "chatgpt_start_chat")
+        if "app" not in chat_tool.get("inputSchema", {}).get("properties", {}):
+            raise RuntimeError("chatgpt_start_chat must expose optional installed app selection.")
         auth_tool = next(item for item in tools if item["name"] == "chatgpt_auth_begin")
         auth_methods = auth_tool.get("inputSchema", {}).get("properties", {}).get("method", {}).get("enum", [])
         if auth_methods != ["passkey", "phone_prompt"]:
