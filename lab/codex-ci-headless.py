@@ -421,11 +421,31 @@ def choose_store(conn):
 
 
 def current_dhcp_leases():
-    leases = virsh("net-dhcp-leases", NETWORK, timeout=15, check=False)
-    text = (leases.stdout or "") + "\n" + (leases.stderr or "")
+    """Return slots that cannot be safely assigned to a managed guest.
+
+    Managed slots always reuse the same MAC for a given IP.  Dnsmasq retains a
+    dynamic lease after its short-lived domain and static reservation are gone;
+    treating that matching lease as occupied eventually exhausts the entire
+    pool even when no guests are running.  Keep honoring live/static
+    reservations and leases held by any foreign MAC.
+    """
     found = set()
-    for match in re.finditer(r"\b192\.168\.122\.(\d{1,3})\b", text):
+    reservations = virsh("net-dumpxml", NETWORK, timeout=15, check=False)
+    reservation_text = (reservations.stdout or "") + "\n" + (reservations.stderr or "")
+    for match in re.finditer(r"<host\b[^>]*\bip=['\"]192\.168\.122\.(\d{1,3})['\"]", reservation_text):
         found.add(int(match.group(1)))
+    leases = virsh("net-dhcp-leases", NETWORK, timeout=15, check=False)
+    lease_text = (leases.stdout or "") + "\n" + (leases.stderr or "")
+    for line in lease_text.splitlines():
+        ip_match = re.search(r"\b192\.168\.122\.(\d{1,3})(?:/\d+)?\b", line)
+        mac_match = re.search(r"\b([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})\b", line)
+        if not ip_match:
+            continue
+        last = int(ip_match.group(1))
+        managed_mac = f"52:54:00:ce:{last // 256:02x}:{last % 256:02x}"
+        if mac_match and mac_match.group(1).lower() == managed_mac:
+            continue
+        found.add(last)
     return found
 
 
