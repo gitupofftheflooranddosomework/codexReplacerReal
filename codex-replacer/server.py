@@ -1438,6 +1438,34 @@ def _chatgpt_composer_ref(snapshot):
     ])
 
 
+def _chatgpt_select_app(snapshot, composer_ref, app):
+    CHATGPT_BROWSER_CLIENT.call("browser_type", {
+        "target": composer_ref,
+        "element": "ChatGPT message composer",
+        "text": f"@{app}",
+        "slowly": True,
+    })
+    CHATGPT_BROWSER_CLIENT.call("browser_wait_for", {"time": 0.75})
+    picker = _chatgpt_snapshot(depth=16)
+    escaped = re.escape(app)
+    app_ref = _snapshot_ref(picker, [
+        rf'(?:menuitem|option|button) "{escaped}"[^\n]*\[ref=([^\]]+)\]',
+        rf'(?:menuitem|option|button) "[^"\n]*{escaped}[^"\n]*"[^\n]*\[ref=([^\]]+)\]',
+    ])
+    if not app_ref:
+        raise RuntimeError(f'Could not select ChatGPT app "{app}" from the composer mention picker.')
+    CHATGPT_BROWSER_CLIENT.call("browser_click", {
+        "target": app_ref,
+        "element": f'ChatGPT app {app}',
+    })
+    CHATGPT_BROWSER_CLIENT.call("browser_wait_for", {"time": 0.5})
+    selected = _chatgpt_snapshot(depth=16)
+    selected_composer_ref = _chatgpt_composer_ref(selected)
+    if not selected_composer_ref:
+        raise RuntimeError("ChatGPT app was selected, but the message composer is no longer available.")
+    return selected, selected_composer_ref
+
+
 def _headed_browser_tabs():
     listing = _mcp_text(CHATGPT_BROWSER_CLIENT.call("browser_tabs", {"action": "list"}))
     tabs = []
@@ -1558,7 +1586,7 @@ def handle_chatgpt_auth_begin(arguments):
             ], timeout=10.0)
 
         if account_email and re.search(r"Email or phone", snapshot, re.IGNORECASE):
-            email_ref = _snapshot_ref(snapshot, [r'textbox "Email or phone" \[ref=([^\]]+)\]'])
+            email_ref = _snapshot_ref(snapshot, [r'textbox "Email or phone"[^\n]*\[ref=([^\]]+)\]'])
             if email_ref:
                 CHATGPT_BROWSER_CLIENT.call("browser_type", {
                     "target": email_ref,
@@ -1665,6 +1693,9 @@ def handle_chatgpt_start_chat(arguments):
 
     project = str(arguments.get("project") or "").strip()
     project_url = str(arguments.get("projectUrl") or "").strip()
+    app = str(arguments.get("app") or "").strip()
+    if len(app) > 120 or any(character in app for character in "\r\n\t"):
+        return tool_result({"created": False}, message="app must be a single-line name of 120 characters or fewer.", is_error=True)
     submit = arguments.get("submit", True) is not False
 
     if project_url:
@@ -1741,15 +1772,23 @@ def handle_chatgpt_start_chat(arguments):
         if not composer_ref:
             raise RuntimeError("Could not locate the ChatGPT message composer in the headed browser.")
 
-        CHATGPT_BROWSER_CLIENT.call("browser_fill_form", {
-            "fields": [{
-                "name": "ChatGPT message",
-                "type": "textbox",
+        if app:
+            snapshot, composer_ref = _chatgpt_select_app(snapshot, composer_ref, app)
+            CHATGPT_BROWSER_CLIENT.call("browser_type", {
                 "target": composer_ref,
                 "element": "ChatGPT message composer",
-                "value": message,
-            }],
-        })
+                "text": message,
+            })
+        else:
+            CHATGPT_BROWSER_CLIENT.call("browser_fill_form", {
+                "fields": [{
+                    "name": "ChatGPT message",
+                    "type": "textbox",
+                    "target": composer_ref,
+                    "element": "ChatGPT message composer",
+                    "value": message,
+                }],
+            })
 
         if submit:
             CHATGPT_BROWSER_CLIENT.call("browser_press_key", {"key": "Enter"})
@@ -1771,6 +1810,7 @@ def handle_chatgpt_start_chat(arguments):
             "authenticationRequired": False,
             "project": project or None,
             "projectUrl": project_url or None,
+            "app": app or None,
             "chatUrl": chat_url if created else None,
             "browserUrl": chat_url,
             "mode": "headed-cdp",
@@ -1874,7 +1914,7 @@ DIRECT_TOOLS = dict([
     tool("dotmoose_vault_get", "Get DotMoose credential", "Retrieve selected fields from one exact item in the project-scoped DotMoose Vaultwarden organization. Request only fields required for the current DotMoose task and avoid repeating returned secrets in chat or logs.", object_schema({"item": string("Exact item name returned by dotmoose_vault_list."), "fields": {"type": "array", "minItems": 1, "uniqueItems": True, "items": {"type": "string", "enum": ["username", "password", "totp", "notes"]}, "default": ["username", "password"]}}, ["item"]), handle_dotmoose_vault_get, annotations(True, False, True)),
     tool("chatgpt_browser_status", "Inspect ChatGPT browser", "Check whether the dedicated normal headed Chromium session for ChatGPT is reachable and authenticated. This does not expose general control of that browser.", object_schema(), handle_chatgpt_browser_status, annotations(True, False, True)),
     tool("chatgpt_auth_begin", "Begin ChatGPT authentication", "Start or resume the normal Google authentication flow for the persistent headed ChatGPT browser using only user-approved passkey or phone-prompt methods. This tool intentionally cannot accept passwords, one-time codes, backup codes, passkey secrets, or MFA secrets.", object_schema({"method": {"type": "string", "enum": ["passkey", "phone_prompt"], "default": "passkey"}, "accountEmail": string("Optional Google account email used only to fill the account identifier field.")}), handle_chatgpt_auth_begin, annotations(False, False, True)),
-    tool("chatgpt_start_chat", "Start ChatGPT chat", "Create a new ChatGPT conversation through the user's persistent headed Chromium session, optionally inside an existing ChatGPT Project, seed it with a message, submit it, and return the resulting conversation URL. Use this only when the user explicitly asks to start, hand off, or continue work in another ChatGPT chat.", object_schema({"message": string("First message to place in the new chat."), "project": string("Optional exact ChatGPT Project name."), "projectUrl": string("Optional exact https://chatgpt.com project URL; prefer when known."), "submit": {"type": "boolean", "default": True}}, ["message"]), handle_chatgpt_start_chat, annotations(False, False, True)),
+    tool("chatgpt_start_chat", "Start ChatGPT chat", "Create a new ChatGPT conversation through the user's persistent headed Chromium session, optionally select an installed ChatGPT app, seed it with a message, submit it, and return the resulting conversation URL. Use this only when the user explicitly asks to start, hand off, or continue work in another ChatGPT chat.", object_schema({"message": string("First message to place in the new chat."), "project": string("Optional exact ChatGPT Project name."), "projectUrl": string("Optional exact https://chatgpt.com project URL; prefer when known."), "app": string("Optional exact installed ChatGPT app name to select through the composer mention picker before sending."), "submit": {"type": "boolean", "default": True}}, ["message"]), handle_chatgpt_start_chat, annotations(False, False, True)),
     tool("system_info", "Inspect VM", "Use this when you need the dedicated Codex Replacer VM identity, Mark's guest execution context, or installed development tools.", object_schema(), handle_system_info, annotations(True, False, False)),
     tool("fs_stat", "Inspect path", "Use this when you need metadata, ownership, permissions, timestamps, link target, or an optional SHA-256 hash for any host path.", object_schema({"path": string(), "hash": {"type": "boolean", "default": False}}, ["path"]), handle_fs_stat, annotations(True, False, False)),
     tool("fs_list", "List files", "Use this when you need to list any host directory, optionally recursively.", object_schema({"path": string(), "recursive": {"type": "boolean", "default": False}, "maxDepth": {"type": "integer", "minimum": 0, "maximum": 100}, "maxEntries": {"type": "integer", "minimum": 1, "maximum": 10000}}, ["path"]), handle_fs_list, annotations(True, False, False)),
