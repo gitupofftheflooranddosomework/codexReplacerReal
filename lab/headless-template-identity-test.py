@@ -38,7 +38,9 @@ with tempfile.TemporaryDirectory() as td:
     spec = importlib.util.spec_from_file_location("headless", ROOT / "codex-ci-headless.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    assert mod.BASE == "codex-ci-base-v4.qcow2"
+    # v4 is built and verified before a separate activation change switches
+    # the allocator; until then the production/default allocator stays on v3.
+    assert mod.BASE == "codex-ci-base-v3.qcow2"
     gib = 1024 ** 3
     assert mod.effective_disk_gib(100 * gib, 40) == 100
     assert mod.effective_disk_gib(100 * gib, 120) == 120
