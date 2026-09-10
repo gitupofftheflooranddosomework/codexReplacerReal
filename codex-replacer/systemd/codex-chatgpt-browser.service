@@ -1,15 +1,14 @@
 [Unit]
 Description=Codex Replacer persistent headed ChatGPT browser
-After=graphical-session.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 UMask=0077
-Environment=DISPLAY=:0
-Environment=XAUTHORITY=%h/.Xauthority
 ExecStartPre=/usr/bin/install -d -m 0700 %h/.local/share/codex-replacer %h/.local/share/codex-replacer/chatgpt-browser
-ExecStartPre=/usr/bin/test -r %h/.Xauthority
-ExecStart=/usr/bin/chromium --user-data-dir=%h/.local/share/codex-replacer/chatgpt-browser --password-store=basic --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --no-first-run --no-default-browser-check --disable-session-crashed-bubble https://chatgpt.com/
+ExecStartPre=/usr/bin/test -x /usr/bin/xvfb-run
+ExecStart=/usr/bin/xvfb-run -a -s "-screen 0 1440x900x24" /usr/bin/chromium --user-data-dir=%h/.local/share/codex-replacer/chatgpt-browser --password-store=basic --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --remote-allow-origins=* --no-first-run --no-default-browser-check --disable-session-crashed-bubble https://chatgpt.com/
 Restart=always
 RestartSec=3
 TimeoutStopSec=15

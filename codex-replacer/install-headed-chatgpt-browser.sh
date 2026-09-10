@@ -4,6 +4,12 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROFILE_DIR="$HOME/.local/share/codex-replacer/chatgpt-browser"
 mkdir -p "$HOME/.config/systemd/user" "$PROFILE_DIR"
 chmod 0700 "$HOME/.local/share/codex-replacer" "$PROFILE_DIR"
+for dependency in /usr/bin/chromium /usr/bin/xvfb-run; do
+  if [ ! -x "$dependency" ]; then
+    printf '%s\n' "Required executable is missing: $dependency" >&2
+    exit 1
+  fi
+done
 install -m 0644 "$SCRIPT_DIR/systemd/codex-chatgpt-browser.service" "$HOME/.config/systemd/user/codex-chatgpt-browser.service"
 if command -v loginctl >/dev/null 2>&1; then
   loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || true
