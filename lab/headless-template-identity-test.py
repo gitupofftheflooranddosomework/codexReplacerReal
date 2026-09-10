@@ -44,6 +44,25 @@ with tempfile.TemporaryDirectory() as td:
     assert mod.admission_charge_mib(2048) == 2560
     assert mod.MAX_HEADLESS_VCPUS == 8
 
+    # A destroyed managed guest leaves a dnsmasq lease behind until expiry.
+    # The same IP always maps to the same managed MAC, so that stale lease is
+    # reusable. Static reservations and leases held by foreign MACs still block
+    # their slots.
+    from types import SimpleNamespace
+    def fake_virsh(*args, **kwargs):
+        if args[0] == "net-dumpxml":
+            return SimpleNamespace(stdout="<host mac='52:54:00:ce:00:66' ip='192.168.122.102'/>", stderr="")
+        if args[0] == "net-dhcp-leases":
+            return SimpleNamespace(stdout=(
+                "52:54:00:ce:00:64 ipv4 192.168.122.100/24 managed-old\n"
+                "52:54:00:aa:bb:cc ipv4 192.168.122.101/24 foreign\n"
+            ), stderr="")
+        raise AssertionError(args)
+    original_virsh = mod.virsh
+    mod.virsh = fake_virsh
+    assert mod.current_dhcp_leases() == {101, 102}
+    mod.virsh = original_virsh
+
     # Storage failures must quarantine only the failing root with exponential
     # backoff, leave healthy roots selectable, and recover immediately after a
     # successful provision. This prevents a persistent storage fault from
