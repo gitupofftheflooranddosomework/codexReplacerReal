@@ -8,7 +8,7 @@ Type=simple
 Environment=PYTHONUNBUFFERED=1
 Environment=CODEX_LAB_INTERACTIVE_SCHEDULER_URL=http://192.168.122.1:8766
 Environment=CODEX_CI_MAX_LOAD_PER_CPU=1.25
-Environment=CODEX_CI_HEADLESS_MAX_VCPUS=16
+Environment=CODEX_CI_HEADLESS_MAX_VCPUS=18
 ExecStart=/usr/bin/python3 /home/mark/.local/bin/codex-headless-job-scheduler
 Restart=always
 RestartSec=2

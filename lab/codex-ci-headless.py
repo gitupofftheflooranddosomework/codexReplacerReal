@@ -42,7 +42,7 @@ MAX_MEM_MIB = max(MEM_MIB, int(os.environ.get("CODEX_CI_HEADLESS_MAX_MEMORY_MIB"
 VCPUS = max(1, int(os.environ.get("CODEX_CI_HEADLESS_VCPUS", "2")))
 MAX_HEADLESS_VCPUS = max(1, int(os.environ.get(
     "CODEX_CI_HEADLESS_MAX_VCPUS",
-    str(max(1, ((os.cpu_count() or 1) * 2) // 3)),
+    str(max(1, ((os.cpu_count() or 1) * 3) // 4)),
 )))
 DISK_GIB = max(10, int(os.environ.get("CODEX_CI_HEADLESS_DISK_GIB", "40")))
 HOST_RESERVE_MIB = max(4096, int(os.environ.get("CODEX_CI_HOST_RESERVE_MIB", "12288")))
