@@ -2,6 +2,7 @@
 Description=Reap expired Codex headless CI KVMs every minute
 
 [Timer]
+OnActiveSec=1min
 OnBootSec=1min
 OnUnitActiveSec=1min
 AccuracySec=10s
