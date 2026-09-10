@@ -1612,6 +1612,21 @@ def handle_chatgpt_auth_begin(arguments):
                 r"backup code",
             ], timeout=10.0)
 
+        if (
+            method == "phone_prompt"
+            and re.search(r"Choose how you want to sign in", snapshot, re.IGNORECASE)
+            and not re.search(r"Do you have your phone\?|Check your phone", snapshot, re.IGNORECASE)
+        ):
+            _click_snapshot_control(snapshot, [
+                r'(?:button|link) "Try another way" \[ref=([^\]]+)\]',
+            ], "Try another way for phone prompt")
+            snapshot = _headed_snapshot_until([
+                r"Do you have your phone",
+                r"Check your phone",
+                r"Google Authenticator",
+                r"backup code",
+            ], timeout=10.0)
+
         if method == "passkey" and re.search(r"Use your passkey", snapshot, re.IGNORECASE):
             _click_snapshot_control(snapshot, [
                 r'(?:button|link) "Use your passkey" \[ref=([^\]]+)\]',
