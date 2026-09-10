@@ -1572,7 +1572,10 @@ def handle_chatgpt_auth_begin(arguments):
             _click_snapshot_control(snapshot, [
                 r'button "Log in" \[ref=([^\]]+)\]',
             ], "ChatGPT Log in")
-            snapshot = _chatgpt_snapshot()
+            snapshot = _headed_snapshot_until([
+                r"Log in or sign up",
+                r"Continue with Google",
+            ], timeout=5.0)
 
         if re.search(r"Continue with Google", snapshot, re.IGNORECASE):
             _click_snapshot_control(snapshot, [
