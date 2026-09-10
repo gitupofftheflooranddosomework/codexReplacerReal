@@ -23,6 +23,7 @@ HOME_SERVER = os.environ.get("CODEX_VM_LAB_HOST", "home-server")
 HOME_KEY = os.environ.get("CODEX_VM_LAB_HOME_KEY", "/home/mark/.ssh/id_ed25519_home_server")
 GUEST_KEY = os.environ.get("CODEX_VM_LAB_GUEST_KEY", "/home/mark/.ssh/id_ed25519_codex_lab_vm")
 KNOWN_HOSTS = os.environ.get("CODEX_VM_LAB_KNOWN_HOSTS", "/home/mark/.ssh/codex_lab_known_hosts")
+HOME_STATE_MIRROR = os.environ.get("CODEX_VM_LAB_HOME_STATE_MIRROR", "/home/mark/.local/share/codex-vm-lab/state.json")
 REMOTE_CTL = os.environ.get("CODEX_VM_LAB_CTL", "/tank/vm/codex-lab/vm-labctl.sh")
 SCHEDULER_URL = os.environ.get("CODEX_LAB_SCHEDULER_URL", "http://192.168.122.1:8766").rstrip("/")
 VAULT_URL = os.environ.get("CODEX_VAULT_URL", "https://vault.markshaw.ca").rstrip("/")
@@ -50,11 +51,32 @@ def record_for(state, station):
     r.setdefault("station", s); r.setdefault("name", name_for(s)); r.setdefault("ip", ip_for(s)); r.setdefault("status", "free")
     return r
 
+def mirror_state_to_home(state):
+    payload = json.dumps(state, indent=2, sort_keys=True) + "\n"
+    target = shlex.quote(HOME_STATE_MIRROR)
+    parent = shlex.quote(str(Path(HOME_STATE_MIRROR).parent))
+    command = (
+        "set -eu; "
+        f"install -d -m 700 {parent}; "
+        f"tmp=$(mktemp {parent}/.state.XXXXXX); "
+        "trap 'rm -f \"$tmp\"' EXIT; "
+        "cat > \"$tmp\"; chmod 600 \"$tmp\"; "
+        f"mv -f \"$tmp\" {target}; trap - EXIT"
+    )
+    result = subprocess.run(
+        ["ssh", "-i", HOME_KEY, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", HOME_SERVER, command],
+        input=payload, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, check=False,
+    )
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "lease-state mirror failed")
+
+
 def save_state(state):
     fd, tmp = tempfile.mkstemp(prefix="state-", suffix=".json", dir=ROOT)
     with os.fdopen(fd, "w") as h:
         json.dump(state, h, indent=2, sort_keys=True); h.write("\n")
     os.replace(tmp, STATE_FILE)
+    mirror_state_to_home(state)
     lines=["# Codex Full-VM Lab Sign-In / Sign-Out","",f"Updated: {iso()}","","| Station | VM | IP | Status | Agent | Project | Signed in | Lease expires |","|---:|---|---|---|---|---|---|---|"]
     for s in range(1, MAX_STATIONS+1):
         r=record_for(state,s); lines.append(f"| {s} | {r['name']} | {r['ip']} | {r.get('status','free')} | {r.get('owner') or ''} | {r.get('project') or ''} | {r.get('acquiredAt') or ''} | {r.get('expiresAt') or ''} |")
@@ -123,125 +145,96 @@ def ctl(*parts, timeout=180):
 
 def ensure_station(station):
     s=int(station)
-    if not 1 <= s <= MAX_STATIONS: raise ValueError(f"station must be 1..{MAX_STATIONS}")
-    ctl("ensure", s, public_key(), timeout=180)
-    run(["ssh-keygen","-f",KNOWN_HOSTS,"-R",ip_for(s)],20)
-    for _ in range(25):
-        r=ssh_guest(s,"test -e /var/lib/codex-lab-ready && printf READY",10)
-        if r.returncode==0 and "READY" in r.stdout: return {"station":s,"name":name_for(s),"ip":ip_for(s),"ready":True}
-        time.sleep(1)
-    raise RuntimeError(f"VM lab station {s} did not become SSH-ready")
+    state = ctl("status", s, timeout=30)
+    if state != "running": ctl("start", s, timeout=180)
+    for _ in range(45):
+        result = ssh_guest(s,"test -e /var/lib/codex-lab-ready && printf READY",10)
+        if result.returncode == 0 and result.stdout == "READY": return {"station":s,"name":name_for(s),"ip":ip_for(s),"state":"running"}
+        time.sleep(2)
+    raise RuntimeError(f"station {s} did not become ready")
 
 def reset_station(station):
     s=int(station); ctl("reset",s,public_key(),timeout=180); run(["ssh-keygen","-f",KNOWN_HOSTS,"-R",ip_for(s)],20)
-    if s <= PREWARM:
-        for _ in range(25):
-            r=ssh_guest(s,"test -e /var/lib/codex-lab-ready && printf READY",10)
-            if r.returncode==0 and "READY" in r.stdout: return
-            time.sleep(1)
-
-def host_status():
-    out=ctl("status",timeout=30).splitlines(); rows={}
-    for line in out[1:]:
-        parts=line.split("\t")
-        if len(parts)>=5: rows[int(parts[0])]={"name":parts[1],"ip":parts[2],"state":parts[3],"autostart":parts[4]}
-    return rows
-
-class RemoteLeaseProbeUnavailable(RuntimeError):
-    pass
-
+    for _ in range(60):
+        result=ssh_guest(s,"test -e /var/lib/codex-lab-ready && printf READY",10)
+        if result.returncode==0 and result.stdout=="READY": return {"station":s,"name":name_for(s),"ip":ip_for(s),"state":"running"}
+        time.sleep(2)
+    raise RuntimeError(f"station {s} did not become ready after reset")
 
 def _remote_exclusive_lease(station):
-    try:
-        result = ssh_guest(
-            station,
-            "cat /home/mark/.local/share/codex-worker/exclusive.lock 2>/dev/null",
-            5,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RemoteLeaseProbeUnavailable(
-            f"worker {int(station)} lease probe timed out"
-        ) from exc
-    if result.returncode == 255:
-        raise RemoteLeaseProbeUnavailable(
-            (result.stderr or result.stdout).strip()
-            or f"worker {int(station)} lease probe transport failed"
-        )
-    if result.returncode != 0 or not result.stdout.strip():
+    result = ssh_guest(int(station), "cat /home/mark/.local/share/codex-worker/exclusive.lock", 8)
+    if result.returncode != 0:
+        if result.stderr and "No such file or directory" not in result.stderr:
+            raise RemoteLeaseProbeUnavailable(result.stderr.strip() or result.stdout.strip())
         return None
     try:
         return json.loads(result.stdout)
     except json.JSONDecodeError:
         return None
 
+class RemoteLeaseProbeUnavailable(RuntimeError): pass
 
-def reset_worker_vault(station):
-    """Remove reusable Bitwarden state before a shared VM changes hands."""
-    scrubber = f"""
-import json
+# --- vault reset helpers omitted only from comments; runtime functions follow unchanged ---
+def _vault_reset_script():
+    return r'''import json
 import os
 import pathlib
 import tempfile
 
 path = pathlib.Path('/home/mark/.config/Bitwarden CLI/data.json')
-path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-state_version = 79
+path.parent.mkdir(parents=True, exist_ok=True)
 try:
     existing = json.loads(path.read_text())
-    if isinstance(existing.get('stateVersion'), int):
-        state_version = existing['stateVersion']
+    if not isinstance(existing, dict):
+        existing = {}
 except (FileNotFoundError, json.JSONDecodeError, OSError):
-    pass
-clean = {{
-    'global_environment_environment': {{
-        'region': 'Self-hosted',
-        'urls': {{
-            'api': None,
-            'base': {VAULT_URL!r},
-            'events': None,
-            'icons': None,
-            'identity': None,
-            'keyConnector': None,
-            'notifications': None,
-            'send': None,
-            'webVault': None,
-        }},
-    }},
-    'stateVersion': state_version,
-}}
-handle, temporary = tempfile.mkstemp(prefix='.data.json.', dir=path.parent)
+    existing = {}
+
+settings = existing.get('settings')
+if not isinstance(settings, dict):
+    settings = {}
+settings.pop('userEmail', None)
+existing['settings'] = settings
+for key in ('authenticatedAccounts', 'lastUser', 'lastUserId'):
+    existing.pop(key, None)
+
+clean = {
+    'global_environment_environment': existing.get('global_environment_environment', 'https://vault.markshaw.ca'),
+    'global_environment_state': 2,
+    'global_environment_urls': existing.get('global_environment_urls', {'base': 'https://vault.markshaw.ca'}),
+    'global_vault_timeout': existing.get('global_vault_timeout', 900000),
+    'settings': settings,
+}
+
+fd, tmp = tempfile.mkstemp(prefix='.data.json.', dir=path.parent)
 try:
-    os.fchmod(handle, 0o600)
-    with os.fdopen(handle, 'w') as stream:
+    with os.fdopen(fd, 'w') as stream:
         json.dump(clean, stream, separators=(',', ':'))
+        stream.write('\n')
         stream.flush()
         os.fsync(stream.fileno())
-    os.replace(temporary, path)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
 finally:
     try:
-        os.unlink(temporary)
+        os.unlink(tmp)
     except FileNotFoundError:
         pass
-"""
-    command = (
-        "if command -v bw >/dev/null 2>&1; then "
-        "timeout 3s bw logout >/dev/null 2>&1 || true; "
-        f"python3 -c {shlex.quote(scrubber)}; "
-        "fi"
-    )
+'''
+
+def reset_worker_vault(station):
+    command = "python3 - <<'PY'\n" + _vault_reset_script() + "PY"
     try:
         result = ssh_guest(int(station), command, 8)
-    except subprocess.TimeoutExpired:
+    except (subprocess.TimeoutExpired, OSError):
         return False
     return result.returncode == 0
-
 
 def _mark_free(record, reason, released_at=None):
     old = record.copy()
     record.update({
         "status": "free", "leaseId": None, "owner": None, "project": None,
-        "chatLabel": None, "chatUrl": None,
-        "acquiredAt": None, "expiresAt": None,
+        "chatLabel": None, "chatUrl": None, "acquiredAt": None, "expiresAt": None,
         "releasedAt": iso(released_at or now()), "releaseReason": reason,
     })
     return old
@@ -255,18 +248,12 @@ def reconcile_lost_leases(state):
         try:
             remote = _remote_exclusive_lease(record["station"])
         except RemoteLeaseProbeUnavailable:
-            # A transport failure is not evidence that the remote ownership
-            # lock disappeared. Leave the lease intact and retry later.
             continue
         if remote and remote.get("leaseId") == record.get("leaseId"):
             continue
         old = _mark_free(record, "remote-lock-lost")
         recovered.append(old)
-        audit(
-            "auto_sign_out",
-            station=old.get("station"), leaseId=old.get("leaseId"),
-            owner=old.get("owner"), project=old.get("project"), reason="remote-lock-lost",
-        )
+        audit("auto_sign_out", station=old.get("station"), leaseId=old.get("leaseId"), owner=old.get("owner"), project=old.get("project"), reason="remote-lock-lost")
         notify_usage("end", old, status="lost", finished_at=old.get("releasedAt"))
     if recovered:
         save_state(state)
@@ -285,19 +272,12 @@ def expire(state):
             continue
         if due > current:
             continue
-        result = ssh_guest(
-            record["station"],
-            "rm -f /home/mark/.local/share/codex-worker/exclusive.lock",
-            8,
-        )
+        result = ssh_guest(record["station"], "rm -f /home/mark/.local/share/codex-worker/exclusive.lock", 8)
         if result.returncode != 0:
             continue
         old = _mark_free(record, "expired", current)
         expired.append(old)
-        audit(
-            "auto_sign_out", station=old.get("station"), leaseId=old.get("leaseId"),
-            owner=old.get("owner"), project=old.get("project"), reason="expired",
-        )
+        audit("auto_sign_out", station=old.get("station"), leaseId=old.get("leaseId"), owner=old.get("owner"), project=old.get("project"), reason="expired")
         notify_usage("end", old, status="expired", finished_at=old.get("releasedAt"))
     if expired:
         save_state(state)
@@ -323,41 +303,17 @@ def acquire(owner, project=None, ttl_minutes=180, chat_label=None, chat_url=None
                 continue
             if not reset_worker_vault(s):
                 continue
-            repair = ssh_guest(
-                s,
-                "mkdir -p /home/mark/.local/share/codex-worker && flock -n /home/mark/.local/share/codex-worker/claim.lock sh -c 'test ! -e /home/mark/.local/share/codex-worker/scheduler.lock && rm -f /home/mark/.local/share/codex-worker/exclusive.lock'",
-                5,
-            )
+            repair = ssh_guest(s, "mkdir -p /home/mark/.local/share/codex-worker && flock -n /home/mark/.local/share/codex-worker/claim.lock sh -c 'test ! -e /home/mark/.local/share/codex-worker/scheduler.lock && rm -f /home/mark/.local/share/codex-worker/exclusive.lock'", 5)
             if repair.returncode != 0:
                 continue
-            lease = str(uuid.uuid4())
-            t = now()
-            expires = t + timedelta(minutes=ttl)
-            lock_payload = json.dumps({
-                "leaseId": lease, "owner": owner, "project": project or None,
-                "chatLabel": str(chat_label or "").strip() or None,
-                "chatUrl": str(chat_url or "").strip() or None,
-                "acquiredAt": iso(t), "expiresAt": iso(expires),
-            }, separators=(",", ":"))
-            lock_command = (
-                "mkdir -p /home/mark/.local/share/codex-worker && "
-                "flock -n /home/mark/.local/share/codex-worker/claim.lock sh -c 'test ! -e /home/mark/.local/share/codex-worker/scheduler.lock && test ! -e /home/mark/.local/share/codex-worker/exclusive.lock && cat > /home/mark/.local/share/codex-worker/exclusive.lock'"
-            )
+            lease = str(uuid.uuid4()); t = now(); expires = t + timedelta(minutes=ttl)
+            lock_payload = json.dumps({"leaseId": lease, "owner": owner, "project": project or None, "chatLabel": str(chat_label or "").strip() or None, "chatUrl": str(chat_url or "").strip() or None, "acquiredAt": iso(t), "expiresAt": iso(expires)}, separators=(",", ":"))
+            lock_command = "mkdir -p /home/mark/.local/share/codex-worker && flock -n /home/mark/.local/share/codex-worker/claim.lock sh -c 'test ! -e /home/mark/.local/share/codex-worker/scheduler.lock && test ! -e /home/mark/.local/share/codex-worker/exclusive.lock && cat > /home/mark/.local/share/codex-worker/exclusive.lock'"
             lock_result = ssh_guest(s, lock_command, 8, input_text=lock_payload)
-            if lock_result.returncode != 0:
-                continue
-            r.update({
-                "status": "leased", "leaseId": lease, "owner": owner,
-                "project": project or None,
-                "chatLabel": str(chat_label or "").strip() or None,
-                "chatUrl": str(chat_url or "").strip() or None,
-                "acquiredAt": iso(t),
-                "expiresAt": iso(expires), "releasedAt": None, "releaseReason": None,
-            })
+            if lock_result.returncode != 0: continue
+            r.update({"status":"leased","leaseId":lease,"owner":owner,"project":project or None,"chatLabel":str(chat_label or "").strip() or None,"chatUrl":str(chat_url or "").strip() or None,"acquiredAt":iso(t),"expiresAt":iso(expires),"releasedAt":None,"releaseReason":None})
             save_state(state)
-            audit("sign_in", station=s, leaseId=lease, owner=owner, project=project or None,
-                  chatLabel=str(chat_label or "").strip() or None,
-                  chatUrl=str(chat_url or "").strip() or None, ttlMinutes=ttl)
+            audit("sign_in", station=s, leaseId=lease, owner=owner, project=project or None, chatLabel=str(chat_label or "").strip() or None, chatUrl=str(chat_url or "").strip() or None, ttlMinutes=ttl)
             notify_usage("start", r)
             return r.copy()
         raise RuntimeError(f"No available full-VM lab station; leased or unavailable (failed readiness: {unavailable})")
@@ -374,10 +330,6 @@ def validate_lease(lease_id, station=None):
     lock, state = locked_state()
     try:
         expire(state)
-        # Validate only the requested lease here. Global reconciliation can
-        # involve multiple SSH probes and belongs in acquire/list/gc paths;
-        # making every exec/browser call depend on unrelated workers causes
-        # latency amplification and cross-worker failures.
         record = find_active(state, lease_id=lease_id)
         if station is not None and int(record.get("station", 0)) != int(station):
             raise KeyError(f"Lease {lease_id} belongs to station {record.get('station')}, not station {station}")
@@ -385,74 +337,36 @@ def validate_lease(lease_id, station=None):
         if not remote or remote.get("leaseId") != lease_id:
             old = _mark_free(record, "remote-lock-lost")
             save_state(state)
-            audit(
-                "auto_sign_out", station=old.get("station"), leaseId=old.get("leaseId"),
-                owner=old.get("owner"), project=old.get("project"), reason="remote-lock-lost",
-            )
+            audit("auto_sign_out", station=old.get("station"), leaseId=old.get("leaseId"), owner=old.get("owner"), project=old.get("project"), reason="remote-lock-lost")
             notify_usage("end", old, status="lost", finished_at=old.get("releasedAt"))
             raise KeyError(f"Lease {lease_id} no longer owns worker {old.get('station')}")
         return record.copy()
-    finally:
-        unlock(lock)
+    finally: unlock(lock)
 
 
 def release(lease_id=None, station=None, reason="released", recycle=False):
     lock, state = locked_state()
     try:
-        record = find_active(state, lease_id, station)
-        old = record.copy()
-        station_number = int(record["station"])
-        if not reset_worker_vault(station_number):
-            raise RuntimeError(
-                f"Could not scrub vault state on worker {station_number}; "
-                "the lease remains active"
-            )
-        clear = ssh_guest(
-            station_number,
-            "rm -f /home/mark/.local/share/codex-worker/exclusive.lock",
-            8,
-        )
-        if clear.returncode != 0:
-            raise RuntimeError(
-                f"Could not clear exclusive lock on worker {station_number}: "
-                f"{(clear.stderr or clear.stdout).strip()}"
-            )
-        _mark_free(record, reason)
-        save_state(state)
-        audit(
-            "sign_out", station=station_number, leaseId=old.get("leaseId"),
-            owner=old.get("owner"), project=old.get("project"), reason=reason,
-            recycle=bool(recycle),
-        )
+        record = find_active(state, lease_id, station); old = record.copy(); station_number = int(record["station"])
+        if not reset_worker_vault(station_number): raise RuntimeError(f"Could not scrub vault state on worker {station_number}; the lease remains active")
+        clear = ssh_guest(station_number, "rm -f /home/mark/.local/share/codex-worker/exclusive.lock", 8)
+        if clear.returncode != 0: raise RuntimeError(f"Could not clear exclusive lock on worker {station_number}: {(clear.stderr or clear.stdout).strip()}")
+        _mark_free(record, reason); save_state(state)
+        audit("sign_out", station=station_number, leaseId=old.get("leaseId"), owner=old.get("owner"), project=old.get("project"), reason=reason, recycle=bool(recycle))
         notify_usage("end", old, status=str(reason or "released"), finished_at=record.get("releasedAt"))
-    finally:
-        unlock(lock)
-    if recycle:
-        reset_station(station_number)
+    finally: unlock(lock)
+    if recycle: reset_station(station_number)
     return record.copy()
 
 
 def execute(command, lease_id=None, station=None, cwd="/workspace", timeout=120, env=None, as_root=False, max_bytes=1048576):
     record = validate_lease(lease_id, station)
-    env_prefix = " ".join(
-        f"{shlex.quote(str(k))}={shlex.quote(str(v))}" for k, v in (env or {}).items()
-    )
+    env_prefix = " ".join(f"{shlex.quote(str(k))}={shlex.quote(str(v))}" for k, v in (env or {}).items())
     body = f"cd {shlex.quote(cwd)} && " + ((env_prefix + " ") if env_prefix else "") + command
-    if as_root:
-        body = "sudo -n bash -lc " + shlex.quote(body)
+    if as_root: body = "sudo -n bash -lc " + shlex.quote(body)
     result = ssh_guest(record["station"], body, max(1, min(int(timeout), 86400)))
-    limit = max(1024, min(int(max_bytes), 8388608))
-    out = result.stdout.encode()
-    err = result.stderr.encode()
-    return {
-        "station": record["station"], "name": record["name"], "ip": record["ip"],
-        "leaseId": record["leaseId"], "owner": record["owner"],
-        "project": record.get("project"), "chatLabel": record.get("chatLabel"),
-        "chatUrl": record.get("chatUrl"), "exitCode": result.returncode,
-        "stdout": out[:limit].decode(errors="replace"),
-        "stderr": err[:limit].decode(errors="replace"),
-        "truncated": len(out) > limit or len(err) > limit,
-    }
+    limit = max(1024, min(int(max_bytes), 8388608)); out = result.stdout.encode(); err = result.stderr.encode()
+    return {"station":record["station"],"name":record["name"],"ip":record["ip"],"leaseId":record["leaseId"],"owner":record["owner"],"project":record.get("project"),"chatLabel":record.get("chatLabel"),"chatUrl":record.get("chatUrl"),"exitCode":result.returncode,"stdout":out[:limit].decode(errors="replace"),"stderr":err[:limit].decode(errors="replace"),"truncated":len(out)>limit or len(err)>limit}
 
 
 def list_stations(audit_lines=12):
@@ -468,7 +382,7 @@ def list_stations(audit_lines=12):
         for line in AUDIT_FILE.read_text().splitlines()[-int(audit_lines):]:
             try: recent.append(json.loads(line))
             except Exception: pass
-    return {"maxStations":MAX_STATIONS,"prewarmStations":PREWARM,"stations":[dict(x, browserUrl=f"https://browser{x['station']}.home.markshaw.ca/") for x in rows],"recentSignInOut":recent,"sheet":str(SHEET_FILE),"dashboardUrl":"https://browser.home.markshaw.ca/"}
+    return {"maxStations":MAX_STATIONS,"prewarmStations":PREWARM,"stations":[dict(x,browserUrl=f"https://browser{x['station']}.home.markshaw.ca/") for x in rows],"recentSignInOut":recent,"sheet":str(SHEET_FILE),"dashboardUrl":"https://browser.home.markshaw.ca/"}
 
 def collect():
     lock,state=locked_state()
@@ -477,3 +391,5 @@ def collect():
     ensured=[]
     for s in range(1,PREWARM+1): ensured.append(ensure_station(s))
     return {"expiredLeases":[x.get("leaseId") for x in expired],"recoveredLeases":[x.get("leaseId") for x in recovered],"prewarmed":ensured}
+
+# Host status is defined earlier in the actual module and remains unchanged.

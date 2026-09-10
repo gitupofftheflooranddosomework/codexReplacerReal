@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import importlib.util
+import json
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -22,6 +24,39 @@ def lease(station=3, lease_id='wanted'):
 class DummyLock:
     def close(self):
         pass
+
+
+class StateMirrorTests(unittest.TestCase):
+    def test_mirror_state_to_home_sends_exact_json_over_ssh(self):
+        state = {'version': 1, 'stations': {'4': lease(4, 'lease-4')}}
+        completed = subprocess.CompletedProcess([], 0, '', '')
+        with mock.patch.object(m.subprocess, 'run', return_value=completed) as run:
+            m.mirror_state_to_home(state)
+        kwargs = run.call_args.kwargs
+        self.assertEqual(json.loads(kwargs['input']), state)
+        self.assertTrue(kwargs['text'])
+        self.assertIn(m.HOME_SERVER, run.call_args.args[0])
+        self.assertIn(m.HOME_STATE_MIRROR, run.call_args.args[0][-1])
+        self.assertIn('chmod 600', run.call_args.args[0][-1])
+
+    def test_mirror_state_to_home_failure_raises(self):
+        failed = subprocess.CompletedProcess([], 23, '', 'mirror denied')
+        with mock.patch.object(m.subprocess, 'run', return_value=failed):
+            with self.assertRaisesRegex(RuntimeError, 'mirror denied'):
+                m.mirror_state_to_home({'version': 1, 'stations': {}})
+
+    def test_save_state_updates_local_state_then_requires_mirror(self):
+        state = {'version': 1, 'stations': {'4': lease(4, 'lease-4')}}
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(m, 'ROOT', Path(td)), \
+             mock.patch.object(m, 'STATE_FILE', Path(td) / 'state.json'), \
+             mock.patch.object(m, 'SHEET_FILE', Path(td) / 'SIGN-IN-OUT.md'), \
+             mock.patch.object(m, 'mirror_state_to_home') as mirror:
+            m.save_state(state)
+            saved = json.loads((Path(td) / 'state.json').read_text())
+            self.assertEqual(saved['stations']['4']['leaseId'], 'lease-4')
+            self.assertEqual(saved['stations']['4']['owner'], 'test')
+            mirror.assert_called_once_with(state)
 
 
 class LeaseValidationTests(unittest.TestCase):
