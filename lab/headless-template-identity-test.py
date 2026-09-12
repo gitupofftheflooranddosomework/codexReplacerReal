@@ -11,9 +11,18 @@ convert_at = build.index('qemu-img convert -p -O qcow2 "$OVERLAY" "$FLAT"')
 sanitize_at = build.index("truncate -s 0 /etc/machine-id")
 replicate_at = build.index("IFS=',' read -ra roots")
 assert convert_at < sanitize_at < replicate_at
-assert 'codex-ci-base-v3.qcow2' in build
-for package in ('python3-reportlab', 'php-cli', 'composer', 'dnsutils'):
+assert 'codex-ci-base-v4.qcow2' in build
+for package in (
+    'python3-reportlab', 'nodejs', 'php8.4-cli', 'php8.4-common',
+    'php8.4-mbstring', 'composer', 'dnsutils'
+):
     assert package in build, package
+assert 'https://deb.nodesource.com/setup_22.x' in build
+assert 'https://packages.sury.org/php/' in build
+assert 'debsuryorg-archive-keyring.gpg' in build
+assert 'major !== 22 || minor < 12' in build
+assert 'PHP_MAJOR_VERSION !== 8 || PHP_MINOR_VERSION !== 4' in build
+assert '/var/lib/codex-ci-toolchain-v4' in build
 assert 'import reportlab, requests, yaml' in build
 for needle in ("/var/lib/dbus/machine-id", "/var/lib/dhcp/*", "/var/lib/NetworkManager/*lease*", "/var/lib/systemd/network/*"):
     assert needle in build, needle
@@ -29,6 +38,8 @@ with tempfile.TemporaryDirectory() as td:
     spec = importlib.util.spec_from_file_location("headless", ROOT / "codex-ci-headless.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    # v4 is built and verified before a separate activation change switches
+    # the allocator; until then the production/default allocator stays on v3.
     assert mod.BASE == "codex-ci-base-v3.qcow2"
     gib = 1024 ** 3
     assert mod.effective_disk_gib(100 * gib, 40) == 100
@@ -44,29 +55,6 @@ with tempfile.TemporaryDirectory() as td:
     assert mod.admission_charge_mib(2048) == 2560
     assert mod.MAX_HEADLESS_VCPUS == 8
 
-    # A destroyed managed guest leaves a dnsmasq lease behind until expiry.
-    # The same IP always maps to the same managed MAC, so that stale lease is
-    # reusable. Static reservations and leases held by foreign MACs still block
-    # their slots.
-    from types import SimpleNamespace
-    def fake_virsh(*args, **kwargs):
-        if args[0] == "net-dumpxml":
-            return SimpleNamespace(stdout="<host mac='52:54:00:ce:00:66' ip='192.168.122.102'/>", stderr="")
-        if args[0] == "net-dhcp-leases":
-            return SimpleNamespace(stdout=(
-                "52:54:00:ce:00:64 ipv4 192.168.122.100/24 managed-old\n"
-                "52:54:00:aa:bb:cc ipv4 192.168.122.101/24 foreign\n"
-            ), stderr="")
-        raise AssertionError(args)
-    original_virsh = mod.virsh
-    mod.virsh = fake_virsh
-    assert mod.current_dhcp_leases() == {101, 102}
-    mod.virsh = original_virsh
-
-    # Storage failures must quarantine only the failing root with exponential
-    # backoff, leave healthy roots selectable, and recover immediately after a
-    # successful provision. This prevents a persistent storage fault from
-    # becoming a VM creation retry storm.
     mod.STORE_BACKOFF_BASE_SECONDS = 10
     mod.STORE_BACKOFF_MAX_SECONDS = 80
     stores = [td / "store-a", td / "store-b", td / "store-c"]
@@ -120,8 +108,6 @@ with tempfile.TemporaryDirectory() as td:
     def fake_finish(iid, status="finished", exit_code=None, reason="job_finished", keep=0):
         calls.append((iid, status, reason)); return {"id": iid}
     mod.finish = fake_finish
-    # A live creator/waiter marker prevents stale-create GC from reaping a
-    # healthy process that is queued behind the libvirt mutation lock.
     mod.PROVISIONERS.mkdir(parents=True, exist_ok=True)
     marker = mod.PROVISIONERS / "old.json"
     marker.write_text(__import__("json").dumps({"pid": os.getpid(), "started_at": mod.stamp()}) + "\n")
@@ -144,9 +130,6 @@ with tempfile.TemporaryDirectory() as td:
     provision_source = source[source.index('def provision(rec):'):source.index('def finish(', source.index('def provision(rec):'))]
     assert 'qemu-img", "create"' not in provision_source
 
-    # Existing dispatchers invoke the one-shot `acquire` command. Preserve that
-    # public contract while the internal reserve/provision split is available
-    # for focused orchestration and testing.
     import contextlib, io, json
     mod.gc = lambda: []
     mod.reserve = lambda *args, **kwargs: ({

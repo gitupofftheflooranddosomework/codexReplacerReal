@@ -4,7 +4,7 @@ set -euo pipefail
 URI=${CODEX_CI_LIBVIRT_URI:-qemu:///system}
 NETWORK=${CODEX_CI_NETWORK:-default}
 SOURCE=${CODEX_CI_BASE_SOURCE:-/tank/vm/codex-lab-v2/codex-lab-base-browser-v2.qcow2}
-OUT_NAME=${CODEX_CI_HEADLESS_BASE:-codex-ci-base-v3.qcow2}
+OUT_NAME=${CODEX_CI_HEADLESS_BASE:-codex-ci-base-v4.qcow2}
 STORES=${CODEX_CI_HEADLESS_STORAGE_ROOTS:-/tank/vm/codex-ci-headless,/tank2/vm/codex-ci-headless,/tank3/vm/codex-ci-headless}
 RPC=${CODEX_CI_WORKER_RPC:-/home/mark/.local/share/codex-ci/codex-ci-worker-rpc.py}
 CI_PUB=${CODEX_CI_PUBLIC_KEY:-/home/mark/.local/share/codex-ci/ssh/id_ed25519_codex_ci.pub}
@@ -53,7 +53,47 @@ p=pathlib.Path.home()/'.ssh/authorized_keys'; p.touch(mode=0o600,exist_ok=True)
 rows=[x for x in p.read_text().splitlines() if blob not in x]; rows.append(line)
 p.write_text('\n'.join(rows)+'\n'); p.chmod(0o600)
 PY
-ssh_admin 'set -e; sudo -n env DEBIAN_FRONTEND=noninteractive apt-get update -qq; sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3 python3-dev python3-venv python3-pip python3-setuptools python3-wheel python3-reportlab python3-pytest python3-requests python3-yaml php-cli php-common php-curl php-mbstring php-xml php-zip php-intl php-sqlite3 php-mysql php-pgsql composer dnsutils; sudo -n apt-get clean; sudo -n rm -rf /var/lib/apt/lists/*; sudo -n touch /var/lib/codex-ci-toolchain-v3; command -v php composer dig >/dev/null; php -r '\''echo "php_runtime_ok\n";'\''; python3 -c '\''import reportlab, requests, yaml; print("python_runtime_ok")'\'''
+
+# The DotMoose CI contract requires Node 22.x (>=22.12) and PHP 8.4. Debian
+# bookworm does not provide PHP 8.4 natively, and the browser source image can
+# carry a newer Node major. Configure signed upstream package sources in the
+# disposable builder, install the exact supported majors, and fail the image
+# build unless the active runtimes match the contract.
+ssh_admin 'bash -s' <<'BUILDER_BOOTSTRAP'
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+sudo -n apt-get update -qq
+sudo -n apt-get install -y --no-install-recommends ca-certificates curl gnupg
+
+curl -fsSL https://deb.nodesource.com/setup_22.x -o /tmp/nodesource_setup.sh
+sudo -n -E bash /tmp/nodesource_setup.sh
+
+curl -fsSL https://packages.sury.org/debsuryorg-archive-keyring.deb -o /tmp/debsuryorg-archive-keyring.deb
+sudo -n dpkg -i /tmp/debsuryorg-archive-keyring.deb
+printf '%s\n' 'deb [signed-by=/usr/share/keyrings/debsuryorg-archive-keyring.gpg] https://packages.sury.org/php/ bookworm main' \
+  | sudo -n tee /etc/apt/sources.list.d/php-sury.list >/dev/null
+sudo -n apt-get update -qq
+
+sudo -n apt-get install -y --allow-downgrades --no-install-recommends \
+  nodejs \
+  python3 python3-dev python3-venv python3-pip python3-setuptools python3-wheel \
+  python3-reportlab python3-pytest python3-requests python3-yaml \
+  php8.4-cli php8.4-common php8.4-curl php8.4-mbstring php8.4-xml php8.4-zip \
+  php8.4-intl php8.4-sqlite3 php8.4-mysql php8.4-pgsql \
+  composer dnsutils
+
+sudo -n update-alternatives --set php /usr/bin/php8.4
+node -e 'const [major, minor] = process.versions.node.split(".").map(Number); if (major !== 22 || minor < 12) process.exit(1)'
+php -r 'if (PHP_MAJOR_VERSION !== 8 || PHP_MINOR_VERSION !== 4) { fwrite(STDERR, PHP_VERSION."\n"); exit(1); } echo "php84_runtime_ok\n";'
+command -v composer dig >/dev/null
+python3 -c 'import reportlab, requests, yaml; print("python_runtime_ok")'
+
+sudo -n touch /var/lib/codex-ci-toolchain-v4
+sudo -n apt-get clean
+sudo -n rm -rf /var/lib/apt/lists/*
+rm -f /tmp/nodesource_setup.sh /tmp/debsuryorg-archive-keyring.deb
+BUILDER_BOOTSTRAP
+
 ssh_admin 'mkdir -p ~/.local/share/codex-ci; : > ~/.local/share/codex-ci/headless-v1; rm -f ~/.local/share/codex-worker/claim.lock ~/.local/share/codex-worker/exclusive.lock ~/.local/share/codex-worker/scheduler.lock; rm -rf /workspace/ci-dispatch/* 2>/dev/null || true; rm -f ~/.config/systemd/user/default.target.wants/codex-worker-desktop.service; systemctl --user disable --now codex-worker-desktop.service >/dev/null 2>&1 || true; pkill -f "chromium.*remote-debugging-port=9222" >/dev/null 2>&1 || true; pkill -f "Xvfb|x11vnc|websockify" >/dev/null 2>&1 || true; sync' || true
 virsh --connect "$URI" shutdown "$BUILDER" >/dev/null || true
 for _ in $(seq 1 60); do state=$(virsh --connect "$URI" domstate "$BUILDER" 2>/dev/null || true); [[ $state != running ]] && break; sleep 1; done
