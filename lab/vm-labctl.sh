@@ -14,14 +14,17 @@ VCPUS=${CODEX_LAB_VM_VCPUS:-4}
 DISK_GIB=${CODEX_LAB_VM_DISK_GIB:-100}
 MAX_STATIONS=${CODEX_LAB_VM_MAX_STATIONS:-9}
 PREWARM=${CODEX_LAB_VM_PREWARM:-9}
+SSH_READY_SECONDS=${CODEX_LAB_VM_SSH_READY_SECONDS:-180}
 ADMIN_KEY=${CODEX_LAB_ADMIN_KEY:-/home/mark/.ssh/id_ed25519_codex_lab_vm}
 ADMIN_KNOWN=${CODEX_LAB_ADMIN_KNOWN_HOSTS:-/home/mark/.ssh/codex_lab_scheduler_known_hosts}
 
 authorize_controller() {
   encoded=$(printf '%s' "$pubkey" | base64 -w0)
-  timeout 15 ssh -i "$ADMIN_KEY" -o IdentitiesOnly=yes -o BatchMode=yes \
-    -o ConnectTimeout=5 -o "UserKnownHostsFile=$ADMIN_KNOWN" -o StrictHostKeyChecking=accept-new \
-    "mark@$IP" python3 - "$encoded" <<'PY'
+  deadline=$(( $(date +%s) + SSH_READY_SECONDS ))
+  while :; do
+    if timeout 10 ssh -i "$ADMIN_KEY" -o IdentitiesOnly=yes -o BatchMode=yes \
+      -o ConnectTimeout=5 -o "UserKnownHostsFile=$ADMIN_KNOWN" -o StrictHostKeyChecking=accept-new \
+      "mark@$IP" python3 - "$encoded" <<'PY'
 import base64, pathlib, sys
 key = base64.b64decode(sys.argv[1]).decode().strip()
 parts = key.split()
@@ -34,6 +37,16 @@ if not any(parts[1] in line.split() for line in content.splitlines()):
         output.write('\n' + key + '\n')
     p.chmod(0o600)
 PY
+    then
+      return 0
+    fi
+    now=$(date +%s)
+    if [ "$now" -ge "$deadline" ]; then
+      echo "$NAME at $IP did not become SSH-ready within ${SSH_READY_SECONDS}s" >&2
+      return 1
+    fi
+    sleep 2
+  done
 }
 
 station_values() {
@@ -99,7 +112,9 @@ create_station() {
   fi
   if [ "$n" -le "$PREWARM" ]; then virsh --connect "$CONNECT" autostart "$NAME" >/dev/null; fi
   # Rebuilt images contain the host administrator key, but may predate the
-  # current broker key. The ensure contract must actually install its key.
+  # current broker key. Wait for a fresh clone to finish booting before
+  # installing the controller key rather than treating first-boot latency as
+  # provisioning failure.
   authorize_controller
   printf '%s\t%s\t%s\n' "$NAME" "$IP" "$(virsh --connect "$CONNECT" domstate "$NAME" | tr -d '\r')"
 }
