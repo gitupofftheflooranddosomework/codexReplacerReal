@@ -62,8 +62,8 @@ PY
 ssh_admin 'bash -s' <<'BUILDER_BOOTSTRAP'
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
-sudo -n apt-get update -qq
-sudo -n apt-get install -y --no-install-recommends ca-certificates curl gnupg
+sudo -n apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true update -qq
+sudo -n apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true install -y --no-install-recommends ca-certificates curl gnupg
 
 curl -fsSL https://deb.nodesource.com/setup_22.x -o /tmp/nodesource_setup.sh
 sudo -n -E bash /tmp/nodesource_setup.sh
@@ -72,9 +72,9 @@ curl -fsSL https://packages.sury.org/debsuryorg-archive-keyring.deb -o /tmp/debs
 sudo -n dpkg -i /tmp/debsuryorg-archive-keyring.deb
 printf '%s\n' 'deb [signed-by=/usr/share/keyrings/debsuryorg-archive-keyring.gpg] https://packages.sury.org/php/ bookworm main' \
   | sudo -n tee /etc/apt/sources.list.d/php-sury.list >/dev/null
-sudo -n apt-get update -qq
+sudo -n apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true update -qq
 
-sudo -n apt-get install -y --allow-downgrades --no-install-recommends \
+sudo -n apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true install -y --allow-downgrades --no-install-recommends \
   nodejs \
   python3 python3-dev python3-venv python3-pip python3-setuptools python3-wheel \
   python3-reportlab python3-pytest python3-requests python3-yaml \

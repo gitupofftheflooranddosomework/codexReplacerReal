@@ -23,6 +23,8 @@ assert 'debsuryorg-archive-keyring.gpg' in build
 assert 'major !== 22 || minor < 12' in build
 assert 'PHP_MAJOR_VERSION !== 8 || PHP_MINOR_VERSION !== 4' in build
 assert '/var/lib/codex-ci-toolchain-v4' in build
+assert 'Acquire::Retries=5' in build
+assert 'Acquire::ForceIPv4=true' in build
 assert 'import reportlab, requests, yaml' in build
 for needle in ("/var/lib/dbus/machine-id", "/var/lib/dhcp/*", "/var/lib/NetworkManager/*lease*", "/var/lib/systemd/network/*"):
     assert needle in build, needle
