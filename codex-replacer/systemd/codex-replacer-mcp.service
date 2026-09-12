@@ -19,11 +19,11 @@ Environment=CODEX_VAULT_ORGANIZATION_ID=3e3b3667-0137-43d6-b297-bb7abc6fb202
 Environment=CODEX_VAULT_BW_CONFIG_DIR=/home/mark/.config/codex-replacer/bitwarden-dotmoose
 Environment=CODEX_VAULT_SESSION_FILE=/home/mark/.config/codex-replacer/dotmoose-vault.session
 Environment=CODEX_VAULT_SYNC_SECONDS=60
-Environment=CODEX_LAB_MAX_STATIONS=6
+Environment=CODEX_LAB_MAX_STATIONS=9
 Environment=CODEX_LAB_PREWARM_STATIONS=0
 Environment=CODEX_LAB_ROOT=/tank/codex-lab
-Environment=CODEX_VM_LAB_MAX_STATIONS=6
-Environment=CODEX_VM_LAB_PREWARM=6
+Environment=CODEX_VM_LAB_MAX_STATIONS=9
+Environment=CODEX_VM_LAB_PREWARM=9
 Environment=CODEX_VM_LAB_ROOT=/tank/codex-lab-vm
 Environment=CODEX_VM_LAB_HOST=home-server
 Environment=CODEX_VM_LAB_HOME_KEY=/home/mark/.ssh/id_ed25519_home_server
