@@ -65,6 +65,15 @@ export DEBIAN_FRONTEND=noninteractive
 sudo -n apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true update -qq
 sudo -n apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true install -y --no-install-recommends ca-certificates curl gnupg
 
+# The browser source image may carry Node from a newer NodeSource channel or a
+# manual /usr/local install. Remove both forms before configuring 22.x so the
+# active `node` binary cannot be shadowed by an inherited Node 24 installation.
+sudo -n apt-get remove -y nodejs || true
+sudo -n rm -f /usr/local/bin/node /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack
+sudo -n rm -rf /usr/local/lib/node_modules
+sudo -n rm -f /etc/apt/sources.list.d/nodesource.list /etc/apt/sources.list.d/nodesource.sources
+sudo -n rm -f /etc/apt/keyrings/nodesource.gpg /usr/share/keyrings/nodesource.gpg 2>/dev/null || true
+hash -r
 curl -fsSL https://deb.nodesource.com/setup_22.x -o /tmp/nodesource_setup.sh
 sudo -n -E bash /tmp/nodesource_setup.sh
 
@@ -83,6 +92,10 @@ sudo -n apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true install -y --al
   composer dnsutils
 
 sudo -n update-alternatives --set php /usr/bin/php8.4
+printf 'node_path=%s\n' "$(command -v node)"
+printf 'node_version=%s\n' "$(node --version)"
+printf 'node_pkg=%s\n' "$(dpkg-query -W -f='${Version}' nodejs 2>/dev/null || echo missing)"
+test "$(readlink -f "$(command -v node)")" = /usr/bin/node
 node -e 'const [major, minor] = process.versions.node.split(".").map(Number); if (major !== 22 || minor < 12) process.exit(1)'
 php -r 'if (PHP_MAJOR_VERSION !== 8 || PHP_MINOR_VERSION !== 4) { fwrite(STDERR, PHP_VERSION."\n"); exit(1); } echo "php84_runtime_ok\n";'
 command -v composer dig >/dev/null

@@ -18,6 +18,11 @@ for package in (
 ):
     assert package in build, package
 assert 'https://deb.nodesource.com/setup_22.x' in build
+assert 'apt-get remove -y nodejs' in build
+assert '/usr/local/bin/node' in build
+assert '/usr/local/lib/node_modules' in build
+assert 'test "$(readlink -f "$(command -v node)")" = /usr/bin/node' in build
+assert 'node_version=' in build
 assert 'https://packages.sury.org/php/' in build
 assert 'debsuryorg-archive-keyring.gpg' in build
 assert 'major !== 22 || minor < 12' in build
