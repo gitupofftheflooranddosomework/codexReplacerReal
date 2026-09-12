@@ -49,6 +49,7 @@ def resources(job_class: str) -> tuple[int, int, int]:
         "test": (2048, 4096, 2),
         "build": (3072, 5120, 2),
         "browser": (2048, 4096, 2),
+        "heavy": (4096, 8192, 4),
     }
     return table.get(str(job_class or "cpu"), table["cpu"])
 
@@ -98,6 +99,14 @@ def main() -> int:
     if cwd != ".":
         command = f"cd {shlex.quote(cwd)} && {command}"
     memory_mib, max_memory_mib, vcpus = resources(str(payload.get("jobClass") or "cpu"))
+    # Explicit requests override the class defaults but remain positive and are still
+    # subject to aggregate admission control in codex-ci-headless.
+    if payload.get("memoryMiB") is not None:
+        memory_mib = max(768, int(payload["memoryMiB"]))
+    if payload.get("maxMemoryMiB") is not None:
+        max_memory_mib = max(memory_mib, int(payload["maxMemoryMiB"]))
+    if payload.get("vcpus") is not None:
+        vcpus = max(1, int(payload["vcpus"]))
     argv = [
         DISPATCH,
         "--owner", str(payload["owner"]),

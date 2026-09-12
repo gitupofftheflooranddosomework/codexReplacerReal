@@ -16,6 +16,9 @@ handle @codexbrowser {
         handle_path /vm4/* { reverse_proxy http://192.168.122.233:6080 }
         handle_path /vm5/* { reverse_proxy http://192.168.122.234:6080 }
         handle_path /vm6/* { reverse_proxy http://192.168.122.235:6080 }
+        handle_path /vm7/* { reverse_proxy http://192.168.122.236:6080 }
+        handle_path /vm8/* { reverse_proxy http://192.168.122.237:6080 }
+        handle_path /vm9/* { reverse_proxy http://192.168.122.238:6080 }
         handle_path /controller/* { reverse_proxy http://192.168.122.225:6080 }
         handle { reverse_proxy http://192.168.122.1:8766 }
     }
@@ -32,5 +35,12 @@ handle @codexbrowser4 { redir "https://browser.home.markshaw.ca/vm4/vnc.html?aut
 handle @codexbrowser5 { redir "https://browser.home.markshaw.ca/vm5/vnc.html?autoconnect=1&resize=scale&path=vm5/websockify" 302 }
 @codexbrowser6 host browser6.home.markshaw.ca
 handle @codexbrowser6 { redir "https://browser.home.markshaw.ca/vm6/vnc.html?autoconnect=1&resize=scale&path=vm6/websockify" 302 }
+
+@codexbrowser7 host browser7.home.markshaw.ca
+handle @codexbrowser7 { redir "https://browser.home.markshaw.ca/vm7/vnc.html?autoconnect=1&resize=scale&path=vm7/websockify" 302 }
+@codexbrowser8 host browser8.home.markshaw.ca
+handle @codexbrowser8 { redir "https://browser.home.markshaw.ca/vm8/vnc.html?autoconnect=1&resize=scale&path=vm8/websockify" 302 }
+@codexbrowser9 host browser9.home.markshaw.ca
+handle @codexbrowser9 { redir "https://browser.home.markshaw.ca/vm9/vnc.html?autoconnect=1&resize=scale&path=vm9/websockify" 302 }
 @codexbrowsercontroller host browser-controller.home.markshaw.ca
 handle @codexbrowsercontroller { redir "https://browser.home.markshaw.ca/controller/vnc.html?autoconnect=1&resize=scale&path=controller/websockify" 302 }
