@@ -1,8 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y --no-install-recommends \
+apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true update -qq
+apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true install -y --no-install-recommends \
   build-essential cmake ninja-build pkg-config clang gdb \
   git git-lfs curl wget ca-certificates gnupg jq ripgrep fd-find \
   python3 python3-dev python3-venv python3-pip pipx \
