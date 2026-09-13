@@ -58,7 +58,7 @@ TRUSTED_CLIENTS = {
     ).split(",")
     if value.strip()
 }
-MAX_STATIONS = max(1, min(int(os.environ.get("CODEX_LAB_VM_MAX_STATIONS", "6")), 8))
+MAX_STATIONS = max(1, min(int(os.environ.get("CODEX_LAB_VM_MAX_STATIONS", "6")), 9))
 GUEST_KEY = os.environ.get("CODEX_LAB_GUEST_KEY", "/home/mark/.ssh/id_ed25519_codex_lab_vm")
 KNOWN_HOSTS = os.environ.get("CODEX_LAB_SCHEDULER_KNOWN_HOSTS", "/home/mark/.ssh/codex_lab_scheduler_known_hosts")
 WORK_ROOT = os.environ.get("CODEX_LAB_WORK_ROOT", "/workspace/codex-jobs")
