@@ -679,6 +679,14 @@ def destroy_resources(rec):
 def provision(rec):
     store = pathlib.Path(rec["storage_root"])
     base = store / BASE
+    os.chmod(store, 0o711)
+    try:
+        os.chmod(base, 0o644)
+    except PermissionError:
+        # Migrated base images may retain libvirt-qemu ownership. They are
+        # already readable, so ownership alone must not block provisioning.
+        if (base.stat().st_mode & 0o044) == 0:
+            raise
     root = store / rec["name"]
     disk = root / f"{rec['name']}.qcow2"
     retry = store_retry_seconds(store)
@@ -718,7 +726,7 @@ def provision(rec):
                          "--disk", (f"path={disk},size={effective_gib},format=qcow2,"
                                     f"backing_store={base},backing_format=qcow2,bus=virtio,sparse=yes"),
                          "--network", f"network={NETWORK},model=virtio,mac={rec['mac']}",
-                         "--os-variant", "debian11", "--graphics", "none", "--noautoconsole", "--import"], timeout=90)
+                         "--os-variant", "debian11", "--check", "disk_size=off", "--graphics", "none", "--noautoconsole", "--import"], timeout=90)
                 except Exception:
                     # Undo the reservation before another creator enters the lock.
                     del_dhcp(rec)

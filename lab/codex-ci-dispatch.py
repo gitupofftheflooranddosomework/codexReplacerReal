@@ -11,6 +11,7 @@ import base64
 import json
 import os
 import pathlib
+import shlex
 import signal
 import subprocess
 import sys
@@ -21,6 +22,7 @@ MANAGER=os.environ.get("CODEX_CI_HEADLESS_MANAGER","/home/mark/.local/bin/codex-
 SSH_USER=os.environ.get("CODEX_CI_SSH_USER","mark")
 SSH_KEY=os.environ.get("CODEX_CI_SSH_KEY","/home/mark/.local/share/codex-ci/ssh/id_ed25519_codex_ci")
 KNOWN_HOSTS=os.environ.get("CODEX_CI_KNOWN_HOSTS","/home/mark/.local/share/codex-ci/ssh/known_hosts")
+REMOTE_RPC=os.environ.get("CODEX_CI_REMOTE_RPC","/home/mark/.local/bin/codex-ci-worker-rpc.py")
 
 
 def enc(value): return base64.urlsafe_b64encode(value.encode()).rstrip(b"=").decode()
@@ -44,10 +46,15 @@ def ssh_capture(rec,cmd,input_bytes=None,timeout=30):
     return subprocess.run([*ssh_base(rec),cmd],input=input_bytes,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout,check=False)
 
 
+def rpc(command):
+    """Invoke the forced-command worker endpoint through the migrated admin key."""
+    return f"env SSH_ORIGINAL_COMMAND={shlex.quote(command)} {shlex.quote(REMOTE_RPC)}"
+
+
 def wait_ready(rec,seconds=180):
     deadline=time.monotonic()+seconds; last=""
     while time.monotonic()<deadline:
-        try: cp=ssh_capture(rec,"codex-ci probe",timeout=8)
+        try: cp=ssh_capture(rec,rpc("codex-ci probe"),timeout=8)
         except subprocess.TimeoutExpired: cp=None
         if cp and cp.returncode==0:
             try: payload=json.loads(cp.stdout.decode())
@@ -87,7 +94,7 @@ def validate_workspace(workspace,inputs):
 
 def stream_snapshot(rec,iid,workspace):
     archive=subprocess.Popen(["git","archive","--format=tar","HEAD"],cwd=workspace,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-    remote=subprocess.Popen([*ssh_base(rec),f"codex-ci import {iid}"],stdin=archive.stdout,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    remote=subprocess.Popen([*ssh_base(rec),rpc(f"codex-ci import {iid}")],stdin=archive.stdout,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
     archive.stdout.close(); _,rerr=remote.communicate(timeout=180); aerr=archive.stderr.read(); arc=archive.wait(timeout=10)
     if arc: raise RuntimeError("git archive failed: "+aerr.decode(errors="replace").strip())
     if remote.returncode: raise RuntimeError("worker import failed: "+rerr.decode(errors="replace").strip())
@@ -98,19 +105,19 @@ def push_inputs(rec,iid,workspace,inputs):
         item=safe_path(raw)
         if not (workspace/item).exists(): raise FileNotFoundError(f"input path does not exist: {item}")
         tar=subprocess.Popen(["tar","-cf","-","--",item],cwd=workspace,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-        remote=subprocess.Popen([*ssh_base(rec),f"codex-ci overlay {iid}"],stdin=tar.stdout,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        remote=subprocess.Popen([*ssh_base(rec),rpc(f"codex-ci overlay {iid}")],stdin=tar.stdout,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
         tar.stdout.close(); _,rerr=remote.communicate(timeout=300); terr=tar.stderr.read(); trc=tar.wait(timeout=10)
         if trc: raise RuntimeError("input archive failed: "+terr.decode(errors="replace").strip())
         if remote.returncode: raise RuntimeError("worker overlay failed: "+rerr.decode(errors="replace").strip())
 
 
 def cancel(rec,iid):
-    try: ssh_capture(rec,f"codex-ci cancel {iid}",timeout=15)
+    try: ssh_capture(rec,rpc(f"codex-ci cancel {iid}"),timeout=15)
     except Exception: pass
 
 
 def run_command(rec,iid,command,timeout,env):
-    original=f"codex-ci exec {iid} {enc(command)} {enc(json.dumps(env,separators=(',',':')))}"
+    original=rpc(f"codex-ci exec {iid} {enc(command)} {enc(json.dumps(env,separators=(',',':')))}")
     proc=subprocess.Popen([*ssh_base(rec),original])
     try: return proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -123,7 +130,7 @@ def run_command(rec,iid,command,timeout,env):
 def pull_artifacts(rec,iid,artifacts,destination):
     if not artifacts: return
     clean=[safe_path(x,allow_git=True) for x in artifacts]; destination.mkdir(parents=True,exist_ok=True)
-    cmd="codex-ci artifact "+iid+" "+" ".join(enc(x) for x in clean)
+    cmd=rpc("codex-ci artifact "+iid+" "+" ".join(enc(x) for x in clean))
     remote=subprocess.Popen([*ssh_base(rec),cmd],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
     extract=subprocess.run(["tar","-xf","-","-C",str(destination)],stdin=remote.stdout,check=False)
     remote.stdout.close(); err=remote.stderr.read(); rc=remote.wait(timeout=300)
@@ -183,7 +190,7 @@ def main():
             manager('provision',rec['id'],timeout=max(180,a.wait_seconds))
         wait_ready(rec); iid=uuid.uuid4().hex
         payload={"leaseId":iid,"owner":a.owner,"project":a.project or None,"source":"github-actions"}
-        cp=ssh_capture(rec,"codex-ci claim "+enc(json.dumps(payload,separators=(",", ":"))),timeout=15)
+        cp=ssh_capture(rec,rpc("codex-ci claim "+enc(json.dumps(payload,separators=(",", ":")))),timeout=15)
         if cp.returncode: raise RuntimeError("headless worker claim failed: "+(cp.stderr or cp.stdout).decode(errors="replace").strip())
         claimed=True
         stream_snapshot(rec,iid,workspace); push_inputs(rec,iid,workspace,a.input)
@@ -206,7 +213,7 @@ def main():
         if rec and iid and claimed:
             if status in ("timed_out","cancelled"): cancel(rec,iid)
             try:
-                release=ssh_capture(rec,f"codex-ci release {iid}",timeout=20)
+                release=ssh_capture(rec,rpc(f"codex-ci release {iid}"),timeout=20)
                 released=release.returncode==0
                 if not released: print('worker release failed; destroying instead of retaining',file=sys.stderr)
             except Exception as exc:
