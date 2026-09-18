@@ -21,6 +21,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
 
+from worker_provider import load_worker_provider
+
 SCHEDULER_VERSION = "2.3.0"
 HOST = os.environ.get("CODEX_LAB_SCHEDULER_HOST", "0.0.0.0")
 PORT = int(os.environ.get("CODEX_LAB_SCHEDULER_PORT", "8766"))
@@ -88,6 +90,7 @@ SCHEDULER_HEALTH = {
 }
 STOP = threading.Event()
 WAKE = threading.Event()
+WORKER_PROVIDER = load_worker_provider()
 
 
 
@@ -288,11 +291,11 @@ def now_iso():
 
 
 def worker_ip(station):
-    return f"192.168.122.{229 + int(station)}"
+    return WORKER_PROVIDER.worker_ip(station)
 
 
 def worker_name(station):
-    return f"codex-lab-vm-{int(station):02d}"
+    return WORKER_PROVIDER.worker_name(station)
 
 
 def browser_url(station):
@@ -407,11 +410,8 @@ def ssh(station, command, timeout=30, input_text=None):
 
 
 def virsh_state(station):
-    try:
-        r = run(["virsh", "-c", "qemu:///system", "domstate", worker_name(station)], timeout=5)
-    except subprocess.TimeoutExpired:
-        return 'unknown'
-    return r.stdout.strip() if r.returncode == 0 else "absent"
+    """Compatibility wrapper retained while callers/tests move to provider naming."""
+    return WORKER_PROVIDER.state(station)
 
 
 def job_row(row):
