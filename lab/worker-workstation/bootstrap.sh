@@ -5,7 +5,7 @@ apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true update -qq
 apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true install -y --no-install-recommends \
   build-essential cmake ninja-build pkg-config clang gdb \
   git git-lfs curl wget ca-certificates gnupg jq ripgrep fd-find \
-  python3 python3-dev python3-venv python3-pip pipx \
+  python3 python3-dev python3-venv python3-pip pipx python3-opencv \
   golang-go rustc cargo default-jdk-headless \
   php-cli composer \
   tmux screen rsync zip unzip p7zip-full shellcheck sqlite3 \
@@ -13,6 +13,7 @@ apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true install -y --no-install
   dnsutils iputils-ping netcat-openbsd lsof strace htop btop tree file less nano vim \
   libssl-dev libffi-dev \
   xterm xfce4-terminal thunar tint2 dbus-x11
+python3 -c 'import cv2; print("opencv_runtime_ok=" + cv2.__version__)'
 systemctl enable --now docker.service >/dev/null 2>&1 || true
 usermod -aG docker,sudo mark
 install -d -o mark -g mark -m 0755 /workspace /home/mark/.config/openbox /home/mark/bin

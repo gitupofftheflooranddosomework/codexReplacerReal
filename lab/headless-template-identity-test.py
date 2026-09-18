@@ -14,7 +14,7 @@ assert convert_at < sanitize_at < replicate_at
 assert 'codex-ci-base-v4.qcow2' in build
 for package in (
     'python3-reportlab', 'nodejs', 'php8.4-cli', 'php8.4-common',
-    'php8.4-mbstring', 'composer', 'dnsutils'
+    'php8.4-mbstring', 'composer', 'dnsutils', 'python3-opencv'
 ):
     assert package in build, package
 assert 'https://deb.nodesource.com/setup_22.x' in build
@@ -30,7 +30,7 @@ assert 'PHP_MAJOR_VERSION !== 8 || PHP_MINOR_VERSION !== 4' in build
 assert '/var/lib/codex-ci-toolchain-v4' in build
 assert 'Acquire::Retries=5' in build
 assert 'Acquire::ForceIPv4=true' in build
-assert 'import reportlab, requests, yaml' in build
+assert 'import cv2, reportlab, requests, yaml' in build
 for needle in ("/var/lib/dbus/machine-id", "/var/lib/dhcp/*", "/var/lib/NetworkManager/*lease*", "/var/lib/systemd/network/*"):
     assert needle in build, needle
 
