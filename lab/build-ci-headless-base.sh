@@ -86,7 +86,7 @@ sudo -n apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true update -qq
 sudo -n apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true install -y --allow-downgrades --no-install-recommends \
   nodejs \
   python3 python3-dev python3-venv python3-pip python3-setuptools python3-wheel \
-  python3-reportlab python3-pytest python3-requests python3-yaml \
+  python3-reportlab python3-pytest python3-requests python3-yaml python3-opencv \
   php8.4-cli php8.4-common php8.4-curl php8.4-mbstring php8.4-xml php8.4-zip \
   php8.4-intl php8.4-sqlite3 php8.4-mysql php8.4-pgsql \
   composer dnsutils
@@ -99,7 +99,7 @@ test "$(readlink -f "$(command -v node)")" = /usr/bin/node
 node -e 'const [major, minor] = process.versions.node.split(".").map(Number); if (major !== 22 || minor < 12) process.exit(1)'
 php -r 'if (PHP_MAJOR_VERSION !== 8 || PHP_MINOR_VERSION !== 4) { fwrite(STDERR, PHP_VERSION."\n"); exit(1); } echo "php84_runtime_ok\n";'
 command -v composer dig >/dev/null
-python3 -c 'import reportlab, requests, yaml; print("python_runtime_ok")'
+python3 -c 'import cv2, reportlab, requests, yaml; print("python_runtime_ok cv2=" + cv2.__version__)'
 
 sudo -n touch /var/lib/codex-ci-toolchain-v4
 sudo -n apt-get clean
