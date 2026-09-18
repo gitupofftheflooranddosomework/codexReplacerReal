@@ -78,11 +78,17 @@ class LibvirtWorkerProvider(WorkerProvider):
         return result.stdout.strip() if result.returncode == 0 else "absent"
 
 
-HttpTransport = Callable[[str, int], dict[str, Any]]
+HttpTransport = Callable[[str, int, str], dict[str, Any]]
 
 
-def default_http_transport(url: str, timeout: int) -> dict[str, Any]:
-    request = urllib.request.Request(url, headers={"Accept": "application/json"})
+def default_http_transport(url: str, timeout: int, bearer_token: str) -> dict[str, Any]:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {bearer_token}",
+        },
+    )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             raw = response.read()
@@ -100,6 +106,7 @@ def default_http_transport(url: str, timeout: int) -> dict[str, Any]:
 @dataclass
 class HttpWorkerProvider(WorkerProvider):
     base_url: str = ""
+    bearer_token: str = ""
     timeout: int = 5
     transport: HttpTransport = default_http_transport
 
@@ -109,6 +116,10 @@ class HttpWorkerProvider(WorkerProvider):
         self.base_url = str(self.base_url).rstrip("/")
         if not self.base_url.startswith(("http://", "https://")):
             raise WorkerProviderError("CODEX_LAB_WORKER_PROVIDER_URL must be http(s)")
+        if len(str(self.bearer_token)) < 24:
+            raise WorkerProviderError(
+                "CODEX_LAB_WORKER_PROVIDER_TOKEN must be at least 24 characters"
+            )
         if self.timeout < 1 or self.timeout > 30:
             raise WorkerProviderError("HTTP worker provider timeout must be 1..30 seconds")
 
@@ -123,6 +134,7 @@ class HttpWorkerProvider(WorkerProvider):
         value = self.transport(
             f"{self.base_url}/v1/workers/{logical_id}",
             self.timeout,
+            self.bearer_token,
         )
         if str(value.get("logicalId") or "") != logical_id:
             raise WorkerProviderError(
@@ -163,12 +175,18 @@ def load_worker_provider(name: str | None = None, *, runner: Runner | None = Non
         return LibvirtWorkerProvider(**kwargs)
     if selected == "http":
         base_url = os.environ.get("CODEX_LAB_WORKER_PROVIDER_URL", "").strip()
+        bearer_token = os.environ.get("CODEX_LAB_WORKER_PROVIDER_TOKEN", "").strip()
         if not base_url:
             raise WorkerProviderError(
                 "CODEX_LAB_WORKER_PROVIDER_URL is required for http provider"
             )
+        if not bearer_token:
+            raise WorkerProviderError(
+                "CODEX_LAB_WORKER_PROVIDER_TOKEN is required for http provider"
+            )
         return HttpWorkerProvider(
             base_url=base_url,
+            bearer_token=bearer_token,
             timeout=int(os.environ.get("CODEX_LAB_WORKER_PROVIDER_TIMEOUT", "5")),
         )
     raise WorkerProviderError(
