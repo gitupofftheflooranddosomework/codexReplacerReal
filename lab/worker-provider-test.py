@@ -60,6 +60,80 @@ class WorkerProviderTests(unittest.TestCase):
         with self.assertRaisesRegex(worker_provider.WorkerProviderError,"unsupported"):
             worker_provider.load_worker_provider("proxmox")
 
+    def test_http_provider_resolves_identity_address_and_state(self):
+        calls=[]
+        def transport(url,timeout):
+            calls.append((url,timeout))
+            return {
+                "logicalId":"station-3",
+                "name":"swf-workstation-03",
+                "address":"10.77.20.43",
+                "state":"running",
+                "provider":"proxmox",
+                "providerId":58213,
+            }
+        provider=worker_provider.HttpWorkerProvider(
+            base_url="http://vm-provider.internal/",
+            timeout=4,
+            transport=transport,
+        )
+        self.assertEqual(provider.worker_name(3),"swf-workstation-03")
+        self.assertEqual(provider.worker_ip(3),"10.77.20.43")
+        self.assertEqual(provider.state(3),"running")
+        self.assertEqual(calls[0],("http://vm-provider.internal/v1/workers/station-3",4))
+
+    def test_http_provider_rejects_identity_mismatch(self):
+        provider=worker_provider.HttpWorkerProvider(
+            base_url="http://provider",
+            transport=lambda *_: {
+                "logicalId":"station-99",
+                "address":"10.0.0.9",
+                "state":"running",
+            },
+        )
+        with self.assertRaisesRegex(worker_provider.WorkerProviderError,"identity mismatch"):
+            provider.worker_ip(1)
+
+    def test_http_provider_rejects_missing_address(self):
+        provider=worker_provider.HttpWorkerProvider(
+            base_url="http://provider",
+            transport=lambda *_: {
+                "logicalId":"station-1",
+                "state":"running",
+            },
+        )
+        with self.assertRaisesRegex(worker_provider.WorkerProviderError,"missing address"):
+            provider.worker_ip(1)
+
+    def test_http_provider_state_degrades_to_unknown_on_failure(self):
+        def fail(*_):
+            raise worker_provider.WorkerProviderError("down")
+        provider=worker_provider.HttpWorkerProvider(
+            base_url="http://provider",
+            transport=fail,
+        )
+        self.assertEqual(provider.state(1),"unknown")
+
+    def test_http_provider_selection_requires_url(self):
+        with patch.dict("os.environ",{"CODEX_LAB_WORKER_PROVIDER":"http"},clear=True):
+            with self.assertRaisesRegex(worker_provider.WorkerProviderError,"PROVIDER_URL"):
+                worker_provider.load_worker_provider()
+
+    def test_http_provider_selection_from_environment(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "CODEX_LAB_WORKER_PROVIDER":"http",
+                "CODEX_LAB_WORKER_PROVIDER_URL":"http://fabric-provider.internal",
+                "CODEX_LAB_WORKER_PROVIDER_TIMEOUT":"7",
+            },
+            clear=True,
+        ):
+            provider=worker_provider.load_worker_provider()
+        self.assertEqual(provider.name,"http")
+        self.assertEqual(provider.base_url,"http://fabric-provider.internal")
+        self.assertEqual(provider.timeout,7)
+
     def test_environment_overrides_legacy_libvirt_parameters(self):
         with patch.dict(
             "os.environ",
