@@ -298,6 +298,19 @@ def worker_name(station):
     return WORKER_PROVIDER.worker_name(station)
 
 
+def worker_endpoint(station):
+    station = int(station)
+    if not 1 <= station <= MAX_STATIONS:
+        raise ValueError(f"station must be 1..{MAX_STATIONS}")
+    return {
+        "station": station,
+        "name": worker_name(station),
+        "ip": worker_ip(station),
+        "state": virsh_state(station),
+        "provider": WORKER_PROVIDER.name,
+    }
+
+
 def browser_url(station):
     station = int(station)
     return f"https://browser.home.markshaw.ca/vm{station}/vnc.html?autoconnect=1&resize=scale&path=vm{station}/websockify"
@@ -1396,6 +1409,14 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_html(dashboard_html(session))
         if not u.path.startswith("/api/") or not self.authorized():
             return self.send_json({"error": "unauthorized"}, 401)
+        if u.path.startswith("/api/workers/"):
+            try:
+                station = int(u.path.rsplit("/", 1)[-1])
+                return self.send_json(worker_endpoint(station))
+            except ValueError as exc:
+                return self.send_json({"error": str(exc)}, 400)
+            except Exception as exc:
+                return self.send_json({"error": str(exc)}, 503)
         if u.path == "/api/workers":
             return self.send_json(state_payload())
         if u.path == "/api/jobs":

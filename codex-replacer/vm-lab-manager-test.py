@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import importlib.util
+import io
+import json
 import subprocess
 import unittest
 from pathlib import Path
@@ -22,6 +24,59 @@ def lease(station=3, lease_id='wanted'):
 class DummyLock:
     def close(self):
         pass
+
+
+
+
+
+class Response:
+    def __init__(self, payload, status=200):
+        self.body=json.dumps(payload).encode()
+        self.status=status
+    def __enter__(self):
+        return self
+    def __exit__(self,*_a):
+        return False
+    def read(self):
+        return self.body
+
+
+class ProviderEndpointTests(unittest.TestCase):
+    def test_libvirt_keeps_legacy_address_formula(self):
+        with mock.patch.object(m, 'WORKER_PROVIDER', 'libvirt'):
+            self.assertEqual(m.worker_ip_for(3), '192.168.122.232')
+
+    def test_external_provider_uses_scheduler_resolved_address(self):
+        calls=[]
+        def open_url(request, timeout):
+            calls.append((request, timeout))
+            return Response({'station':3,'name':'swf-station-03','ip':'10.77.20.33','state':'running','provider':'serverworkerfabric'})
+        with mock.patch.object(m, 'WORKER_PROVIDER', 'serverworkerfabric'), \
+             mock.patch.object(m.urllib.request, 'urlopen', side_effect=open_url):
+            self.assertEqual(m.worker_ip_for(3), '10.77.20.33')
+        self.assertEqual(calls[0][0].full_url, m.SCHEDULER_URL + '/api/workers/3')
+        self.assertEqual(calls[0][1], 3)
+
+    def test_external_provider_identity_mismatch_fails_closed(self):
+        with mock.patch.object(m, 'WORKER_PROVIDER', 'serverworkerfabric'), \
+             mock.patch.object(m.urllib.request, 'urlopen', return_value=Response({'station':4,'ip':'10.0.0.4'})):
+            with self.assertRaisesRegex(RuntimeError, 'identity mismatch'):
+                m.worker_ip_for(3)
+
+    def test_external_provider_missing_address_fails_closed(self):
+        with mock.patch.object(m, 'WORKER_PROVIDER', 'serverworkerfabric'), \
+             mock.patch.object(m.urllib.request, 'urlopen', return_value=Response({'station':3,'ip':None})):
+            with self.assertRaisesRegex(RuntimeError, 'no provider-resolved address'):
+                m.worker_ip_for(3)
+
+    def test_ssh_guest_uses_provider_resolver(self):
+        completed=subprocess.CompletedProcess([],0,'ok','')
+        with mock.patch.object(m, 'worker_ip_for', return_value='10.77.20.33'), \
+             mock.patch.object(m.subprocess, 'run', return_value=completed) as run:
+            got=m.ssh_guest(3,'true',5)
+        self.assertEqual(got.returncode,0)
+        args=run.call_args.args[0]
+        self.assertIn('mark@10.77.20.33',args)
 
 
 class LeaseValidationTests(unittest.TestCase):
