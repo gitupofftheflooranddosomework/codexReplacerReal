@@ -133,6 +133,7 @@ class FabricProviderTests(unittest.TestCase):
                 "CODEX_LAB_WORKER_LOGICAL_PREFIX":"workstation-",
                 "CODEX_LAB_WORKER_API_TIMEOUT":"3.5",
                 "CODEX_LAB_WORKER_API_TOKEN":"runtime-bearer",
+                "CODEX_LAB_WORKER_API_CA_FILE":"/run/secrets/fabric-ca.pem",
             },
             clear=True,
         ):
@@ -149,6 +150,7 @@ class FabricProviderTests(unittest.TestCase):
         self.assertEqual(provider.name,"serverworkerfabric")
         self.assertEqual(provider.logical_id(1),"workstation-01")
         self.assertEqual(provider.timeout,3.5)
+        self.assertEqual(provider.ca_file,"/run/secrets/fabric-ca.pem")
 
     def test_missing_api_token_fails_closed(self):
         with patch.dict(
@@ -180,6 +182,23 @@ class FabricProviderTests(unittest.TestCase):
                     urlopen=lambda *_a,**_k: Response(self.worker())
                 )
         self.assertEqual(provider.api_token,"file-bearer")
+
+    def test_custom_ca_is_used_for_https_requests(self):
+        calls=[]
+        sentinel=object()
+        def open_url(request, **kwargs):
+            calls.append((request,kwargs))
+            return Response(self.worker())
+        with patch.object(worker_provider.ssl,"create_default_context",return_value=sentinel) as create:
+            provider=worker_provider.ServerWorkerFabricProvider(
+                "https://fabric.internal:8788",
+                "test-bearer",
+                ca_file="/run/secrets/fabric-ca.pem",
+                urlopen=open_url,
+            )
+            self.assertEqual(provider.worker_name(3),"swf-station-03")
+        create.assert_called_once_with(cafile="/run/secrets/fabric-ca.pem")
+        self.assertIs(calls[0][1]["context"],sentinel)
 
     def test_missing_url_fails_closed(self):
         with patch.dict(
