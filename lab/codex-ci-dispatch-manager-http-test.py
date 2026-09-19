@@ -45,6 +45,57 @@ class DispatchManagerHTTPTests(unittest.TestCase):
             "args":["reserve","--owner","DotMoose","--project","DotMoose"]
         })
 
+    def test_main_uses_provision_resolved_address_before_worker_probe(self):
+        import sys
+        rec={"id":"headless-abcd","name":"swf-headless-abcd","ip":"","reused":False}
+        manager_calls=[]
+        probed=[]
+        def manager(*args,**_kwargs):
+            manager_calls.append(args)
+            if args[0]=="provision":
+                return {
+                    "id":"headless-abcd",
+                    "name":"swf-headless-abcd",
+                    "ip":"10.77.20.44",
+                }
+            if args[0]=="finish":
+                return {"status":"destroyed"}
+            raise AssertionError(args)
+        def ready(record,*_args,**_kwargs):
+            probed.append(dict(record))
+            return {"ready":True,"mode":"headless"}
+        completed=subprocess.CompletedProcess([],0,b'{"ok":true}',b"")
+        with mock.patch.object(
+            sys,"argv",
+            ["dispatch","--owner","test","--command","true"],
+        ), mock.patch.object(dispatch,"validate_workspace"),              mock.patch.object(dispatch,"acquire",return_value=rec),              mock.patch.object(dispatch,"manager",side_effect=manager),              mock.patch.object(dispatch,"wait_ready",side_effect=ready),              mock.patch.object(dispatch,"ssh_capture",return_value=completed),              mock.patch.object(dispatch,"stream_snapshot"),              mock.patch.object(dispatch,"push_inputs"),              mock.patch.object(dispatch,"run_command",return_value=0),              mock.patch.object(dispatch,"pull_artifacts"):
+            self.assertEqual(dispatch.main(),0)
+        self.assertEqual(probed[0]["ip"],"10.77.20.44")
+        self.assertEqual(manager_calls[0],("provision","headless-abcd"))
+
+    def test_main_rejects_provision_identity_mismatch_before_ssh(self):
+        import sys
+        rec={"id":"headless-abcd","name":"swf-headless-abcd","ip":"","reused":False}
+        with mock.patch.object(
+            sys,"argv",
+            ["dispatch","--owner","test","--command","true"],
+        ), mock.patch.object(dispatch,"validate_workspace"),              mock.patch.object(dispatch,"acquire",return_value=rec),              mock.patch.object(
+                 dispatch,"manager",
+                 return_value={
+                     "id":"headless-other",
+                     "name":"swf-headless-other",
+                     "ip":"10.77.20.45",
+                 },
+             ),              mock.patch.object(
+                 dispatch,"wait_ready",
+                 side_effect=AssertionError("worker probe must not run"),
+             ),              mock.patch.object(
+                 dispatch,"ssh_capture",
+                 side_effect=AssertionError("SSH must not run"),
+             ):
+            with self.assertRaisesRegex(RuntimeError,"identity mismatch"):
+                dispatch.main()
+
     def test_http_error_surfaces_scheduler_message(self):
         error=urllib.error.HTTPError(
             "http://scheduler/api/manager",400,"bad",{},
