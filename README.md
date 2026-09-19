@@ -171,6 +171,26 @@ For interactive browser automation, an agent first calls `vm_lab_acquire` with i
 
 Ordinary sign-out uses `vm_lab_release` without reimaging. `recycle=true` is reserved for the cases where a genuinely clean workstation is required.
 
+### ServerWorkerFabric worker-provider canary
+
+The interactive scheduler now has an **opt-in** external provider adapter for ServerWorkerFabric. Production remains on the legacy libvirt provider unless `CODEX_LAB_WORKER_PROVIDER=serverworkerfabric` is explicitly set.
+
+The adapter consumes the ServerWorkerFabric HTTP worker records; Codex Replacer does not receive Proxmox credentials and does not derive replacement worker addresses from the old `192.168.122.230+` formula.
+
+Canary settings are applied as a reversible systemd override, not by editing the base scheduler service:
+
+```ini
+[Service]
+Environment=CODEX_LAB_WORKER_PROVIDER=serverworkerfabric
+Environment=CODEX_LAB_WORKER_API_URL=http://<fabric-worker-api>:8788
+Environment=CODEX_LAB_WORKER_LOGICAL_PREFIX=station-
+Environment=CODEX_LAB_WORKER_API_TIMEOUT=5
+```
+
+The logical prefix maps station 1 to `station-01`, station 2 to `station-02`, and so on. ServerWorkerFabric must return a provider-resolved `address` for SSH/readiness; a missing address fails closed instead of falling back to the legacy private-network formula. HTTP 404 maps to an absent worker, while provider transport failures map state observation to unknown.
+
+Do not switch the default provider until a Proxmox-native workstation canary passes acquire/SSH/browser/release and the independent browser/CDP address coupling is also removed.
+
 ### Central job scheduler
 
 Long or CPU-heavy transferable work should use `vm_job_submit` instead of running on the controller. When two or more independent heavy tasks exist, agents should use `vm_job_submit_batch`; dispatch is automatic, so agents do not pick station numbers and one batch can feed the elastic disposable headless-KVM pool in a single MCP round trip. The six persistent desktop VMs are interactive-only and are not the heavy-job concurrency limit. The scheduler is a persistent homeserver user service:
