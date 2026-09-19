@@ -3,16 +3,23 @@
 
 The scheduler owns leases, policy, history and public APIs. Providers own only
 worker identity/address and compute lifecycle observations. The legacy libvirt
-provider remains the default until the Proxmox provider passes canary gates.
+provider remains the default until the external ServerWorkerFabric provider
+passes canary gates.
 """
 from __future__ import annotations
 
+import json
 import os
+import socket
 import subprocess
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from typing import Callable
 
 Runner = Callable[..., subprocess.CompletedProcess]
+Urlopen = Callable[..., object]
 
 
 class WorkerProviderError(RuntimeError):
@@ -75,17 +82,158 @@ class LibvirtWorkerProvider(WorkerProvider):
         return result.stdout.strip() if result.returncode == 0 else "absent"
 
 
-def load_worker_provider(name: str | None = None, *, runner: Runner | None = None) -> WorkerProvider:
-    selected = str(name or os.environ.get("CODEX_LAB_WORKER_PROVIDER", "libvirt")).strip().lower()
+@dataclass
+class ServerWorkerFabricProvider(WorkerProvider):
+    """Read-only adapter for the external ServerWorkerFabric worker API."""
+
+    base_url: str
+    logical_prefix: str = "station-"
+    timeout: float = 5.0
+    urlopen: Urlopen = urllib.request.urlopen
+
+    name = "serverworkerfabric"
+
+    def __post_init__(self) -> None:
+        self.base_url = self.base_url.rstrip("/")
+        parsed = urllib.parse.urlsplit(self.base_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise WorkerProviderError(
+                "CODEX_LAB_WORKER_API_URL must be an absolute http(s) URL"
+            )
+        if not self.logical_prefix:
+            raise WorkerProviderError(
+                "CODEX_LAB_WORKER_LOGICAL_PREFIX must not be empty"
+            )
+
+    def logical_id(self, station: int) -> str:
+        station = int(station)
+        if station < 1:
+            raise WorkerProviderError("station must be >= 1")
+        return f"{self.logical_prefix}{station:02d}"
+
+    def _worker(self, station: int) -> dict:
+        logical_id = self.logical_id(station)
+        url = (
+            self.base_url
+            + "/v1/workers/"
+            + urllib.parse.quote(logical_id, safe="")
+        )
+        request = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "CodexReplacer/ServerWorkerFabricProvider",
+            },
+            method="GET",
+        )
+        try:
+            with self.urlopen(request, timeout=self.timeout) as response:
+                raw = response.read()
+                status = int(getattr(response, "status", 200))
+        except urllib.error.HTTPError as exc:
+            if int(exc.code) == 404:
+                raise WorkerProviderError(f"worker {logical_id!r} is absent") from exc
+            raise WorkerProviderError(
+                f"ServerWorkerFabric returned HTTP {int(exc.code)}"
+            ) from exc
+        except (urllib.error.URLError, TimeoutError, socket.timeout, OSError) as exc:
+            raise WorkerProviderError("ServerWorkerFabric request failed") from exc
+
+        if status == 404:
+            raise WorkerProviderError(f"worker {logical_id!r} is absent")
+        if status < 200 or status >= 300:
+            raise WorkerProviderError(
+                f"ServerWorkerFabric returned HTTP {status}"
+            )
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise WorkerProviderError(
+                "ServerWorkerFabric returned invalid JSON"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise WorkerProviderError(
+                "ServerWorkerFabric worker response must be an object"
+            )
+        if str(payload.get("logical_id") or "") != logical_id:
+            raise WorkerProviderError(
+                "ServerWorkerFabric logical worker identity mismatch"
+            )
+        return payload
+
+    def worker_name(self, station: int) -> str:
+        worker = self._worker(station)
+        metadata = worker.get("metadata")
+        if isinstance(metadata, dict):
+            name = str(metadata.get("name") or "").strip()
+            if name:
+                return name
+        return str(worker["logical_id"])
+
+    def worker_ip(self, station: int) -> str:
+        worker = self._worker(station)
+        address = str(worker.get("address") or "").strip()
+        if not address:
+            raise WorkerProviderError(
+                f"worker {worker.get('logical_id')!r} has no provider-resolved address"
+            )
+        return address
+
+    def state(self, station: int) -> str:
+        try:
+            worker = self._worker(station)
+        except WorkerProviderError as exc:
+            if " is absent" in str(exc):
+                return "absent"
+            return "unknown"
+        return str(worker.get("state") or "unknown").strip().lower() or "unknown"
+
+
+def load_worker_provider(
+    name: str | None = None,
+    *,
+    runner: Runner | None = None,
+    urlopen: Urlopen | None = None,
+) -> WorkerProvider:
+    selected = str(
+        name or os.environ.get("CODEX_LAB_WORKER_PROVIDER", "libvirt")
+    ).strip().lower()
     if selected == "libvirt":
         kwargs = {
             "uri": os.environ.get("CODEX_LAB_LIBVIRT_URI", "qemu:///system"),
-            "network_base": os.environ.get("CODEX_LAB_LIBVIRT_NETWORK_BASE", "192.168.122"),
-            "first_worker_octet": int(os.environ.get("CODEX_LAB_LIBVIRT_FIRST_WORKER_OCTET", "230")),
+            "network_base": os.environ.get(
+                "CODEX_LAB_LIBVIRT_NETWORK_BASE", "192.168.122"
+            ),
+            "first_worker_octet": int(
+                os.environ.get(
+                    "CODEX_LAB_LIBVIRT_FIRST_WORKER_OCTET", "230"
+                )
+            ),
         }
         if runner is not None:
             kwargs["runner"] = runner
         return LibvirtWorkerProvider(**kwargs)
+    if selected in {"serverworkerfabric", "swf"}:
+        base_url = str(
+            os.environ.get("CODEX_LAB_WORKER_API_URL", "")
+        ).strip()
+        if not base_url:
+            raise WorkerProviderError(
+                "CODEX_LAB_WORKER_API_URL is required for serverworkerfabric"
+            )
+        kwargs = {
+            "base_url": base_url,
+            "logical_prefix": os.environ.get(
+                "CODEX_LAB_WORKER_LOGICAL_PREFIX", "station-"
+            ),
+            "timeout": float(
+                os.environ.get("CODEX_LAB_WORKER_API_TIMEOUT", "5")
+            ),
+        }
+        if urlopen is not None:
+            kwargs["urlopen"] = urlopen
+        return ServerWorkerFabricProvider(**kwargs)
     raise WorkerProviderError(
-        f"unsupported CODEX_LAB_WORKER_PROVIDER={selected!r}; supported providers: libvirt"
+        "unsupported CODEX_LAB_WORKER_PROVIDER="
+        f"{selected!r}; supported providers: libvirt, serverworkerfabric"
     )
