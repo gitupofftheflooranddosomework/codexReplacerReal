@@ -34,12 +34,13 @@ class ServerWorkerFabricHeadlessManagerTests(unittest.TestCase):
             mock.patch.object(m,"BASE_URL","https://fabric.internal"),
             mock.patch.object(m,"TOKEN","secret"),
             mock.patch.object(m,"TOKEN_FILE",""),
+            mock.patch.object(m,"CA_FILE",""),
         )
 
     def test_reserve_creates_disposable_headless_with_bounded_ttl(self):
         calls=[]
-        def open_url(request,timeout):
-            calls.append((request,timeout))
+        def open_url(request,timeout,context):
+            calls.append((request,timeout,context))
             return Response({
                 "instance_id":"headless-abcd",
                 "expires_at_epoch":1600,
@@ -50,17 +51,18 @@ class ServerWorkerFabricHeadlessManagerTests(unittest.TestCase):
                     "metadata":{"name":"swf-headless-abcd"},
                 },
             },201)
-        p1,p2,p3=self.settings()
-        with p1,p2,p3,mock.patch.object(m.urllib.request,"urlopen",side_effect=open_url):
+        p1,p2,p3,p4=self.settings()
+        with p1,p2,p3,p4,mock.patch.object(m.urllib.request,"urlopen",side_effect=open_url):
             got=m.reserve("DotMoose-site-build","DotMoose",600)
         self.assertFalse(got["reused"])
         self.assertEqual(got["instance"]["id"],"headless-abcd")
         self.assertEqual(got["instance"]["name"],"swf-headless-abcd")
         self.assertEqual(got["instance"]["ip"],"")
-        request,timeout=calls[0]
+        request,timeout,context=calls[0]
         self.assertEqual(request.full_url,"https://fabric.internal/v1/headless")
         self.assertEqual(request.method,"POST")
         self.assertEqual(timeout,m.HTTP_TIMEOUT)
+        self.assertIsNotNone(context)
         self.assertEqual(request.get_header("Authorization"),"Bearer secret")
         payload=json.loads(request.data)
         self.assertEqual(payload["profile"],m.PROFILE)
@@ -68,16 +70,16 @@ class ServerWorkerFabricHeadlessManagerTests(unittest.TestCase):
         self.assertRegex(payload["correlation_id"],r"^ci-[0-9a-f]{16}$")
 
     def test_reserve_refuses_retained_session_before_api_call(self):
-        p1,p2,p3=self.settings()
-        with p1,p2,p3,mock.patch.object(
+        p1,p2,p3,p4=self.settings()
+        with p1,p2,p3,p4,mock.patch.object(
             m.urllib.request,"urlopen",side_effect=AssertionError("API must not run")
         ):
             with self.assertRaisesRegex(m.FabricManagerError,"retained session"):
                 m.reserve("owner","project",600,session_key="reuse-me")
 
     def test_reserve_rejects_out_of_bounds_ttl_before_api_call(self):
-        p1,p2,p3=self.settings()
-        with p1,p2,p3,mock.patch.object(
+        p1,p2,p3,p4=self.settings()
+        with p1,p2,p3,p4,mock.patch.object(
             m.urllib.request,"urlopen",side_effect=AssertionError("API must not run")
         ):
             for ttl in (59,604801):
@@ -99,11 +101,11 @@ class ServerWorkerFabricHeadlessManagerTests(unittest.TestCase):
             },200),
         ]
         calls=[]
-        def open_url(request,timeout):
+        def open_url(request,timeout,context):
             calls.append((request,timeout))
             return responses.pop(0)
-        p1,p2,p3=self.settings()
-        with p1,p2,p3,              mock.patch.object(m,"READY_TIMEOUT",10),              mock.patch.object(m,"POLL_SECONDS",0.001),              mock.patch.object(m.urllib.request,"urlopen",side_effect=open_url),              mock.patch.object(m.time,"sleep"):
+        p1,p2,p3,p4=self.settings()
+        with p1,p2,p3,p4,              mock.patch.object(m,"READY_TIMEOUT",10),              mock.patch.object(m,"POLL_SECONDS",0.001),              mock.patch.object(m.urllib.request,"urlopen",side_effect=open_url),              mock.patch.object(m.time,"sleep"):
             got=m.provision("headless-abcd")
         self.assertEqual(got["id"],"headless-abcd")
         self.assertEqual(got["ip"],"10.77.20.44")
@@ -115,8 +117,8 @@ class ServerWorkerFabricHeadlessManagerTests(unittest.TestCase):
         ))
 
     def test_provision_identity_mismatch_fails_closed(self):
-        p1,p2,p3=self.settings()
-        with p1,p2,p3,mock.patch.object(
+        p1,p2,p3,p4=self.settings()
+        with p1,p2,p3,p4,mock.patch.object(
             m.urllib.request,"urlopen",
             return_value=Response({
                 "ready":True,
@@ -132,8 +134,8 @@ class ServerWorkerFabricHeadlessManagerTests(unittest.TestCase):
                 m.provision("headless-abcd")
 
     def test_finish_refuses_retention_without_deleting(self):
-        p1,p2,p3=self.settings()
-        with p1,p2,p3,mock.patch.object(
+        p1,p2,p3,p4=self.settings()
+        with p1,p2,p3,p4,mock.patch.object(
             m.urllib.request,"urlopen",side_effect=AssertionError("DELETE must not run")
         ):
             with self.assertRaisesRegex(m.FabricManagerError,"keep_seconds"):
@@ -145,14 +147,27 @@ class ServerWorkerFabricHeadlessManagerTests(unittest.TestCase):
             404,"not found",{},
             io.BytesIO(b'{"error":"worker not found"}'),
         )
-        p1,p2,p3=self.settings()
-        with p1,p2,p3,mock.patch.object(
+        p1,p2,p3,p4=self.settings()
+        with p1,p2,p3,p4,mock.patch.object(
             m.urllib.request,"urlopen",side_effect=error
         ):
             got=m.finish("headless-abcd")
         self.assertEqual(got["status"],"destroyed")
         self.assertTrue(got["already_absent"])
         self.assertFalse(got["deleted"])
+
+    def test_custom_ca_file_builds_verified_context(self):
+        sentinel=object()
+        with mock.patch.object(m,"CA_FILE","/etc/swf/private-ca.pem"), \
+             mock.patch.object(m.ssl,"create_default_context",return_value=sentinel) as create:
+            self.assertIs(m._ssl_context(),sentinel)
+        create.assert_called_once_with(cafile="/etc/swf/private-ca.pem")
+
+    def test_unusable_custom_ca_fails_closed(self):
+        with mock.patch.object(m,"CA_FILE","/missing/ca.pem"), \
+             mock.patch.object(m.ssl,"create_default_context",side_effect=OSError("missing")):
+            with self.assertRaisesRegex(m.FabricManagerError,"CA_FILE is not usable"):
+                m._ssl_context()
 
     def test_missing_token_fails_closed_before_network(self):
         with mock.patch.object(m,"BASE_URL","https://fabric.internal"),              mock.patch.object(m,"TOKEN",""),              mock.patch.object(m,"TOKEN_FILE",""),              mock.patch.object(
