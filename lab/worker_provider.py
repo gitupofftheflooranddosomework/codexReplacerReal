@@ -12,6 +12,7 @@ import json
 import os
 import pathlib
 import socket
+import ssl
 import subprocess
 import urllib.error
 import urllib.parse
@@ -91,6 +92,7 @@ class ServerWorkerFabricProvider(WorkerProvider):
     api_token: str
     logical_prefix: str = "station-"
     timeout: float = 5.0
+    ca_file: str | None = None
     urlopen: Urlopen = urllib.request.urlopen
 
     name = "serverworkerfabric"
@@ -134,7 +136,17 @@ class ServerWorkerFabricProvider(WorkerProvider):
             method="GET",
         )
         try:
-            with self.urlopen(request, timeout=self.timeout) as response:
+            open_kwargs = {"timeout": self.timeout}
+            if self.ca_file:
+                try:
+                    open_kwargs["context"] = ssl.create_default_context(
+                        cafile=self.ca_file
+                    )
+                except (OSError, ssl.SSLError) as exc:
+                    raise WorkerProviderError(
+                        "ServerWorkerFabric CA file could not be loaded"
+                    ) from exc
+            with self.urlopen(request, **open_kwargs) as response:
                 raw = response.read()
                 status = int(getattr(response, "status", 200))
         except urllib.error.HTTPError as exc:
@@ -256,6 +268,10 @@ def load_worker_provider(
             ),
             "timeout": float(
                 os.environ.get("CODEX_LAB_WORKER_API_TIMEOUT", "5")
+            ),
+            "ca_file": (
+                str(os.environ.get("CODEX_LAB_WORKER_API_CA_FILE", "")).strip()
+                or None
             ),
         }
         if urlopen is not None:
