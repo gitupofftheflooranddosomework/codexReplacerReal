@@ -22,7 +22,7 @@ class FabricDispatchInstallerTests(unittest.TestCase):
         self.assertIn("codex-ci-dispatch.py", text)
         self.assertIn("serverworkerfabric-headless-manager.py", text)
         self.assertNotIn('install_atomic "$SCRIPT_DIR/codex-ci-headless.py"', text)
-        self.assertNotIn("rm -f "$TARGET_BIN/codex-ci-headless"", text)
+        self.assertNotIn('rm -f "$TARGET_BIN/codex-ci-headless"', text)
         self.assertIn("legacy local manager remains", text)
 
     def test_temp_install_produces_executable_exact_sources(self):
