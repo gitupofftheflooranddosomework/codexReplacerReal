@@ -111,6 +111,7 @@ class FabricProviderTests(unittest.TestCase):
             return Response(self.worker())
         provider=worker_provider.ServerWorkerFabricProvider(
             "http://fabric.internal:8788",
+            "test-bearer",
             urlopen=open_url,
         )
         self.assertEqual(provider.worker_name(3),"swf-station-03")
@@ -118,6 +119,10 @@ class FabricProviderTests(unittest.TestCase):
         self.assertEqual(provider.state(3),"running")
         self.assertTrue(all(call[0].full_url.endswith("/v1/workers/station-03") for call in calls))
         self.assertTrue(all(call[1]==5.0 for call in calls))
+        self.assertTrue(all(
+            call[0].get_header("Authorization")=="Bearer test-bearer"
+            for call in calls
+        ))
 
     def test_loader_keeps_libvirt_default_but_supports_swf_opt_in(self):
         with patch.dict(
@@ -127,6 +132,8 @@ class FabricProviderTests(unittest.TestCase):
                 "CODEX_LAB_WORKER_API_URL":"https://fabric.example.invalid",
                 "CODEX_LAB_WORKER_LOGICAL_PREFIX":"workstation-",
                 "CODEX_LAB_WORKER_API_TIMEOUT":"3.5",
+                "CODEX_LAB_WORKER_API_TOKEN":"runtime-bearer",
+                "CODEX_LAB_WORKER_API_CA_FILE":"/run/secrets/fabric-ca.pem",
             },
             clear=True,
         ):
@@ -143,6 +150,55 @@ class FabricProviderTests(unittest.TestCase):
         self.assertEqual(provider.name,"serverworkerfabric")
         self.assertEqual(provider.logical_id(1),"workstation-01")
         self.assertEqual(provider.timeout,3.5)
+        self.assertEqual(provider.ca_file,"/run/secrets/fabric-ca.pem")
+
+    def test_missing_api_token_fails_closed(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "CODEX_LAB_WORKER_PROVIDER":"serverworkerfabric",
+                "CODEX_LAB_WORKER_API_URL":"https://fabric.example.invalid",
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(worker_provider.WorkerProviderError,"WORKER_API_TOKEN"):
+                worker_provider.load_worker_provider()
+
+    def test_api_token_can_be_read_from_file(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w",delete=True) as handle:
+            handle.write("file-bearer\n")
+            handle.flush()
+            with patch.dict(
+                "os.environ",
+                {
+                    "CODEX_LAB_WORKER_PROVIDER":"serverworkerfabric",
+                    "CODEX_LAB_WORKER_API_URL":"https://fabric.example.invalid",
+                    "CODEX_LAB_WORKER_API_TOKEN_FILE":handle.name,
+                },
+                clear=True,
+            ):
+                provider=worker_provider.load_worker_provider(
+                    urlopen=lambda *_a,**_k: Response(self.worker())
+                )
+        self.assertEqual(provider.api_token,"file-bearer")
+
+    def test_custom_ca_is_used_for_https_requests(self):
+        calls=[]
+        sentinel=object()
+        def open_url(request, **kwargs):
+            calls.append((request,kwargs))
+            return Response(self.worker())
+        with patch.object(worker_provider.ssl,"create_default_context",return_value=sentinel) as create:
+            provider=worker_provider.ServerWorkerFabricProvider(
+                "https://fabric.internal:8788",
+                "test-bearer",
+                ca_file="/run/secrets/fabric-ca.pem",
+                urlopen=open_url,
+            )
+            self.assertEqual(provider.worker_name(3),"swf-station-03")
+        create.assert_called_once_with(cafile="/run/secrets/fabric-ca.pem")
+        self.assertIs(calls[0][1]["context"],sentinel)
 
     def test_missing_url_fails_closed(self):
         with patch.dict(
@@ -157,7 +213,7 @@ class FabricProviderTests(unittest.TestCase):
         def open_url(request, timeout):
             raise urllib.error.HTTPError(request.full_url,404,"not found",{},io.BytesIO())
         provider=worker_provider.ServerWorkerFabricProvider(
-            "http://fabric.internal:8788",urlopen=open_url
+            "http://fabric.internal:8788","test-bearer",urlopen=open_url
         )
         self.assertEqual(provider.state(1),"absent")
 
@@ -165,13 +221,14 @@ class FabricProviderTests(unittest.TestCase):
         def open_url(*_a,**_k):
             raise urllib.error.URLError("offline")
         provider=worker_provider.ServerWorkerFabricProvider(
-            "http://fabric.internal:8788",urlopen=open_url
+            "http://fabric.internal:8788","test-bearer",urlopen=open_url
         )
         self.assertEqual(provider.state(1),"unknown")
 
     def test_missing_address_does_not_recreate_legacy_ip(self):
         provider=worker_provider.ServerWorkerFabricProvider(
             "http://fabric.internal:8788",
+            "test-bearer",
             urlopen=lambda *_a,**_k: Response(self.worker(address=None)),
         )
         with self.assertRaisesRegex(worker_provider.WorkerProviderError,"no provider-resolved address"):
@@ -180,6 +237,7 @@ class FabricProviderTests(unittest.TestCase):
     def test_identity_mismatch_fails_closed(self):
         provider=worker_provider.ServerWorkerFabricProvider(
             "http://fabric.internal:8788",
+            "test-bearer",
             urlopen=lambda *_a,**_k: Response(self.worker(logical_id="station-99")),
         )
         with self.assertRaisesRegex(worker_provider.WorkerProviderError,"identity mismatch"):
@@ -188,6 +246,7 @@ class FabricProviderTests(unittest.TestCase):
     def test_invalid_station_is_rejected_before_network(self):
         provider=worker_provider.ServerWorkerFabricProvider(
             "http://fabric.internal:8788",
+            "test-bearer",
             urlopen=lambda *_a,**_k: self.fail("network should not be called"),
         )
         with self.assertRaisesRegex(worker_provider.WorkerProviderError,"station"):

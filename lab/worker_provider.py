@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import socket
+import ssl
 import subprocess
 import urllib.error
 import urllib.parse
@@ -87,8 +89,10 @@ class ServerWorkerFabricProvider(WorkerProvider):
     """Read-only adapter for the external ServerWorkerFabric worker API."""
 
     base_url: str
+    api_token: str
     logical_prefix: str = "station-"
     timeout: float = 5.0
+    ca_file: str | None = None
     urlopen: Urlopen = urllib.request.urlopen
 
     name = "serverworkerfabric"
@@ -99,6 +103,10 @@ class ServerWorkerFabricProvider(WorkerProvider):
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise WorkerProviderError(
                 "CODEX_LAB_WORKER_API_URL must be an absolute http(s) URL"
+            )
+        if not self.api_token:
+            raise WorkerProviderError(
+                "ServerWorkerFabric worker API bearer token is required"
             )
         if not self.logical_prefix:
             raise WorkerProviderError(
@@ -122,12 +130,23 @@ class ServerWorkerFabricProvider(WorkerProvider):
             url,
             headers={
                 "Accept": "application/json",
+                "Authorization": f"Bearer {self.api_token}",
                 "User-Agent": "CodexReplacer/ServerWorkerFabricProvider",
             },
             method="GET",
         )
         try:
-            with self.urlopen(request, timeout=self.timeout) as response:
+            open_kwargs = {"timeout": self.timeout}
+            if self.ca_file:
+                try:
+                    open_kwargs["context"] = ssl.create_default_context(
+                        cafile=self.ca_file
+                    )
+                except (OSError, ssl.SSLError) as exc:
+                    raise WorkerProviderError(
+                        "ServerWorkerFabric CA file could not be loaded"
+                    ) from exc
+            with self.urlopen(request, **open_kwargs) as response:
                 raw = response.read()
                 status = int(getattr(response, "status", 200))
         except urllib.error.HTTPError as exc:
@@ -189,6 +208,26 @@ class ServerWorkerFabricProvider(WorkerProvider):
         return str(worker.get("state") or "unknown").strip().lower() or "unknown"
 
 
+def _worker_api_token_from_env() -> str:
+    direct = str(os.environ.get("CODEX_LAB_WORKER_API_TOKEN", "")).strip()
+    if direct:
+        return direct
+    token_file = str(os.environ.get("CODEX_LAB_WORKER_API_TOKEN_FILE", "")).strip()
+    if token_file:
+        try:
+            value = pathlib.Path(token_file).read_text().strip()
+        except OSError as exc:
+            raise WorkerProviderError(
+                "CODEX_LAB_WORKER_API_TOKEN_FILE is not readable"
+            ) from exc
+        if value:
+            return value
+    raise WorkerProviderError(
+        "CODEX_LAB_WORKER_API_TOKEN or CODEX_LAB_WORKER_API_TOKEN_FILE "
+        "is required for serverworkerfabric"
+    )
+
+
 def load_worker_provider(
     name: str | None = None,
     *,
@@ -223,11 +262,16 @@ def load_worker_provider(
             )
         kwargs = {
             "base_url": base_url,
+            "api_token": _worker_api_token_from_env(),
             "logical_prefix": os.environ.get(
                 "CODEX_LAB_WORKER_LOGICAL_PREFIX", "station-"
             ),
             "timeout": float(
                 os.environ.get("CODEX_LAB_WORKER_API_TIMEOUT", "5")
+            ),
+            "ca_file": (
+                str(os.environ.get("CODEX_LAB_WORKER_API_CA_FILE", "")).strip()
+                or None
             ),
         }
         if urlopen is not None:

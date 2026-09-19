@@ -13,6 +13,7 @@ import json
 import os
 import pathlib
 import socket
+import ssl
 import sys
 import time
 import urllib.error
@@ -22,6 +23,7 @@ import urllib.request
 BASE_URL=os.environ.get("CODEX_CI_SWF_API_URL","").strip().rstrip("/")
 TOKEN=os.environ.get("CODEX_CI_SWF_API_TOKEN","").strip()
 TOKEN_FILE=os.environ.get("CODEX_CI_SWF_API_TOKEN_FILE","").strip()
+CA_FILE=os.environ.get("CODEX_CI_SWF_API_CA_FILE","").strip()
 PROFILE=os.environ.get("CODEX_CI_SWF_HEADLESS_PROFILE","headless").strip() or "headless"
 HTTP_TIMEOUT=max(1.0,float(os.environ.get("CODEX_CI_SWF_API_TIMEOUT","10")))
 READY_TIMEOUT=max(5.0,float(os.environ.get("CODEX_CI_SWF_READY_TIMEOUT","180")))
@@ -55,6 +57,18 @@ def base_url():
     return BASE_URL
 
 
+def _urlopen(request):
+    kwargs={"timeout":HTTP_TIMEOUT}
+    if CA_FILE:
+        try:
+            kwargs["context"]=ssl.create_default_context(cafile=CA_FILE)
+        except (OSError,ssl.SSLError) as exc:
+            raise FabricManagerError(
+                "ServerWorkerFabric CA file could not be loaded"
+            ) from exc
+    return urllib.request.urlopen(request,**kwargs)
+
+
 def _request(method,path,payload=None,*,allow_404=False):
     url=base_url()+path
     headers={
@@ -68,7 +82,7 @@ def _request(method,path,payload=None,*,allow_404=False):
         headers["Content-Type"]="application/json"
     request=urllib.request.Request(url,data=data,method=method,headers=headers)
     try:
-        with urllib.request.urlopen(request,timeout=HTTP_TIMEOUT) as response:
+        with _urlopen(request) as response:
             raw=response.read()
             status=int(getattr(response,"status",200))
     except urllib.error.HTTPError as exc:
@@ -164,7 +178,7 @@ def provision(instance_id):
             },
         )
         try:
-            with urllib.request.urlopen(request,timeout=HTTP_TIMEOUT) as response:
+            with _urlopen(request) as response:
                 raw=response.read()
                 status=int(getattr(response,"status",200))
         except urllib.error.HTTPError as exc:

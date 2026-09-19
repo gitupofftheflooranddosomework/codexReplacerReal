@@ -154,6 +154,30 @@ class ServerWorkerFabricHeadlessManagerTests(unittest.TestCase):
         self.assertTrue(got["already_absent"])
         self.assertFalse(got["deleted"])
 
+    def test_custom_ca_is_used_for_fabric_requests(self):
+        sentinel=object()
+        seen=[]
+        def open_url(request, **kwargs):
+            seen.append(kwargs)
+            return Response({
+                "instance_id":"headless-abcd",
+                "worker":{
+                    "logical_id":"headless-abcd",
+                    "state":"running",
+                    "address":None,
+                    "metadata":{},
+                },
+            },201)
+        p1,p2,p3=self.settings()
+        with p1,p2,p3, \
+             mock.patch.object(m,"CA_FILE","/run/secrets/fabric-ca.pem"), \
+             mock.patch.object(m.ssl,"create_default_context",return_value=sentinel) as create, \
+             mock.patch.object(m.urllib.request,"urlopen",side_effect=open_url):
+            got=m.reserve("owner","project",600)
+        self.assertEqual(got["instance"]["id"],"headless-abcd")
+        create.assert_called_once_with(cafile="/run/secrets/fabric-ca.pem")
+        self.assertIs(seen[0]["context"],sentinel)
+
     def test_missing_token_fails_closed_before_network(self):
         with mock.patch.object(m,"BASE_URL","https://fabric.internal"),              mock.patch.object(m,"TOKEN",""),              mock.patch.object(m,"TOKEN_FILE",""),              mock.patch.object(
                  m.urllib.request,"urlopen",
