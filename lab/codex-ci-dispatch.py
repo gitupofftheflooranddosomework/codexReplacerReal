@@ -216,7 +216,24 @@ def main():
         # and signal finalizers can always release the reserved VM.
         sys.stdout.flush()
         if not rec.get('reused'):
-            manager('provision',rec['id'],timeout=max(180,a.wait_seconds))
+            provisioned=manager('provision',rec['id'],timeout=max(180,a.wait_seconds))
+            if isinstance(provisioned,dict):
+                instance=provisioned.get('instance',provisioned)
+                if isinstance(instance,dict):
+                    resolved_id=str(instance.get('id') or rec['id'])
+                    if resolved_id != str(rec['id']):
+                        raise RuntimeError(
+                            f"headless manager provision identity mismatch: {resolved_id!r} != {rec['id']!r}"
+                        )
+                    for key in ('name','ip'):
+                        value=str(instance.get(key) or '').strip()
+                        if value:
+                            rec[key]=value
+        if not str(rec.get('ip') or '').strip():
+            raise RuntimeError("headless manager provision did not resolve worker IP")
+        print(f"codex_ci_vm={rec['name']}")
+        print(f"codex_ci_worker={rec['ip']}")
+        sys.stdout.flush()
         wait_ready(rec); iid=uuid.uuid4().hex
         payload={"leaseId":iid,"owner":a.owner,"project":a.project or None,"source":"github-actions"}
         cp=ssh_capture(rec,rpc("codex-ci claim "+enc(json.dumps(payload,separators=(",", ":")))),timeout=15)
