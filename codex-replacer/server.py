@@ -405,7 +405,7 @@ class KvmWorkerBrowserClient:
 
     @property
     def worker_ip(self):
-        return f"192.168.122.{229 + self.station}"
+        return vm_lab_manager.worker_ip_for(self.station)
 
     @property
     def endpoint(self):
