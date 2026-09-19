@@ -30,6 +30,8 @@ RUNNER = os.environ.get("CODEX_VM_JOB_RUNNER", "/home/mark/.local/bin/codex-head
 MANAGER = os.environ.get("CODEX_CI_HEADLESS_MANAGER", "/home/mark/.local/bin/codex-ci-headless")
 INTERACTIVE_URL = os.environ.get("CODEX_LAB_INTERACTIVE_SCHEDULER_URL", "http://192.168.122.1:8766").rstrip("/")
 MAX_LAUNCHERS = max(1, int(os.environ.get("CODEX_VM_JOB_MAX_LAUNCHERS", "96")))
+MANAGER_PROXY_ENABLED = os.environ.get("CODEX_VM_JOB_MANAGER_PROXY", "0").strip().lower() in {"1","true","yes","on"}
+MANAGER_PROXY_TIMEOUT = max(30, min(int(os.environ.get("CODEX_VM_JOB_MANAGER_PROXY_TIMEOUT", "600")), 1800))
 MAX_TAIL = 1024 * 1024
 POLL_SECONDS = max(0.2, float(os.environ.get("CODEX_VM_JOB_POLL_SECONDS", "0.5")))
 TERMINAL = {"succeeded", "failed", "timed_out", "canceled"}
@@ -304,6 +306,42 @@ def list_jobs(status: str | None = None, limit: int = 50) -> list[dict]:
     return [public_job(row) for row in rows]
 
 
+def manager_proxy(payload: dict) -> dict:
+    if not MANAGER_PROXY_ENABLED:
+        raise RuntimeError("headless manager proxy is disabled")
+    args=payload.get("args")
+    if not isinstance(args,list) or not args or not all(isinstance(x,(str,int,float)) for x in args):
+        raise ValueError("manager proxy requires a non-empty args list")
+    argv=[str(x) for x in args]
+    action=argv[0]
+    if action not in {"reserve","provision","finish"}:
+        raise ValueError(f"manager proxy action is not allowed: {action}")
+    if action=="reserve" and len(argv) < 3:
+        raise ValueError("reserve requires owner/project arguments")
+    if action=="provision" and len(argv) != 2:
+        raise ValueError("provision requires exactly one instance id")
+    if action=="finish" and len(argv) < 2:
+        raise ValueError("finish requires an instance id")
+    cp=subprocess.run(
+        [MANAGER,*argv],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=MANAGER_PROXY_TIMEOUT,
+        check=False,
+        env={**os.environ,"CODEX_CI_DISPATCH_PID":str(os.getpid())},
+    )
+    if cp.returncode:
+        raise RuntimeError(cp.stderr.strip() or cp.stdout.strip() or f"headless manager rc={cp.returncode}")
+    try:
+        result=json.loads(cp.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("invalid headless manager response") from exc
+    if not isinstance(result,dict):
+        raise RuntimeError("headless manager response must be an object")
+    return result
+
+
 def manager_state() -> dict:
     cp = subprocess.run([MANAGER, "state", "--history-limit", "40"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, check=False)
     if cp.returncode:
@@ -423,6 +461,8 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         try:
             payload = self.read_json()
+            if u.path == "/api/manager":
+                return self.send_json(manager_proxy(payload), 200)
             if u.path == "/api/jobs":
                 return self.send_json(submit_job(payload), 201)
             if u.path.startswith("/api/jobs/") and u.path.endswith("/cancel"):
