@@ -25,6 +25,7 @@ GUEST_KEY = os.environ.get("CODEX_VM_LAB_GUEST_KEY", "/home/mark/.ssh/id_ed25519
 KNOWN_HOSTS = os.environ.get("CODEX_VM_LAB_KNOWN_HOSTS", "/home/mark/.ssh/codex_lab_known_hosts")
 REMOTE_CTL = os.environ.get("CODEX_VM_LAB_CTL", "/tank/vm/codex-lab/vm-labctl.sh")
 SCHEDULER_URL = os.environ.get("CODEX_LAB_SCHEDULER_URL", "http://192.168.122.1:8766").rstrip("/")
+WORKER_PROVIDER = os.environ.get("CODEX_LAB_WORKER_PROVIDER", "libvirt").strip().lower() or "libvirt"
 VAULT_URL = os.environ.get("CODEX_VAULT_URL", "https://vault.markshaw.ca").rstrip("/")
 
 
@@ -32,6 +33,36 @@ def now(): return datetime.now(timezone.utc)
 def iso(v=None): return (v or now()).isoformat()
 def ip_for(station): return f"192.168.122.{229 + int(station)}"
 def name_for(station): return f"codex-lab-vm-{int(station):02d}"
+
+def worker_ip_for(station):
+    station = int(station)
+    if station < 1:
+        raise ValueError("station must be >= 1")
+    if WORKER_PROVIDER == "libvirt":
+        return ip_for(station)
+    request = urllib.request.Request(
+        f"{SCHEDULER_URL}/api/workers/{station}",
+        method="GET",
+        headers={"Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=3) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+            status = int(getattr(response, "status", 200))
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(
+            f"Worker endpoint lookup failed with HTTP {int(exc.code)}"
+        ) from exc
+    except Exception as exc:
+        raise RuntimeError("Worker endpoint lookup failed") from exc
+    if status < 200 or status >= 300 or not isinstance(payload, dict):
+        raise RuntimeError("Worker endpoint lookup returned an invalid response")
+    if int(payload.get("station") or 0) != station:
+        raise RuntimeError("Worker endpoint station identity mismatch")
+    address = str(payload.get("ip") or "").strip()
+    if not address:
+        raise RuntimeError(f"Worker station {station} has no provider-resolved address")
+    return address
 
 def ensure_dirs():
     ROOT.mkdir(parents=True, exist_ok=True)
@@ -108,7 +139,7 @@ def ssh_host(command, timeout=120):
     return run(["ssh","-i",HOME_KEY,"-o","IdentitiesOnly=yes","-o","BatchMode=yes",HOME_SERVER,command], timeout)
 
 def ssh_guest(station, command, timeout=120, input_text=None):
-    return subprocess.run(["ssh","-i",GUEST_KEY,"-o","IdentitiesOnly=yes","-o","BatchMode=yes","-o",f"UserKnownHostsFile={KNOWN_HOSTS}","-o","StrictHostKeyChecking=accept-new","-o","ConnectTimeout=5",f"mark@{ip_for(station)}",command], input=input_text, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
+    return subprocess.run(["ssh","-i",GUEST_KEY,"-o","IdentitiesOnly=yes","-o","BatchMode=yes","-o",f"UserKnownHostsFile={KNOWN_HOSTS}","-o","StrictHostKeyChecking=accept-new","-o","ConnectTimeout=5",f"mark@{worker_ip_for(station)}",command], input=input_text, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
 
 def public_key():
     p=Path(GUEST_KEY+".pub")
@@ -125,15 +156,15 @@ def ensure_station(station):
     s=int(station)
     if not 1 <= s <= MAX_STATIONS: raise ValueError(f"station must be 1..{MAX_STATIONS}")
     ctl("ensure", s, public_key(), timeout=180)
-    run(["ssh-keygen","-f",KNOWN_HOSTS,"-R",ip_for(s)],20)
+    run(["ssh-keygen","-f",KNOWN_HOSTS,"-R",worker_ip_for(s)],20)
     for _ in range(25):
         r=ssh_guest(s,"test -e /var/lib/codex-lab-ready && printf READY",10)
-        if r.returncode==0 and "READY" in r.stdout: return {"station":s,"name":name_for(s),"ip":ip_for(s),"ready":True}
+        if r.returncode==0 and "READY" in r.stdout: return {"station":s,"name":name_for(s),"ip":worker_ip_for(s),"ready":True}
         time.sleep(1)
     raise RuntimeError(f"VM lab station {s} did not become SSH-ready")
 
 def reset_station(station):
-    s=int(station); ctl("reset",s,public_key(),timeout=180); run(["ssh-keygen","-f",KNOWN_HOSTS,"-R",ip_for(s)],20)
+    s=int(station); ctl("reset",s,public_key(),timeout=180); run(["ssh-keygen","-f",KNOWN_HOSTS,"-R",worker_ip_for(s)],20)
     if s <= PREWARM:
         for _ in range(25):
             r=ssh_guest(s,"test -e /var/lib/codex-lab-ready && printf READY",10)
@@ -391,7 +422,9 @@ def validate_lease(lease_id, station=None):
             )
             notify_usage("end", old, status="lost", finished_at=old.get("releasedAt"))
             raise KeyError(f"Lease {lease_id} no longer owns worker {old.get('station')}")
-        return record.copy()
+        resolved = record.copy()
+        resolved["ip"] = worker_ip_for(record["station"])
+        return resolved
     finally:
         unlock(lock)
 
