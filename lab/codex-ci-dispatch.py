@@ -17,8 +17,11 @@ import subprocess
 import sys
 import time
 import uuid
+import urllib.error
+import urllib.request
 
 MANAGER=os.environ.get("CODEX_CI_HEADLESS_MANAGER","/home/mark/.local/bin/codex-ci-headless")
+MANAGER_URL=os.environ.get("CODEX_CI_HEADLESS_MANAGER_URL","").strip().rstrip("/")
 SSH_USER=os.environ.get("CODEX_CI_SSH_USER","mark")
 SSH_KEY=os.environ.get("CODEX_CI_SSH_KEY","/home/mark/.local/share/codex-ci/ssh/id_ed25519_codex_ci")
 KNOWN_HOSTS=os.environ.get("CODEX_CI_KNOWN_HOSTS","/home/mark/.local/share/codex-ci/ssh/known_hosts")
@@ -29,8 +32,34 @@ def enc(value): return base64.urlsafe_b64encode(value.encode()).rstrip(b"=").dec
 
 
 def manager(*args,timeout=120):
+    argv=[str(x) for x in args]
+    if MANAGER_URL:
+        request=urllib.request.Request(
+            MANAGER_URL,
+            data=json.dumps({"args":argv},separators=(",",":")).encode(),
+            method="POST",
+            headers={"Content-Type":"application/json","Accept":"application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request,timeout=timeout) as response:
+                raw=response.read()
+                status=int(getattr(response,"status",200))
+        except urllib.error.HTTPError as exc:
+            raw=exc.read()
+            try: payload=json.loads(raw.decode()) if raw else {}
+            except Exception: payload={}
+            raise RuntimeError(str(payload.get("error") or f"headless manager proxy HTTP {exc.code}")) from exc
+        except (urllib.error.URLError,TimeoutError,OSError) as exc:
+            raise RuntimeError("headless manager proxy request failed") from exc
+        if status < 200 or status >= 300:
+            raise RuntimeError(f"headless manager proxy HTTP {status}")
+        try: payload=json.loads(raw.decode())
+        except Exception as exc: raise RuntimeError("invalid manager proxy response") from exc
+        if not isinstance(payload,dict):
+            raise RuntimeError("invalid manager proxy response")
+        return payload
     environ = dict(os.environ, CODEX_CI_DISPATCH_PID=str(os.getpid()))
-    cp=subprocess.run([MANAGER,*map(str,args)],text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout,check=False,env=environ)
+    cp=subprocess.run([MANAGER,*argv],text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout,check=False,env=environ)
     if cp.returncode: raise RuntimeError(cp.stderr.strip() or cp.stdout.strip() or f"headless manager rc={cp.returncode}")
     try: return json.loads(cp.stdout)
     except json.JSONDecodeError as exc: raise RuntimeError(f"invalid manager response: {cp.stdout[:500]}") from exc
