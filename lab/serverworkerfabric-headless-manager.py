@@ -43,7 +43,8 @@ def api_token():
         if value:
             return value
     raise FabricManagerError(
-        "CODEX_CI_SWF_API_TOKEN or CODEX_CI_SWF_API_TOKEN_FILE is required"
+        "ServerWorkerFabric API token is required via "
+        "CODEX_CI_SWF_API_TOKEN or CODEX_CI_SWF_API_TOKEN_FILE"
     )
 
 
