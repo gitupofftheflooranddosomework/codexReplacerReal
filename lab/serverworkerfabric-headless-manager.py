@@ -13,6 +13,7 @@ import json
 import os
 import pathlib
 import socket
+import ssl
 import sys
 import time
 import urllib.error
@@ -24,6 +25,7 @@ TOKEN=os.environ.get("CODEX_CI_SWF_API_TOKEN","").strip()
 TOKEN_FILE=os.environ.get("CODEX_CI_SWF_API_TOKEN_FILE","").strip()
 PROFILE=os.environ.get("CODEX_CI_SWF_HEADLESS_PROFILE","headless").strip() or "headless"
 HTTP_TIMEOUT=max(1.0,float(os.environ.get("CODEX_CI_SWF_API_TIMEOUT","10")))
+CA_FILE=os.environ.get("CODEX_CI_SWF_API_CA_FILE","").strip()
 READY_TIMEOUT=max(5.0,float(os.environ.get("CODEX_CI_SWF_READY_TIMEOUT","180")))
 POLL_SECONDS=max(0.1,float(os.environ.get("CODEX_CI_SWF_READY_POLL_SECONDS","2")))
 
@@ -55,6 +57,15 @@ def base_url():
     return BASE_URL
 
 
+def _ssl_context():
+    if not CA_FILE:
+        return ssl.create_default_context()
+    try:
+        return ssl.create_default_context(cafile=CA_FILE)
+    except (OSError,ssl.SSLError) as exc:
+        raise FabricManagerError("CODEX_CI_SWF_API_CA_FILE is not usable") from exc
+
+
 def _request(method,path,payload=None,*,allow_404=False):
     url=base_url()+path
     headers={
@@ -68,7 +79,9 @@ def _request(method,path,payload=None,*,allow_404=False):
         headers["Content-Type"]="application/json"
     request=urllib.request.Request(url,data=data,method=method,headers=headers)
     try:
-        with urllib.request.urlopen(request,timeout=HTTP_TIMEOUT) as response:
+        with urllib.request.urlopen(
+            request,timeout=HTTP_TIMEOUT,context=_ssl_context()
+        ) as response:
             raw=response.read()
             status=int(getattr(response,"status",200))
     except urllib.error.HTTPError as exc:
@@ -164,7 +177,9 @@ def provision(instance_id):
             },
         )
         try:
-            with urllib.request.urlopen(request,timeout=HTTP_TIMEOUT) as response:
+            with urllib.request.urlopen(
+            request,timeout=HTTP_TIMEOUT,context=_ssl_context()
+        ) as response:
                 raw=response.read()
                 status=int(getattr(response,"status",200))
         except urllib.error.HTTPError as exc:
