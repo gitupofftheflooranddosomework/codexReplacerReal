@@ -7,6 +7,7 @@ import mimetypes
 import os
 import queue
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -490,9 +491,19 @@ class KvmWorkerBrowserClient:
     def _start(self):
         self.close()
         self._start_tunnel()
-        image = os.environ.get("CODEX_REPLACER_BROWSER_IMAGE", "markshaw-private-mcp_browser:latest")
-        self.process = subprocess.Popen(
-            [
+        native_command = os.environ.get("CODEX_REPLACER_BROWSER_MCP_COMMAND", "").strip()
+        if native_command:
+            arguments = [
+                *shlex.split(native_command),
+                "--cdp-endpoint", self.endpoint,
+                "--caps", "vision",
+                "--image-responses", "allow",
+                "--timeout-action", "10000",
+                "--timeout-navigation", "90000",
+            ]
+        else:
+            image = os.environ.get("CODEX_REPLACER_BROWSER_IMAGE", "markshaw-private-mcp_browser:latest")
+            arguments = [
                 "docker", "run", "--rm", "-i", "--network", "host",
                 "--entrypoint", "node", image,
                 "/app/cli.js",
@@ -504,7 +515,9 @@ class KvmWorkerBrowserClient:
                 "--timeout-action", "10000",
                 "--timeout-navigation", "90000",
                 "--timeout-settle", "750",
-            ],
+            ]
+        self.process = subprocess.Popen(
+            arguments,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=sys.stderr,
