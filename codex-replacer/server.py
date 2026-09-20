@@ -442,7 +442,7 @@ class KvmWorkerBrowserClient:
                 "-o", "IdentitiesOnly=yes",
                 "-o", "BatchMode=yes",
                 "-o", f"UserKnownHostsFile={known_hosts}",
-                "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "StrictHostKeyChecking=yes",
                 "-o", "ExitOnForwardFailure=yes",
                 "-o", "ServerAliveInterval=30",
                 "-o", "ServerAliveCountMax=3",
