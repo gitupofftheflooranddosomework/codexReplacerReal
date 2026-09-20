@@ -1,0 +1,2 @@
+Host 192.168.122.*
+    ProxyCommand ssh -i /etc/serverworkerfabric/vm-lab/relay_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o UserKnownHostsFile=/etc/serverworkerfabric/vm-lab/known_hosts -o StrictHostKeyChecking=yes -W %h:%p mark@10.0.0.229
