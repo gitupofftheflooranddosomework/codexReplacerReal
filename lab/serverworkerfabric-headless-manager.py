@@ -233,6 +233,29 @@ def provision(instance_id):
         time.sleep(POLL_SECONDS)
 
 
+def state(history_limit=40):
+    """Return read-only Fabric worker inventory for scheduler telemetry."""
+    del history_limit
+    _,payload=_request("GET","/v1/workers")
+    workers=payload.get("workers")
+    if not isinstance(workers,list):
+        raise FabricManagerError("ServerWorkerFabric worker inventory is missing workers")
+    visible=[worker for worker in workers if isinstance(worker,dict)]
+    headless=[
+        worker for worker in visible
+        if str(worker.get("logical_id") or "").startswith("headless-")
+        or str((worker.get("metadata") or {}).get("profile") or "") == PROFILE
+    ]
+    return {
+        "provider":"serverworkerfabric",
+        "workers":visible,
+        "capacity":{
+            "visibleWorkers":len(visible),
+            "headlessWorkers":len(headless),
+        },
+    }
+
+
 def finish(instance_id,status="finished",exit_code=None,reason="job_finished",keep_seconds=0):
     del status,exit_code,reason
     logical=str(instance_id or "").strip()
@@ -270,6 +293,8 @@ def parser():
     r.add_argument("--max-memory-mib",type=int,default=4096)
     r.add_argument("--vcpus",type=int,default=2)
     r.add_argument("--disk-gib",type=int,default=40)
+    st=sub.add_parser("state")
+    st.add_argument("--history-limit",type=int,default=40)
     pr=sub.add_parser("provision")
     pr.add_argument("id")
     f=sub.add_parser("finish")
@@ -290,6 +315,8 @@ def main(argv=None):
                 memory_mib=a.memory_mib,max_memory_mib=a.max_memory_mib,
                 vcpus=a.vcpus,disk_gib=a.disk_gib,
             )
+        elif a.action=="state":
+            result=state(a.history_limit)
         elif a.action=="provision":
             result=provision(a.id)
         elif a.action=="finish":
