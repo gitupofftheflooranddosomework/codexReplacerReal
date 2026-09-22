@@ -18,7 +18,9 @@ permissions:
 
 jobs:
   validate:
-    runs-on: ubuntu-latest
+    # Owned Fabric capacity only. If it is unavailable this job must remain
+    # queued; never fall back to GitHub-hosted or paid runners.
+    runs-on: [self-hosted, serverworkerfabric, lxc, build]
     timeout-minutes: 10
     steps:
       - name: Check out repository
