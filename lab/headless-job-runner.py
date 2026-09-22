@@ -105,7 +105,10 @@ def prepare_workspace(payload: dict, job_dir: pathlib.Path) -> pathlib.Path:
             )
             if cp.returncode:
                 raise RuntimeError(cp.stderr.strip() or cp.stdout.strip() or "git fetch failed")
-            subprocess.run(["git", "checkout", "--detach", "FETCH_HEAD"], cwd=workspace, check=True)
+            subprocess.run(
+                ["git", "checkout", "--detach", "FETCH_HEAD"], cwd=workspace,
+                check=True, env=git_env,
+            )
     else:
         workspace.mkdir(parents=True, exist_ok=True)
         subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
