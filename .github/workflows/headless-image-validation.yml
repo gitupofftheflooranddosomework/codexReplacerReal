@@ -5,6 +5,10 @@ on:
     paths:
       - 'lab/build-ci-headless-base.sh'
       - 'lab/codex-ci-headless.py'
+      - 'lab/headless-job-scheduler.py'
+      - 'lab/headless-job-scheduler-test.py'
+      - 'lab/serverworkerfabric-headless-manager.py'
+      - 'lab/serverworkerfabric-headless-manager-test.py'
       - 'lab/headless-template-identity-test.py'
       - '.github/workflows/headless-image-validation.yml'
   workflow_dispatch:
@@ -25,5 +29,13 @@ jobs:
         run: |
           set -euo pipefail
           bash -n lab/build-ci-headless-base.sh
-          python3 -m py_compile lab/codex-ci-headless.py lab/headless-template-identity-test.py
+          python3 -m py_compile \
+            lab/codex-ci-headless.py \
+            lab/headless-template-identity-test.py \
+            lab/headless-job-scheduler.py \
+            lab/headless-job-scheduler-test.py \
+            lab/serverworkerfabric-headless-manager.py \
+            lab/serverworkerfabric-headless-manager-test.py
           python3 lab/headless-template-identity-test.py
+          python3 lab/headless-job-scheduler-test.py
+          python3 lab/serverworkerfabric-headless-manager-test.py
