@@ -2,9 +2,11 @@
 """Run one queued MCP heavy job through the disposable headless KVM dispatcher."""
 from __future__ import annotations
 
+import base64
 import json
 import os
 import pathlib
+import urllib.parse
 import shlex
 import signal
 import subprocess
@@ -54,6 +56,53 @@ def resources(job_class: str) -> tuple[int, int, int]:
     return table.get(str(job_class or "cpu"), table["cpu"])
 
 
+def controller_git_env(repo_url: str) -> dict[str, str]:
+    """Return a controller-only Git environment for GitHub HTTPS access.
+
+    Credentials are resolved on the controller and injected only into the git
+    child process through an in-memory extraHeader. They are never written into
+    the repository URL, payload, worker workspace, or dispatcher environment.
+    """
+    env = dict(os.environ)
+    for key in ("GH_TOKEN", "GITHUB_TOKEN", "GITHUB_PAT"):
+        env.pop(key, None)
+    parsed = urllib.parse.urlsplit(str(repo_url or "").strip())
+    if parsed.scheme not in ("http", "https") or parsed.hostname != "github.com":
+        return env
+    if parsed.username is not None or parsed.password is not None:
+        raise RuntimeError("GitHub repoUrl must not contain embedded credentials")
+
+    token = ""
+    token_file = os.environ.get("CODEX_VM_JOB_GITHUB_TOKEN_FILE", "").strip()
+    if token_file:
+        try:
+            token = pathlib.Path(token_file).read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise RuntimeError("controller GitHub token file is not readable") from exc
+    if not token:
+        try:
+            cp = subprocess.run(
+                ["gh", "auth", "token", "--hostname", "github.com"],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                check=False, timeout=10,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            cp = None
+        if cp is not None and cp.returncode == 0:
+            token = cp.stdout.strip()
+    if not token:
+        return env
+    if any(ord(ch) < 33 for ch in token):
+        raise RuntimeError("controller GitHub token is malformed")
+
+    basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    env["GIT_CONFIG_COUNT"] = "1"
+    env["GIT_CONFIG_KEY_0"] = "http.https://github.com/.extraheader"
+    env["GIT_CONFIG_VALUE_0"] = f"AUTHORIZATION: basic {basic}"
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
 def prepare_workspace(payload: dict, job_dir: pathlib.Path) -> pathlib.Path:
     workspace = job_dir / "workspace"
     repo = str(payload.get("repoUrl") or "").strip()
@@ -61,16 +110,17 @@ def prepare_workspace(payload: dict, job_dir: pathlib.Path) -> pathlib.Path:
     if workspace.exists():
         subprocess.run(["rm", "-rf", str(workspace)], check=True)
     if repo:
+        git_env = controller_git_env(repo)
         cp = subprocess.run(
             ["git", "clone", "--filter=blob:none", repo, str(workspace)],
-            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, env=git_env,
         )
         if cp.returncode:
             raise RuntimeError(cp.stderr.strip() or cp.stdout.strip() or "git clone failed")
         if revision:
             cp = subprocess.run(
                 ["git", "fetch", "--depth=1", "origin", revision], cwd=workspace,
-                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, env=git_env,
             )
             if cp.returncode:
                 raise RuntimeError(cp.stderr.strip() or cp.stdout.strip() or "git fetch failed")
