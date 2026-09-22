@@ -17,7 +17,7 @@ import threading
 import time
 import urllib.request
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -34,6 +34,7 @@ MANAGER_PROXY_ENABLED = os.environ.get("CODEX_VM_JOB_MANAGER_PROXY", "0").strip(
 MANAGER_PROXY_TIMEOUT = max(30, min(int(os.environ.get("CODEX_VM_JOB_MANAGER_PROXY_TIMEOUT", "600")), 1800))
 MAX_TAIL = 1024 * 1024
 POLL_SECONDS = max(0.2, float(os.environ.get("CODEX_VM_JOB_POLL_SECONDS", "0.5")))
+CLAIM_STALE_SECONDS = max(5, int(os.environ.get("CODEX_VM_JOB_CLAIM_STALE_SECONDS", "30")))
 TERMINAL = {"succeeded", "failed", "timed_out", "canceled"}
 STOP = threading.Event()
 WAKE = threading.Event()
@@ -196,10 +197,29 @@ def reconcile_one(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
         )
 
 
+def recover_stale_claims(conn: sqlite3.Connection) -> int:
+    """Release pre-Popen claim sentinels left behind by an interrupted scheduler.
+
+    launcher_pid=0 is intentionally used as an atomic claim while launch_row()
+    starts the child. A fresh claim must remain exclusive, but after a bounded
+    grace period no live process can own the sentinel and the row is safe to
+    make launchable again.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=CLAIM_STALE_SECONDS)).isoformat()
+    stamp = now_iso()
+    changed = conn.execute(
+        "UPDATE jobs SET launcher_pid=NULL,updated_at=?,error=? "
+        "WHERE status='queued' AND launcher_pid=0 AND updated_at<?",
+        (stamp, "recovered stale pre-launch claim", cutoff),
+    ).rowcount
+    return int(changed)
+
+
 def scheduler_iteration() -> None:
     reap_launchers()
     with DB_LOCK:
         conn = db()
+        recover_stale_claims(conn)
         active = conn.execute("SELECT * FROM jobs WHERE status IN ('queued','running') AND launcher_pid IS NOT NULL ORDER BY created_at").fetchall()
         for row in active:
             reconcile_one(conn, row)
