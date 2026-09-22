@@ -131,6 +131,38 @@ class ServerWorkerFabricHeadlessManagerTests(unittest.TestCase):
             with self.assertRaisesRegex(m.FabricManagerError,"identity mismatch"):
                 m.provision("headless-abcd")
 
+    def test_state_reads_worker_inventory_without_mutation(self):
+        calls=[]
+        def open_url(request,timeout):
+            calls.append((request,timeout))
+            return Response({
+                "workers":[
+                    {
+                        "logical_id":"headless-abcd",
+                        "state":"running",
+                        "address":"10.77.20.44",
+                        "metadata":{"profile":m.PROFILE},
+                    },
+                    {
+                        "logical_id":"station-01",
+                        "state":"running",
+                        "address":"10.77.10.11",
+                        "metadata":{"profile":"workstation"},
+                    },
+                ]
+            },200)
+        p1,p2,p3=self.settings()
+        with p1,p2,p3,mock.patch.object(m.urllib.request,"urlopen",side_effect=open_url):
+            got=m.state(40)
+        self.assertEqual(got["provider"],"serverworkerfabric")
+        self.assertEqual(got["capacity"]["visibleWorkers"],2)
+        self.assertEqual(got["capacity"]["headlessWorkers"],1)
+        request,timeout=calls[0]
+        self.assertEqual(request.full_url,"https://fabric.internal/v1/workers")
+        self.assertEqual(request.method,"GET")
+        self.assertIsNone(request.data)
+        self.assertEqual(timeout,m.HTTP_TIMEOUT)
+
     def test_finish_refuses_retention_without_deleting(self):
         p1,p2,p3=self.settings()
         with p1,p2,p3,mock.patch.object(
