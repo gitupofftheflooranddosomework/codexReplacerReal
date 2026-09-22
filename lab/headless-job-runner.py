@@ -14,6 +14,7 @@ import time
 
 DISPATCH = os.environ.get("CODEX_CI_DISPATCH", "/home/mark/.local/bin/codex-ci-dispatch")
 WAIT_SECONDS = max(60, int(os.environ.get("CODEX_VM_JOB_WAIT_SECONDS", "86400")))
+GIT_TOKEN_FILE = os.environ.get("CODEX_GIT_TOKEN_FILE", "").strip()
 
 
 def atomic_json(path: pathlib.Path, payload: dict) -> None:
@@ -54,6 +55,35 @@ def resources(job_class: str) -> tuple[int, int, int]:
     return table.get(str(job_class or "cpu"), table["cpu"])
 
 
+def git_environment(job_dir: pathlib.Path) -> dict[str, str]:
+    """Build a non-interactive Git environment without putting secrets in argv."""
+    env = {
+        **os.environ,
+        "GIT_TERMINAL_PROMPT": "0",
+        # Ignore any ambient credential helper inherited by the service account.
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "credential.helper",
+        "GIT_CONFIG_VALUE_0": "",
+    }
+    if not GIT_TOKEN_FILE:
+        return env
+    token_file = pathlib.Path(GIT_TOKEN_FILE)
+    if not token_file.is_absolute() or not token_file.is_file():
+        raise RuntimeError("CODEX_GIT_TOKEN_FILE must name a readable absolute file")
+    helper = job_dir / ".git-askpass"
+    helper.write_text(
+        "#!/bin/sh\n"
+        "case \"$1\" in\n"
+        "  *Username*) printf '%s\\n' x-access-token ;;\n"
+        "  *Password*) cat \"$CODEX_GIT_TOKEN_FILE\" ;;\n"
+        "  *) exit 1 ;;\n"
+        "esac\n"
+    )
+    helper.chmod(0o700)
+    env["GIT_ASKPASS"] = str(helper)
+    return env
+
+
 def prepare_workspace(payload: dict, job_dir: pathlib.Path) -> pathlib.Path:
     workspace = job_dir / "workspace"
     repo = str(payload.get("repoUrl") or "").strip()
@@ -61,16 +91,17 @@ def prepare_workspace(payload: dict, job_dir: pathlib.Path) -> pathlib.Path:
     if workspace.exists():
         subprocess.run(["rm", "-rf", str(workspace)], check=True)
     if repo:
+        git_env = git_environment(job_dir)
         cp = subprocess.run(
             ["git", "clone", "--filter=blob:none", repo, str(workspace)],
-            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, env=git_env,
         )
         if cp.returncode:
             raise RuntimeError(cp.stderr.strip() or cp.stdout.strip() or "git clone failed")
         if revision:
             cp = subprocess.run(
                 ["git", "fetch", "--depth=1", "origin", revision], cwd=workspace,
-                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, env=git_env,
             )
             if cp.returncode:
                 raise RuntimeError(cp.stderr.strip() or cp.stdout.strip() or "git fetch failed")
