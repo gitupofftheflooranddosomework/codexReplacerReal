@@ -107,6 +107,45 @@ def main():
         assert stale_pid is None, stale_pid
         assert fresh_pid == 0, fresh_pid
 
+        # A launch/allocation failure must become an honest terminal result;
+        # it must not remain queued for an unbounded retry loop.
+        conn = sched.db()
+        conn.execute(
+            "UPDATE jobs SET status='canceled',finished_at=?,launcher_pid=NULL "
+            "WHERE status IN ('queued','running')",
+            (sched.now_iso(),),
+        )
+        conn.commit(); conn.close()
+        failed = sched.submit_job({"owner":"failed","project":"p","command":"true"})
+
+        def fail_launch(_row):
+            raise RuntimeError("forced allocation failure")
+
+        sched.launch_row = fail_launch
+        sched.scheduler_iteration()
+        failed_result = sched.get_job(failed["id"], 4096)
+        assert failed_result["status"] == "failed", failed_result
+        assert failed_result["finished_at"], failed_result
+        assert "forced allocation failure" in failed_result["error"], failed_result
+
+        # Runner timeout receipt 124 is durable and reconciles to timed_out,
+        # including after a scheduler process restart/reload.
+        timed = sched.submit_job({"owner":"timeout","project":"p","command":"sleep 99"})
+        conn = sched.db()
+        conn.execute("UPDATE jobs SET launcher_pid=? WHERE id=?", (os.getpid(), timed["id"]))
+        conn.commit(); conn.close()
+        timed_dir = sched.job_dir(timed["id"])
+        timed_dir.mkdir(parents=True, exist_ok=True)
+        (timed_dir / "rc").write_text("124\n")
+        conn = sched.db()
+        timed_row = conn.execute("SELECT * FROM jobs WHERE id=?", (timed["id"],)).fetchone()
+        sched.reconcile_one(conn, timed_row)
+        conn.commit(); conn.close()
+        timed_result = sched.get_job(timed["id"], 4096)
+        assert timed_result["status"] == "timed_out", timed_result
+        assert timed_result["exitCode"] == 124, timed_result
+        assert timed_result["finished_at"], timed_result
+
     runner = load(LAB / "headless-job-runner.py", "headless_job_runner_tested")
     assert runner.resources("io") == (1024, 2048, 1)
     assert runner.resources("cpu") == (1536, 3072, 2)
