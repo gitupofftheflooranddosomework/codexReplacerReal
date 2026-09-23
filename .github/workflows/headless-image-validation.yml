@@ -9,6 +9,8 @@ on:
       - 'lab/headless-job-scheduler-test.py'
       - 'lab/headless-job-runner.py'
       - 'lab/headless-private-repo-auth-test.py'
+      - 'lab/headless-rollout-admission-test.py'
+      - 'lab/rollout_admission.py'
       - 'lab/serverworkerfabric-headless-manager.py'
       - 'lab/serverworkerfabric-headless-manager-test.py'
       - 'lab/headless-template-identity-test.py'
@@ -40,9 +42,12 @@ jobs:
             lab/headless-job-scheduler-test.py \
             lab/headless-job-runner.py \
             lab/headless-private-repo-auth-test.py \
+            lab/headless-rollout-admission-test.py \
+            lab/rollout_admission.py \
             lab/serverworkerfabric-headless-manager.py \
             lab/serverworkerfabric-headless-manager-test.py
           python3 lab/headless-template-identity-test.py
           python3 lab/headless-job-scheduler-test.py
           python3 lab/headless-private-repo-auth-test.py
+          python3 lab/headless-rollout-admission-test.py
           python3 lab/serverworkerfabric-headless-manager-test.py

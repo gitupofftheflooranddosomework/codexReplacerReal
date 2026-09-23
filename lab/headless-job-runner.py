@@ -14,6 +14,8 @@ import sys
 import threading
 import time
 
+import rollout_admission
+
 DISPATCH = os.environ.get("CODEX_CI_DISPATCH", "/home/mark/.local/bin/codex-ci-dispatch")
 WAIT_SECONDS = max(60, int(os.environ.get("CODEX_VM_JOB_WAIT_SECONDS", "86400")))
 GIT_TOKEN_FILE = os.environ.get("CODEX_GIT_TOKEN_FILE", "").strip()
@@ -163,6 +165,12 @@ def main() -> int:
     meta_path = job_dir / "meta.json"
     rc_path = job_dir / "rc"
     workspace = prepare_workspace(payload, job_dir)
+    rollout_admission.authorize_effect(
+        str(payload["id"]),
+        payload.get("admissionGeneration"),
+        str(payload.get("project") or ""),
+        str(payload.get("jobClass") or "cpu"),
+    )
     cwd = normalize_cwd(payload.get("cwd") or "/workspace")
     command = str(payload["command"])
     if cwd != ".":
