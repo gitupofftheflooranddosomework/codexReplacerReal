@@ -81,6 +81,29 @@ def main():
         conn.close()
         assert claimed == os.getpid(), claimed
 
+        # A service/process interruption can leave the atomic pre-Popen
+        # sentinel behind. Old sentinels must become launchable again, while a
+        # fresh concurrent claim remains protected.
+        stale = sched.submit_job({"owner":"stale","project":"p","command":"echo stale","timeout":123})
+        fresh = sched.submit_job({"owner":"fresh","project":"p","command":"echo fresh","timeout":123})
+        conn = sched.db()
+        conn.execute(
+            "UPDATE jobs SET launcher_pid=0,updated_at=? WHERE id=?",
+            ("2000-01-01T00:00:00+00:00", stale["id"]),
+        )
+        conn.execute(
+            "UPDATE jobs SET launcher_pid=0,updated_at=? WHERE id=?",
+            (sched.now_iso(), fresh["id"]),
+        )
+        conn.commit()
+        recovered = sched.recover_stale_claims(conn)
+        stale_pid = conn.execute("SELECT launcher_pid FROM jobs WHERE id=?", (stale["id"],)).fetchone()[0]
+        fresh_pid = conn.execute("SELECT launcher_pid FROM jobs WHERE id=?", (fresh["id"],)).fetchone()[0]
+        conn.close()
+        assert recovered == 1, recovered
+        assert stale_pid is None, stale_pid
+        assert fresh_pid == 0, fresh_pid
+
     runner = load(LAB / "headless-job-runner.py", "headless_job_runner_tested")
     assert runner.resources("io") == (1024, 2048, 1)
     assert runner.resources("cpu") == (1536, 3072, 2)
