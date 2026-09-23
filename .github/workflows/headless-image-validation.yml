@@ -10,6 +10,8 @@ on:
       - 'lab/headless-job-runner.py'
       - 'lab/headless-private-repo-auth-test.py'
       - 'lab/headless-rollout-admission-test.py'
+      - 'lab/headless-synthetic-canary-test.py'
+      - 'lab/headless-candidate-probe.py'
       - 'lab/rollout_admission.py'
       - 'lab/serverworkerfabric-headless-manager.py'
       - 'lab/serverworkerfabric-headless-manager-test.py'
@@ -43,6 +45,8 @@ jobs:
             lab/headless-job-runner.py \
             lab/headless-private-repo-auth-test.py \
             lab/headless-rollout-admission-test.py \
+            lab/headless-synthetic-canary-test.py \
+            lab/headless-candidate-probe.py \
             lab/rollout_admission.py \
             lab/serverworkerfabric-headless-manager.py \
             lab/serverworkerfabric-headless-manager-test.py
@@ -50,4 +54,5 @@ jobs:
           python3 lab/headless-job-scheduler-test.py
           python3 lab/headless-private-repo-auth-test.py
           python3 lab/headless-rollout-admission-test.py
+          python3 lab/headless-synthetic-canary-test.py
           python3 lab/serverworkerfabric-headless-manager-test.py

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import signal
 import sqlite3
 import subprocess
@@ -34,6 +35,7 @@ INTERACTIVE_URL = os.environ.get("CODEX_LAB_INTERACTIVE_SCHEDULER_URL", "http://
 MAX_LAUNCHERS = max(1, int(os.environ.get("CODEX_VM_JOB_MAX_LAUNCHERS", "96")))
 MANAGER_PROXY_ENABLED = os.environ.get("CODEX_VM_JOB_MANAGER_PROXY", "0").strip().lower() in {"1","true","yes","on"}
 MANAGER_PROXY_TIMEOUT = max(30, min(int(os.environ.get("CODEX_VM_JOB_MANAGER_PROXY_TIMEOUT", "600")), 1800))
+SYNTHETIC_CANARY_ENABLED = os.environ.get("CODEX_VM_JOB_SYNTHETIC_CANARY", "0").strip().lower() in {"1","true","yes","on"}
 MAX_TAIL = 1024 * 1024
 POLL_SECONDS = max(0.2, float(os.environ.get("CODEX_VM_JOB_POLL_SECONDS", "0.5")))
 CLAIM_STALE_SECONDS = max(5, int(os.environ.get("CODEX_VM_JOB_CLAIM_STALE_SECONDS", "30")))
@@ -43,6 +45,7 @@ WAKE = threading.Event()
 DB_LOCK = threading.RLock()
 LAUNCHERS_LOCK = threading.Lock()
 LAUNCHERS: dict[int, subprocess.Popen] = {}
+CANARY_ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$")
 
 
 def now_iso() -> str:
@@ -72,6 +75,10 @@ def db() -> sqlite3.Connection:
         conn.execute("ALTER TABLE jobs ADD COLUMN admission_generation INTEGER")
     conn.execute("CREATE INDEX IF NOT EXISTS headless_jobs_status_created ON jobs(status,created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS headless_jobs_finished ON jobs(finished_at)")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS synthetic_canary_receipts("
+        "operation_id TEXT PRIMARY KEY,created_at TEXT NOT NULL,confirmed_at TEXT NOT NULL)"
+    )
     conn.commit()
     return conn
 
@@ -323,6 +330,36 @@ def submit_job(payload: dict) -> dict:
     return public_job(row)
 
 
+def synthetic_canary(operation_id: str) -> dict:
+    """Exercise candidate HTTP + durable receipt capability without worker allocation."""
+    if not SYNTHETIC_CANARY_ENABLED:
+        raise RuntimeError("synthetic canary capability is disabled")
+    operation_id = str(operation_id or "").strip()
+    if not CANARY_ID.fullmatch(operation_id):
+        raise ValueError("invalid synthetic canary operation id")
+    stamp = now_iso()
+    with DB_LOCK:
+        conn = db()
+        created = conn.execute(
+            "INSERT OR IGNORE INTO synthetic_canary_receipts(operation_id,created_at,confirmed_at) VALUES(?,?,?)",
+            (operation_id, stamp, stamp),
+        ).rowcount == 1
+        row = conn.execute(
+            "SELECT operation_id,created_at,confirmed_at FROM synthetic_canary_receipts WHERE operation_id=?",
+            (operation_id,),
+        ).fetchone()
+        conn.commit()
+        conn.close()
+    return {
+        "ok": True,
+        "capability": "durable-scheduler-receipt",
+        "operationId": row["operation_id"],
+        "created": created,
+        "createdAt": row["created_at"],
+        "confirmedAt": row["confirmed_at"],
+    }
+
+
 def tail(path: pathlib.Path, limit: int) -> str:
     try:
         with path.open("rb") as handle:
@@ -515,6 +552,10 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         try:
             payload = self.read_json()
+            if u.path == "/api/canary":
+                if self.client_address[0] not in {"127.0.0.1", "::1"}:
+                    return self.send_json({"error":"synthetic canary is loopback-only"}, 403)
+                return self.send_json(synthetic_canary(payload.get("operationId")), 200)
             if u.path == "/api/manager":
                 return self.send_json(manager_proxy(payload), 200)
             if u.path == "/api/jobs":
