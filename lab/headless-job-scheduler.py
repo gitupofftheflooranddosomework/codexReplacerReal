@@ -21,6 +21,8 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+import rollout_admission
+
 HOST = os.environ.get("CODEX_VM_JOB_HOST", "192.168.122.1")
 PORT = int(os.environ.get("CODEX_VM_JOB_PORT", "8767"))
 ROOT = pathlib.Path(os.environ.get("CODEX_VM_JOB_ROOT", "/tank/vm/codex-ci-headless/job-scheduler"))
@@ -62,9 +64,12 @@ def db() -> sqlite3.Connection:
           cwd TEXT NOT NULL,env_json TEXT NOT NULL,timeout_seconds INTEGER NOT NULL,
           repo_url TEXT,revision TEXT,status TEXT NOT NULL,launcher_pid INTEGER,
           instance_id TEXT,worker TEXT,worker_ip TEXT,exit_code INTEGER,error TEXT,
-          cancel_requested INTEGER NOT NULL DEFAULT 0
+          cancel_requested INTEGER NOT NULL DEFAULT 0,admission_generation INTEGER
         )"""
     )
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+    if "admission_generation" not in columns:
+        conn.execute("ALTER TABLE jobs ADD COLUMN admission_generation INTEGER")
     conn.execute("CREATE INDEX IF NOT EXISTS headless_jobs_status_created ON jobs(status,created_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS headless_jobs_finished ON jobs(finished_at)")
     conn.commit()
@@ -100,6 +105,13 @@ def load_json(path: pathlib.Path) -> dict:
         return {}
 
 
+def finish_admission(task_id: str) -> None:
+    try:
+        rollout_admission.finish(task_id)
+    except rollout_admission.AdmissionError as exc:
+        print(json.dumps({"event":"admission_finish_failed","time":now_iso(),"job":task_id,"error":str(exc)}), flush=True)
+
+
 def public_job(row) -> dict | None:
     if row is None:
         return None
@@ -117,6 +129,7 @@ def public_job(row) -> dict | None:
     out["instanceId"] = out.pop("instance_id", None)
     out["exitCode"] = out.pop("exit_code", None)
     out["cancelRequested"] = bool(out.pop("cancel_requested", 0))
+    out["admissionGeneration"] = out.pop("admission_generation", None)
     out.pop("launcher_pid", None)
     out["execution"] = "ephemeral-headless-kvm"
     return out
@@ -131,6 +144,7 @@ def write_payload(row: sqlite3.Row) -> pathlib.Path:
         "jobClass": row["job_class"], "command": row["command"], "cwd": row["cwd"],
         "env": json.loads(row["env_json"] or "{}"), "timeout": row["timeout_seconds"],
         "repoUrl": row["repo_url"], "revision": row["revision"],
+        "admissionGeneration": row["admission_generation"],
     }
     path = d / "payload.json"
     tmp = path.with_suffix(".tmp")
@@ -141,6 +155,12 @@ def write_payload(row: sqlite3.Row) -> pathlib.Path:
 
 
 def launch_row(row: sqlite3.Row) -> None:
+    rollout_admission.authorize_effect(
+        row["id"],
+        row["admission_generation"],
+        str(row["project"] or ""),
+        str(row["job_class"]),
+    )
     payload = write_payload(row)
     d = payload.parent
     stdout = open(d / "stdout.log", "ab", buffering=0)
@@ -189,12 +209,14 @@ def reconcile_one(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
             "UPDATE jobs SET status=?,exit_code=?,finished_at=COALESCE(finished_at,?),updated_at=?,launcher_pid=NULL WHERE id=?",
             (status, rc, stamp, stamp, row["id"]),
         )
+        finish_admission(row["id"])
         return
     if row["launcher_pid"] and not pid_alive(int(row["launcher_pid"])):
         conn.execute(
             "UPDATE jobs SET status='failed',finished_at=COALESCE(finished_at,?),updated_at=?,launcher_pid=NULL,error=? WHERE id=?",
             (stamp, stamp, "headless launcher exited without a result", row["id"]),
         )
+        finish_admission(row["id"])
 
 
 def recover_stale_claims(conn: sqlite3.Connection) -> int:
@@ -252,6 +274,7 @@ def scheduler_iteration() -> None:
                 conn.execute("UPDATE jobs SET status='failed',finished_at=?,updated_at=?,launcher_pid=NULL,error=? WHERE id=?",
                              (stamp, stamp, str(exc)[:2000], row["id"]))
                 conn.commit(); conn.close()
+            finish_admission(row["id"])
 
 
 def scheduler_loop() -> None:
@@ -271,22 +294,31 @@ def submit_job(payload: dict) -> dict:
         raise ValueError("owner and command are required")
     env = payload.get("env") if isinstance(payload.get("env"), dict) else {}
     job_id = uuid.uuid4().hex
+    project = str(payload.get("project") or "").strip()
+    job_class = str(payload.get("jobClass") or "cpu")
+    admission_generation = rollout_admission.admit(job_id, project, job_class)
     stamp = now_iso()
     record = (
-        job_id, stamp, stamp, owner, str(payload.get("project") or "").strip() or None,
+        job_id, stamp, stamp, owner, project or None,
         str(payload.get("chatLabel") or "").strip() or None, str(payload.get("chatUrl") or "").strip() or None,
-        str(payload.get("jobClass") or "cpu"), command, str(payload.get("cwd") or "/workspace"),
+        job_class, command, str(payload.get("cwd") or "/workspace"),
         json.dumps(env, separators=(",", ":")), max(1, min(int(payload.get("timeout", 3600)), 86400)),
         str(payload.get("repoUrl") or "").strip() or None, str(payload.get("revision") or "").strip() or None,
-        "queued",
+        "queued", admission_generation,
     )
     with DB_LOCK:
         conn = db()
-        conn.execute(
-            "INSERT INTO jobs(id,created_at,updated_at,owner,project,chat_label,chat_url,job_class,command,cwd,env_json,timeout_seconds,repo_url,revision,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            record,
-        )
-        conn.commit(); row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone(); conn.close()
+        try:
+            conn.execute(
+                "INSERT INTO jobs(id,created_at,updated_at,owner,project,chat_label,chat_url,job_class,command,cwd,env_json,timeout_seconds,repo_url,revision,status,admission_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                record,
+            )
+            conn.commit(); row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        except Exception:
+            conn.close()
+            finish_admission(job_id)
+            raise
+        conn.close()
     WAKE.set()
     return public_job(row)
 
@@ -418,6 +450,7 @@ def cancel_job(job_id: str) -> dict | None:
                 (stamp, stamp, job_id),
             )
             conn.commit(); row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone(); conn.close()
+            finish_admission(job_id)
             WAKE.set()
             return public_job(row)
         conn.execute("UPDATE jobs SET cancel_requested=1,updated_at=? WHERE id=?", (stamp, job_id)); conn.commit(); conn.close()
@@ -443,6 +476,7 @@ def cancel_job(job_id: str) -> dict | None:
             conn = db(); stamp = now_iso()
             conn.execute("UPDATE jobs SET status='canceled',finished_at=?,updated_at=?,launcher_pid=NULL WHERE id=?", (stamp, stamp, job_id))
             conn.commit(); conn.close()
+        finish_admission(job_id)
         current = get_job(job_id, 4096)
     WAKE.set()
     return current
