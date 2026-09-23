@@ -28,6 +28,9 @@ def main():
         os.environ["CODEX_VM_JOB_HOST"] = "127.0.0.1"
         sched = load(LAB / "headless-job-scheduler.py", "headless_job_scheduler_tested")
         assert sched.MAX_LAUNCHERS == 96
+        assert sched.scheduler_error_backoff(1) == sched.POLL_SECONDS
+        assert sched.scheduler_error_backoff(2) == sched.POLL_SECONDS * 2
+        assert sched.scheduler_error_backoff(100) == sched.ERROR_BACKOFF_MAX_SECONDS
         class FinishedProcess:
             def poll(self):
                 return 0

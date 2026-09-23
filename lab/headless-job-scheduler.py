@@ -38,6 +38,10 @@ MANAGER_PROXY_TIMEOUT = max(30, min(int(os.environ.get("CODEX_VM_JOB_MANAGER_PRO
 SYNTHETIC_CANARY_ENABLED = os.environ.get("CODEX_VM_JOB_SYNTHETIC_CANARY", "0").strip().lower() in {"1","true","yes","on"}
 MAX_TAIL = 1024 * 1024
 POLL_SECONDS = max(0.2, float(os.environ.get("CODEX_VM_JOB_POLL_SECONDS", "0.5")))
+ERROR_BACKOFF_MAX_SECONDS = max(
+    POLL_SECONDS,
+    float(os.environ.get("CODEX_VM_JOB_ERROR_BACKOFF_MAX_SECONDS", "60")),
+)
 CLAIM_STALE_SECONDS = max(5, int(os.environ.get("CODEX_VM_JOB_CLAIM_STALE_SECONDS", "30")))
 TERMINAL = {"succeeded", "failed", "timed_out", "canceled"}
 STOP = threading.Event()
@@ -285,13 +289,35 @@ def scheduler_iteration() -> None:
 
 
 def scheduler_loop() -> None:
+    consecutive_failures = 0
     while not STOP.is_set():
         try:
             scheduler_iteration()
+            consecutive_failures = 0
         except Exception as exc:
-            print(json.dumps({"event":"headless_scheduler_error","time":now_iso(),"error":str(exc)[:2000]}), flush=True)
+            consecutive_failures += 1
+            # Emit the first failure and then only powers of two. Persistent
+            # faults therefore remain visible without growing logs every poll.
+            if consecutive_failures & (consecutive_failures - 1) == 0:
+                print(json.dumps({
+                    "event": "headless_scheduler_error",
+                    "time": now_iso(),
+                    "error": str(exc)[:2000],
+                    "consecutiveFailures": consecutive_failures,
+                    "suppressedSinceLast": 0 if consecutive_failures == 1 else consecutive_failures // 2 - 1,
+                    "retryInSeconds": scheduler_error_backoff(consecutive_failures),
+                }), flush=True)
+            # Do not let API wakeups bypass failure backoff and recreate the
+            # original tight retry/log loop.
+            STOP.wait(scheduler_error_backoff(consecutive_failures))
+            continue
         WAKE.wait(POLL_SECONDS)
         WAKE.clear()
+
+
+def scheduler_error_backoff(consecutive_failures: int) -> float:
+    exponent = min(max(0, int(consecutive_failures) - 1), 16)
+    return min(ERROR_BACKOFF_MAX_SECONDS, POLL_SECONDS * (2 ** exponent))
 
 
 def submit_job(payload: dict) -> dict:
