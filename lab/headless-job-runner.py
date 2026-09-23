@@ -16,6 +16,7 @@ import time
 
 DISPATCH = os.environ.get("CODEX_CI_DISPATCH", "/home/mark/.local/bin/codex-ci-dispatch")
 WAIT_SECONDS = max(60, int(os.environ.get("CODEX_VM_JOB_WAIT_SECONDS", "86400")))
+GIT_TOKEN_FILE = os.environ.get("CODEX_GIT_TOKEN_FILE", "").strip()
 
 
 def atomic_json(path: pathlib.Path, payload: dict) -> None:
@@ -56,50 +57,65 @@ def resources(job_class: str) -> tuple[int, int, int]:
     return table.get(str(job_class or "cpu"), table["cpu"])
 
 
-def controller_git_env(repo_url: str) -> dict[str, str]:
-    """Return a controller-only Git environment for GitHub HTTPS access.
-
-    Credentials are resolved on the controller and injected only into the git
-    child process through an in-memory extraHeader. They are never written into
-    the repository URL, payload, worker workspace, or dispatcher environment.
-    """
-    env = dict(os.environ)
+def git_environment(job_dir: pathlib.Path, repo_url: str) -> dict[str, str]:
+    """Build a non-interactive Git environment without putting secrets in argv."""
+    parsed = urllib.parse.urlsplit(str(repo_url or "").strip())
+    if parsed.hostname == "github.com" and (
+        parsed.username is not None or parsed.password is not None
+    ):
+        raise RuntimeError("GitHub repoUrl must not contain embedded credentials")
+    env = {
+        **os.environ,
+        "GIT_TERMINAL_PROMPT": "0",
+        # Ignore any ambient credential helper inherited by the service account.
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "credential.helper",
+        "GIT_CONFIG_VALUE_0": "",
+    }
     for key in ("GH_TOKEN", "GITHUB_TOKEN", "GITHUB_PAT"):
         env.pop(key, None)
-    parsed = urllib.parse.urlsplit(str(repo_url or "").strip())
-    if parsed.scheme not in ("http", "https") or parsed.hostname != "github.com":
+    if not GIT_TOKEN_FILE:
+        token_file = os.environ.get("CODEX_VM_JOB_GITHUB_TOKEN_FILE", "").strip()
+        token = ""
+        if token_file:
+            try:
+                token = pathlib.Path(token_file).read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                raise RuntimeError("controller GitHub token file is not readable") from exc
+        if not token and parsed.hostname == "github.com":
+            try:
+                cp = subprocess.run(
+                    ["gh", "auth", "token", "--hostname", "github.com"],
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    check=False, timeout=10,
+                )
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                cp = None
+            if cp is not None and cp.returncode == 0:
+                token = cp.stdout.strip()
+        if not token:
+            return env
+        if any(ord(ch) < 33 for ch in token):
+            raise RuntimeError("controller GitHub token is malformed")
+        basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+        env["GIT_CONFIG_COUNT"] = "2"
+        env["GIT_CONFIG_KEY_1"] = "http.https://github.com/.extraheader"
+        env["GIT_CONFIG_VALUE_1"] = f"AUTHORIZATION: basic {basic}"
         return env
-    if parsed.username is not None or parsed.password is not None:
-        raise RuntimeError("GitHub repoUrl must not contain embedded credentials")
-
-    token = ""
-    token_file = os.environ.get("CODEX_VM_JOB_GITHUB_TOKEN_FILE", "").strip()
-    if token_file:
-        try:
-            token = pathlib.Path(token_file).read_text(encoding="utf-8").strip()
-        except OSError as exc:
-            raise RuntimeError("controller GitHub token file is not readable") from exc
-    if not token:
-        try:
-            cp = subprocess.run(
-                ["gh", "auth", "token", "--hostname", "github.com"],
-                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                check=False, timeout=10,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            cp = None
-        if cp is not None and cp.returncode == 0:
-            token = cp.stdout.strip()
-    if not token:
-        return env
-    if any(ord(ch) < 33 for ch in token):
-        raise RuntimeError("controller GitHub token is malformed")
-
-    basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
-    env["GIT_CONFIG_COUNT"] = "1"
-    env["GIT_CONFIG_KEY_0"] = "http.https://github.com/.extraheader"
-    env["GIT_CONFIG_VALUE_0"] = f"AUTHORIZATION: basic {basic}"
-    env["GIT_TERMINAL_PROMPT"] = "0"
+    token_file = pathlib.Path(GIT_TOKEN_FILE)
+    if not token_file.is_absolute() or not token_file.is_file():
+        raise RuntimeError("CODEX_GIT_TOKEN_FILE must name a readable absolute file")
+    helper = job_dir / ".git-askpass"
+    helper.write_text(
+        "#!/bin/sh\n"
+        "case \"$1\" in\n"
+        "  *Username*) printf '%s\\n' x-access-token ;;\n"
+        "  *Password*) cat \"$CODEX_GIT_TOKEN_FILE\" ;;\n"
+        "  *) exit 1 ;;\n"
+        "esac\n"
+    )
+    helper.chmod(0o700)
+    env["GIT_ASKPASS"] = str(helper)
     return env
 
 
@@ -110,7 +126,7 @@ def prepare_workspace(payload: dict, job_dir: pathlib.Path) -> pathlib.Path:
     if workspace.exists():
         subprocess.run(["rm", "-rf", str(workspace)], check=True)
     if repo:
-        git_env = controller_git_env(repo)
+        git_env = git_environment(job_dir, repo)
         cp = subprocess.run(
             ["git", "clone", "--filter=blob:none", repo, str(workspace)],
             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, env=git_env,
@@ -124,7 +140,10 @@ def prepare_workspace(payload: dict, job_dir: pathlib.Path) -> pathlib.Path:
             )
             if cp.returncode:
                 raise RuntimeError(cp.stderr.strip() or cp.stdout.strip() or "git fetch failed")
-            subprocess.run(["git", "checkout", "--detach", "FETCH_HEAD"], cwd=workspace, check=True)
+            subprocess.run(
+                ["git", "checkout", "--detach", "FETCH_HEAD"], cwd=workspace,
+                check=True, env=git_env,
+            )
     else:
         workspace.mkdir(parents=True, exist_ok=True)
         subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)

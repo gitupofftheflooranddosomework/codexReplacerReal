@@ -2,6 +2,7 @@
 import importlib.util
 import os
 import pathlib
+import stat
 import tempfile
 import threading
 import time
@@ -115,6 +116,20 @@ def main():
         pass
     else:
         raise AssertionError("absolute cwd escaped /workspace")
+    with tempfile.TemporaryDirectory() as td:
+        job_dir = pathlib.Path(td)
+        token = job_dir / "github.token"
+        token.write_text("test-token\n")
+        runner.GIT_TOKEN_FILE = str(token)
+        git_env = runner.git_environment(job_dir)
+        helper = pathlib.Path(git_env["GIT_ASKPASS"])
+        assert helper.is_file()
+        if os.name != "nt":
+            assert stat.S_IMODE(helper.stat().st_mode) == 0o700
+        assert "test-token" not in helper.read_text()
+        assert git_env["GIT_TERMINAL_PROMPT"] == "0"
+        assert git_env["GIT_CONFIG_KEY_0"] == "credential.helper"
+        assert git_env["GIT_CONFIG_VALUE_0"] == ""
 
     headless = (LAB / "codex-ci-headless.py").read_text()
     assert 'CODEX_CI_HEADLESS_MAX_ACTIVE", "96"' in headless
