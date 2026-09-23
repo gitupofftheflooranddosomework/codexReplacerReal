@@ -57,7 +57,7 @@ def resources(job_class: str) -> tuple[int, int, int]:
     return table.get(str(job_class or "cpu"), table["cpu"])
 
 
-def git_environment(job_dir: pathlib.Path, repo_url: str) -> dict[str, str]:
+def git_environment(job_dir: pathlib.Path, repo_url: str = "") -> dict[str, str]:
     """Build a non-interactive Git environment without putting secrets in argv."""
     parsed = urllib.parse.urlsplit(str(repo_url or "").strip())
     if parsed.hostname == "github.com" and (
