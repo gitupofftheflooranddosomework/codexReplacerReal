@@ -9,6 +9,11 @@ import unittest
 ROOT=pathlib.Path(__file__).resolve().parent
 
 class HeadlessTests(unittest.TestCase):
+    def test_reserve_timeout_covers_slow_provider_clone(self):
+        text=(ROOT/'codex-ci-dispatch.py').read_text()
+        self.assertIn('CODEX_CI_RESERVE_TIMEOUT',text)
+        self.assertIn('reserved=manager(*argv,timeout=RESERVE_TIMEOUT)',text)
+
     def test_dispatcher_has_no_desktop_pool_addressing(self):
         text=(ROOT/'codex-ci-dispatch.py').read_text()
         self.assertNotIn('192.168.122.230',text)
