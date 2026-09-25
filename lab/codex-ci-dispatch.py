@@ -27,17 +27,18 @@ SSH_KEY=os.environ.get("CODEX_CI_SSH_KEY","/home/mark/.local/share/codex-ci/ssh/
 KNOWN_HOSTS=os.environ.get("CODEX_CI_KNOWN_HOSTS","/home/mark/.local/share/codex-ci/ssh/known_hosts")
 REMOTE_RPC=os.environ.get("CODEX_CI_REMOTE_RPC","/home/mark/.local/bin/codex-ci-worker-rpc.py")
 RESERVE_TIMEOUT=max(60,float(os.environ.get("CODEX_CI_RESERVE_TIMEOUT","420")))
+MANAGER_REQUEST_PREFIX=uuid.uuid4().hex
 
 
 def enc(value): return base64.urlsafe_b64encode(value.encode()).rstrip(b"=").decode()
 
 
-def manager(*args,timeout=120):
+def manager(*args,timeout=120,request_id=None):
     argv=[str(x) for x in args]
     if MANAGER_URL:
         request=urllib.request.Request(
             MANAGER_URL,
-            data=json.dumps({"args":argv},separators=(",",":")).encode(),
+            data=json.dumps({"args":argv,"requestId":request_id} if request_id else {"args":argv},separators=(",",":")).encode(),
             method="POST",
             headers={"Content-Type":"application/json","Accept":"application/json"},
         )
@@ -186,7 +187,7 @@ def acquire(a):
               "--vcpus",str(a.vcpus),"--disk-gib",str(a.disk_gib)]
         if a.session_key: argv += ["--session-key",a.session_key]
         try:
-            reserved=manager(*argv,timeout=RESERVE_TIMEOUT)
+            reserved=manager(*argv,timeout=RESERVE_TIMEOUT,request_id=f"{MANAGER_REQUEST_PREFIX}-reserve")
             return dict(reserved['instance'], reused=reserved['reused'])
         except RuntimeError as exc:
             last=str(exc)
