@@ -26,6 +26,7 @@ SSH_USER=os.environ.get("CODEX_CI_SSH_USER","mark")
 SSH_KEY=os.environ.get("CODEX_CI_SSH_KEY","/home/mark/.local/share/codex-ci/ssh/id_ed25519_codex_ci")
 KNOWN_HOSTS=os.environ.get("CODEX_CI_KNOWN_HOSTS","/home/mark/.local/share/codex-ci/ssh/known_hosts")
 REMOTE_RPC=os.environ.get("CODEX_CI_REMOTE_RPC","/home/mark/.local/bin/codex-ci-worker-rpc.py")
+RESERVE_TIMEOUT=max(60,float(os.environ.get("CODEX_CI_RESERVE_TIMEOUT","420")))
 
 
 def enc(value): return base64.urlsafe_b64encode(value.encode()).rstrip(b"=").decode()
@@ -185,7 +186,7 @@ def acquire(a):
               "--vcpus",str(a.vcpus),"--disk-gib",str(a.disk_gib)]
         if a.session_key: argv += ["--session-key",a.session_key]
         try:
-            reserved=manager(*argv,timeout=45)
+            reserved=manager(*argv,timeout=RESERVE_TIMEOUT)
             return dict(reserved['instance'], reused=reserved['reused'])
         except RuntimeError as exc:
             last=str(exc)
