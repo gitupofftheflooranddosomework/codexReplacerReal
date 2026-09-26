@@ -49,6 +49,7 @@ WAKE = threading.Event()
 DB_LOCK = threading.RLock()
 LAUNCHERS_LOCK = threading.Lock()
 LAUNCHERS: dict[int, subprocess.Popen] = {}
+MANAGER_PROXY_LOCK = threading.Lock()
 CANARY_ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$")
 
 
@@ -82,6 +83,11 @@ def db() -> sqlite3.Connection:
     conn.execute(
         "CREATE TABLE IF NOT EXISTS synthetic_canary_receipts("
         "operation_id TEXT PRIMARY KEY,created_at TEXT NOT NULL,confirmed_at TEXT NOT NULL)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS manager_proxy_receipts("
+        "request_id TEXT PRIMARY KEY,args_json TEXT NOT NULL,response_json TEXT NOT NULL,"
+        "created_at TEXT NOT NULL)"
     )
     conn.commit()
     return conn
@@ -437,25 +443,55 @@ def manager_proxy(payload: dict) -> dict:
         raise ValueError("provision requires exactly one instance id")
     if action=="finish" and len(argv) < 2:
         raise ValueError("finish requires an instance id")
-    cp=subprocess.run(
-        [MANAGER,*argv],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=MANAGER_PROXY_TIMEOUT,
-        check=False,
-        env={**os.environ,"CODEX_CI_DISPATCH_PID":str(os.getpid())},
-    )
-    if cp.returncode:
-        raise RuntimeError(cp.stderr.strip() or cp.stdout.strip() or f"headless manager rc={cp.returncode}")
-    try:
-        result=json.loads(cp.stdout)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("invalid headless manager response") from exc
-    if not isinstance(result,dict):
-        raise RuntimeError("headless manager response must be an object")
-    return result
-
+    request_id=str(payload.get("requestId") or "").strip()
+    if request_id and not CANARY_ID.fullmatch(request_id):
+        raise ValueError("invalid manager proxy request id")
+    args_json=json.dumps(argv,separators=(",",":"))
+    # Mutating manager calls are serialized and, when a request id is supplied,
+    # durably deduplicated. A client timeout can therefore retry the same reserve
+    # without launching another disposable VM while the original call completes.
+    with MANAGER_PROXY_LOCK:
+        if request_id:
+            with DB_LOCK:
+                conn=db()
+                row=conn.execute(
+                    "SELECT args_json,response_json FROM manager_proxy_receipts WHERE request_id=?",
+                    (request_id,),
+                ).fetchone()
+                conn.close()
+            if row is not None:
+                if row["args_json"] != args_json:
+                    raise ValueError("manager proxy request id was reused with different arguments")
+                result=json.loads(row["response_json"])
+                if not isinstance(result,dict):
+                    raise RuntimeError("invalid cached headless manager response")
+                return result
+        cp=subprocess.run(
+            [MANAGER,*argv],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=MANAGER_PROXY_TIMEOUT,
+            check=False,
+            env={**os.environ,"CODEX_CI_DISPATCH_PID":str(os.getpid())},
+        )
+        if cp.returncode:
+            raise RuntimeError(cp.stderr.strip() or cp.stdout.strip() or f"headless manager rc={cp.returncode}")
+        try:
+            result=json.loads(cp.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("invalid headless manager response") from exc
+        if not isinstance(result,dict):
+            raise RuntimeError("headless manager response must be an object")
+        if request_id:
+            with DB_LOCK:
+                conn=db()
+                conn.execute(
+                    "INSERT OR REPLACE INTO manager_proxy_receipts(request_id,args_json,response_json,created_at) VALUES(?,?,?,?)",
+                    (request_id,args_json,json.dumps(result,separators=(",",":")),now_iso()),
+                )
+                conn.commit(); conn.close()
+        return result
 
 def manager_state() -> dict:
     cp = subprocess.run([MANAGER, "state", "--history-limit", "40"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, check=False)

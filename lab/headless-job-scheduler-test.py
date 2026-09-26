@@ -31,6 +31,39 @@ def main():
         assert sched.scheduler_error_backoff(1) == sched.POLL_SECONDS
         assert sched.scheduler_error_backoff(2) == sched.POLL_SECONDS * 2
         assert sched.scheduler_error_backoff(100) == sched.ERROR_BACKOFF_MAX_SECONDS
+
+        # Retrying a mutating manager proxy call after an uncertain HTTP outcome
+        # must be idempotent. One request ID may execute the underlying manager
+        # exactly once and then replay the durable receipt.
+        sched.MANAGER_PROXY_ENABLED = True
+        manager_calls = []
+        real_run = sched.subprocess.run
+        def fake_manager_run(argv, **kwargs):
+            manager_calls.append(list(argv))
+            return __import__("subprocess").CompletedProcess(
+                argv, 0, stdout='{"instance":{"id":"headless-one"}}', stderr=""
+            )
+        sched.subprocess.run = fake_manager_run
+        try:
+            request = {
+                "args": ["reserve", "--owner", "x", "--project", "p"],
+                "requestId": "retry-safe-1",
+            }
+            first = sched.manager_proxy(request)
+            second = sched.manager_proxy(request)
+            assert first == second
+            assert len(manager_calls) == 1, manager_calls
+            try:
+                sched.manager_proxy({
+                    "args": ["reserve", "--owner", "x", "--project", "other"],
+                    "requestId": "retry-safe-1",
+                })
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("manager proxy request ID accepted different arguments")
+        finally:
+            sched.subprocess.run = real_run
         class FinishedProcess:
             def poll(self):
                 return 0
@@ -172,6 +205,11 @@ def main():
         assert git_env["GIT_TERMINAL_PROMPT"] == "0"
         assert git_env["GIT_CONFIG_KEY_0"] == "credential.helper"
         assert git_env["GIT_CONFIG_VALUE_0"] == ""
+
+    dispatch = (LAB / "codex-ci-dispatch.py").read_text()
+    assert 'MANAGER_REQUEST_PREFIX=uuid.uuid4().hex' in dispatch
+    assert '"requestId":request_id' in dispatch
+    assert 'request_id=f"{MANAGER_REQUEST_PREFIX}-reserve"' in dispatch
 
     headless = (LAB / "codex-ci-headless.py").read_text()
     assert 'CODEX_CI_HEADLESS_MAX_ACTIVE", "96"' in headless

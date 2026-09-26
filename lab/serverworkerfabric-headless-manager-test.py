@@ -29,6 +29,12 @@ class Response:
 
 
 class ServerWorkerFabricHeadlessManagerTests(unittest.TestCase):
+    def test_operation_timeouts_cover_synchronous_worker_api_latency(self):
+        self.assertEqual(m.HTTP_TIMEOUT,10)
+        self.assertGreaterEqual(m.READINESS_HTTP_TIMEOUT,30)
+        self.assertGreaterEqual(m.CREATE_HTTP_TIMEOUT,330)
+        self.assertGreaterEqual(m.DELETE_HTTP_TIMEOUT,75)
+
     def settings(self):
         return (
             mock.patch.object(m,"BASE_URL","https://fabric.internal"),
@@ -60,7 +66,7 @@ class ServerWorkerFabricHeadlessManagerTests(unittest.TestCase):
         request,timeout=calls[0]
         self.assertEqual(request.full_url,"https://fabric.internal/v1/headless")
         self.assertEqual(request.method,"POST")
-        self.assertEqual(timeout,m.HTTP_TIMEOUT)
+        self.assertEqual(timeout,m.CREATE_HTTP_TIMEOUT)
         self.assertEqual(request.get_header("Authorization"),"Bearer secret")
         payload=json.loads(request.data)
         self.assertEqual(payload["profile"],m.PROFILE)
@@ -113,6 +119,7 @@ class ServerWorkerFabricHeadlessManagerTests(unittest.TestCase):
             c[0].full_url.endswith("/v1/workers/headless-abcd/ready")
             for c in calls
         ))
+        self.assertTrue(all(c[1] == m.READINESS_HTTP_TIMEOUT for c in calls))
 
     def test_provision_identity_mismatch_fails_closed(self):
         p1,p2,p3=self.settings()
@@ -162,6 +169,19 @@ class ServerWorkerFabricHeadlessManagerTests(unittest.TestCase):
         self.assertEqual(request.method,"GET")
         self.assertIsNone(request.data)
         self.assertEqual(timeout,m.HTTP_TIMEOUT)
+
+    def test_finish_uses_bounded_delete_timeout(self):
+        calls=[]
+        def open_url(request,timeout):
+            calls.append((request,timeout))
+            return Response({"deleted":True},200)
+        p1,p2,p3=self.settings()
+        with p1,p2,p3,mock.patch.object(m.urllib.request,"urlopen",side_effect=open_url):
+            got=m.finish("headless-abcd")
+        self.assertTrue(got["deleted"])
+        request,timeout=calls[0]
+        self.assertEqual(request.method,"DELETE")
+        self.assertEqual(timeout,m.DELETE_HTTP_TIMEOUT)
 
     def test_finish_refuses_retention_without_deleting(self):
         p1,p2,p3=self.settings()
