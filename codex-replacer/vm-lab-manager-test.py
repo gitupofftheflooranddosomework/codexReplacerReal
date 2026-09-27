@@ -148,6 +148,60 @@ class LeaseValidationTests(unittest.TestCase):
         with mock.patch.object(m, 'ssh_guest', return_value=missing):
             self.assertIsNone(m._remote_exclusive_lease(1))
 
+    def test_expire_frees_expired_lease_when_worker_is_unreachable(self):
+        current = m.datetime(2026, 9, 27, 6, 40, tzinfo=m.timezone.utc)
+        row = lease(1, 'expired-dead')
+        row['expiresAt'] = (current - m.timedelta(minutes=5)).isoformat()
+        state = {'version': 1, 'stations': {'1': row}}
+        unreachable = subprocess.CompletedProcess([], 255, '', 'No route to host')
+        with mock.patch.object(m, 'now', return_value=current), \
+             mock.patch.object(m, 'ssh_guest', return_value=unreachable), \
+             mock.patch.object(m, 'save_state') as save, \
+             mock.patch.object(m, 'audit') as audit, \
+             mock.patch.object(m, 'notify_usage'):
+            expired = m.expire(state)
+        self.assertEqual([item['leaseId'] for item in expired], ['expired-dead'])
+        self.assertEqual(state['stations']['1']['status'], 'free')
+        self.assertIsNone(state['stations']['1']['leaseId'])
+        save.assert_called_once_with(state)
+        self.assertFalse(audit.call_args.kwargs['remoteLockCleared'])
+        self.assertIn('No route to host', audit.call_args.kwargs['remoteLockError'])
+
+    def test_expire_clears_remote_lock_when_worker_is_reachable(self):
+        current = m.datetime(2026, 9, 27, 6, 40, tzinfo=m.timezone.utc)
+        row = lease(2, 'expired-live')
+        row['expiresAt'] = (current - m.timedelta(seconds=1)).isoformat()
+        state = {'version': 1, 'stations': {'2': row}}
+        cleared = subprocess.CompletedProcess([], 0, '', '')
+        with mock.patch.object(m, 'now', return_value=current), \
+             mock.patch.object(m, 'ssh_guest', return_value=cleared) as ssh, \
+             mock.patch.object(m, 'save_state'), \
+             mock.patch.object(m, 'audit') as audit, \
+             mock.patch.object(m, 'notify_usage'):
+            expired = m.expire(state)
+        self.assertEqual([item['leaseId'] for item in expired], ['expired-live'])
+        self.assertEqual(state['stations']['2']['status'], 'free')
+        ssh.assert_called_once()
+        self.assertTrue(audit.call_args.kwargs['remoteLockCleared'])
+        self.assertIsNone(audit.call_args.kwargs['remoteLockError'])
+
+    def test_expire_keeps_unexpired_lease_even_when_worker_would_be_unreachable(self):
+        current = m.datetime(2026, 9, 27, 6, 40, tzinfo=m.timezone.utc)
+        row = lease(3, 'still-active')
+        row['expiresAt'] = (current + m.timedelta(minutes=5)).isoformat()
+        state = {'version': 1, 'stations': {'3': row}}
+        with mock.patch.object(m, 'now', return_value=current), \
+             mock.patch.object(m, 'ssh_guest') as ssh, \
+             mock.patch.object(m, 'save_state') as save, \
+             mock.patch.object(m, 'audit'), \
+             mock.patch.object(m, 'notify_usage'):
+            expired = m.expire(state)
+        self.assertEqual(expired, [])
+        self.assertEqual(state['stations']['3']['status'], 'leased')
+        self.assertEqual(state['stations']['3']['leaseId'], 'still-active')
+        ssh.assert_not_called()
+        save.assert_not_called()
+
     def test_release_returns_post_release_free_record(self):
         state = {'version': 1, 'stations': {'3': lease(3, 'wanted')}}
         cleared = subprocess.CompletedProcess([], 0, '', '')

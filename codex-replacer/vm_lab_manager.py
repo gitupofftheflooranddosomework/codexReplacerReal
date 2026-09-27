@@ -316,18 +316,35 @@ def expire(state):
             continue
         if due > current:
             continue
-        result = ssh_guest(
-            record["station"],
-            "rm -f /home/mark/.local/share/codex-worker/exclusive.lock",
-            8,
-        )
-        if result.returncode != 0:
-            continue
+
+        # Lease expiry is authoritative controller state. Clearing the remote
+        # ownership lock is best-effort because an expired worker may itself be
+        # down or temporarily unreachable. Keeping the central lease forever in
+        # that case starves otherwise recoverable desktop capacity. A later
+        # acquire still runs ensure_station() and repairs stale remote lock state
+        # before assigning this station to another owner.
+        remote_lock_cleared = False
+        remote_lock_error = None
+        try:
+            result = ssh_guest(
+                record["station"],
+                "rm -f /home/mark/.local/share/codex-worker/exclusive.lock",
+                8,
+            )
+            remote_lock_cleared = result.returncode == 0
+            if not remote_lock_cleared:
+                remote_lock_error = (
+                    result.stderr or result.stdout or f"exit {result.returncode}"
+                ).strip()[:500]
+        except Exception as exc:
+            remote_lock_error = str(exc).strip()[:500] or exc.__class__.__name__
+
         old = _mark_free(record, "expired", current)
         expired.append(old)
         audit(
             "auto_sign_out", station=old.get("station"), leaseId=old.get("leaseId"),
             owner=old.get("owner"), project=old.get("project"), reason="expired",
+            remoteLockCleared=remote_lock_cleared, remoteLockError=remote_lock_error,
         )
         notify_usage("end", old, status="expired", finished_at=old.get("releasedAt"))
     if expired:
