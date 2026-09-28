@@ -165,6 +165,7 @@ def main() -> int:
     meta_path = job_dir / "meta.json"
     rc_path = job_dir / "rc"
     workspace = prepare_workspace(payload, job_dir)
+    revision = str(payload.get("revision") or "").strip()
     rollout_admission.authorize_effect(
         str(payload["id"]),
         payload.get("admissionGeneration"),
@@ -196,6 +197,8 @@ def main() -> int:
         "--max-memory-mib", str(max_memory_mib),
         "--vcpus", str(vcpus),
     ]
+    if revision:
+        argv += ["--expected-revision", revision]
     for key, value in (payload.get("env") or {}).items():
         argv += ["--env", f"{key}={value}"]
 
