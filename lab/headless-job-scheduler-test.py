@@ -146,6 +146,43 @@ def main():
         assert timed_result["exitCode"] == 124, timed_result
         assert timed_result["finished_at"], timed_result
 
+        # Worker metadata can arrive after the first running-state reconciliation.
+        # Terminal reconciliation must persist the latest meta snapshot rather than
+        # leaving workerIp null in an otherwise successful durable result.
+        late = sched.submit_job({"owner":"late-meta","project":"p","command":"true"})
+        conn = sched.db()
+        conn.execute("UPDATE jobs SET launcher_pid=? WHERE id=?", (os.getpid(), late["id"]))
+        conn.commit()
+        late_dir = sched.job_dir(late["id"])
+        late_dir.mkdir(parents=True, exist_ok=True)
+        (late_dir / "meta.json").write_text(
+            '{"instanceId":"headless-late","worker":"swf-headless-late"}\n'
+        )
+        late_row = conn.execute("SELECT * FROM jobs WHERE id=?", (late["id"],)).fetchone()
+        sched.reconcile_one(conn, late_row)
+        conn.commit()
+        running = conn.execute(
+            "SELECT status,instance_id,worker,worker_ip FROM jobs WHERE id=?",
+            (late["id"],),
+        ).fetchone()
+        assert running["status"] == "running", dict(running)
+        assert running["instance_id"] == "headless-late", dict(running)
+        assert running["worker"] == "swf-headless-late", dict(running)
+        assert running["worker_ip"] is None, dict(running)
+
+        (late_dir / "meta.json").write_text(
+            '{"instanceId":"headless-late","worker":"swf-headless-late","workerIp":"10.100.1.1"}\n'
+        )
+        (late_dir / "rc").write_text("0\n")
+        late_row = conn.execute("SELECT * FROM jobs WHERE id=?", (late["id"],)).fetchone()
+        sched.reconcile_one(conn, late_row)
+        conn.commit(); conn.close()
+        late_result = sched.get_job(late["id"], 4096)
+        assert late_result["status"] == "succeeded", late_result
+        assert late_result["instanceId"] == "headless-late", late_result
+        assert late_result["worker"] == "swf-headless-late", late_result
+        assert late_result["workerIp"] == "10.100.1.1", late_result
+
     runner = load(LAB / "headless-job-runner.py", "headless_job_runner_tested")
     assert runner.resources("io") == (1024, 2048, 1)
     assert runner.resources("cpu") == (1536, 3072, 2)
