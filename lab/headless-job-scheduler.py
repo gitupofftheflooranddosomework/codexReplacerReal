@@ -36,6 +36,7 @@ MAX_LAUNCHERS = max(1, int(os.environ.get("CODEX_VM_JOB_MAX_LAUNCHERS", "96")))
 MANAGER_PROXY_ENABLED = os.environ.get("CODEX_VM_JOB_MANAGER_PROXY", "0").strip().lower() in {"1","true","yes","on"}
 MANAGER_PROXY_TIMEOUT = max(30, min(int(os.environ.get("CODEX_VM_JOB_MANAGER_PROXY_TIMEOUT", "600")), 1800))
 SYNTHETIC_CANARY_ENABLED = os.environ.get("CODEX_VM_JOB_SYNTHETIC_CANARY", "0").strip().lower() in {"1","true","yes","on"}
+DRAIN_FILE = pathlib.Path(os.environ.get("CODEX_VM_JOB_DRAIN_FILE", str(ROOT / "drain-new-admissions")))
 MAX_TAIL = 1024 * 1024
 POLL_SECONDS = max(0.2, float(os.environ.get("CODEX_VM_JOB_POLL_SECONDS", "0.5")))
 ERROR_BACKOFF_MAX_SECONDS = max(
@@ -54,6 +55,15 @@ CANARY_ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$")
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def draining() -> bool:
+    return DRAIN_FILE.is_file()
+
+
+def require_new_admission_open() -> None:
+    if draining():
+        raise RuntimeError("headless scheduler is draining; new admissions are temporarily disabled")
 
 
 def db() -> sqlite3.Connection:
@@ -321,6 +331,7 @@ def scheduler_error_backoff(consecutive_failures: int) -> float:
 
 
 def submit_job(payload: dict) -> dict:
+    require_new_admission_open()
     owner = str(payload.get("owner") or "").strip()
     command = str(payload.get("command") or "").strip()
     if not owner or not command:
@@ -431,6 +442,8 @@ def manager_proxy(payload: dict) -> dict:
     action=argv[0]
     if action not in {"reserve","provision","finish"}:
         raise ValueError(f"manager proxy action is not allowed: {action}")
+    if action == "reserve":
+        require_new_admission_open()
     if action=="reserve" and len(argv) < 3:
         raise ValueError("reserve requires owner/project arguments")
     if action=="provision" and len(argv) != 2:
@@ -487,6 +500,8 @@ def workers_state() -> dict:
         "mode": "elastic-headless",
         "batchMax": 48,
         "maxLaunchers": MAX_LAUNCHERS,
+        "draining": draining(),
+        "drainFile": str(DRAIN_FILE),
         "queuedJobs": queued,
         "runningJobs": running,
         "ephemeralHeadless": headless,
@@ -560,7 +575,7 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path); q = parse_qs(u.query)
         try:
             if u.path == "/health":
-                return self.send_json({"ok":True,"service":"codex-headless-job-scheduler","time":now_iso(),"maxLaunchers":MAX_LAUNCHERS})
+                return self.send_json({"ok":True,"service":"codex-headless-job-scheduler","time":now_iso(),"maxLaunchers":MAX_LAUNCHERS,"draining":draining()})
             if u.path == "/api/workers":
                 return self.send_json(workers_state())
             if u.path == "/api/jobs":
