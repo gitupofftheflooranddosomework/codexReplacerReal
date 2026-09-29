@@ -60,7 +60,8 @@ class ServerWorkerFabricHeadlessManagerTests(unittest.TestCase):
         request,timeout=calls[0]
         self.assertEqual(request.full_url,"https://fabric.internal/v1/headless")
         self.assertEqual(request.method,"POST")
-        self.assertEqual(timeout,m.HTTP_TIMEOUT)
+        self.assertEqual(timeout,m.CREATE_TIMEOUT)
+        self.assertGreaterEqual(timeout,420)
         self.assertEqual(request.get_header("Authorization"),"Bearer secret")
         payload=json.loads(request.data)
         self.assertEqual(payload["profile"],m.PROFILE)

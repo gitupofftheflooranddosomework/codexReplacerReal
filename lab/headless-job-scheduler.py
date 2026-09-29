@@ -36,6 +36,7 @@ MAX_LAUNCHERS = max(1, int(os.environ.get("CODEX_VM_JOB_MAX_LAUNCHERS", "96")))
 MANAGER_PROXY_ENABLED = os.environ.get("CODEX_VM_JOB_MANAGER_PROXY", "0").strip().lower() in {"1","true","yes","on"}
 MANAGER_PROXY_TIMEOUT = max(30, min(int(os.environ.get("CODEX_VM_JOB_MANAGER_PROXY_TIMEOUT", "600")), 1800))
 SYNTHETIC_CANARY_ENABLED = os.environ.get("CODEX_VM_JOB_SYNTHETIC_CANARY", "0").strip().lower() in {"1","true","yes","on"}
+DRAIN_FILE = pathlib.Path(os.environ.get("CODEX_VM_JOB_DRAIN_FILE", str(ROOT / "drain-new-admissions")))
 MAX_TAIL = 1024 * 1024
 POLL_SECONDS = max(0.2, float(os.environ.get("CODEX_VM_JOB_POLL_SECONDS", "0.5")))
 ERROR_BACKOFF_MAX_SECONDS = max(
@@ -54,6 +55,15 @@ CANARY_ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$")
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def draining() -> bool:
+    return DRAIN_FILE.is_file()
+
+
+def require_new_admission_open() -> None:
+    if draining():
+        raise RuntimeError("headless scheduler is draining; new admissions are temporarily disabled")
 
 
 def db() -> sqlite3.Connection:
@@ -217,8 +227,16 @@ def reconcile_one(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
         canceled = bool(row["cancel_requested"])
         status = "canceled" if canceled or rc == 130 else ("succeeded" if rc == 0 else ("timed_out" if rc == 124 else "failed"))
         conn.execute(
-            "UPDATE jobs SET status=?,exit_code=?,finished_at=COALESCE(finished_at,?),updated_at=?,launcher_pid=NULL WHERE id=?",
-            (status, rc, stamp, stamp, row["id"]),
+            "UPDATE jobs SET status=?,exit_code=?,finished_at=COALESCE(finished_at,?),updated_at=?,"
+            "launcher_pid=NULL,instance_id=COALESCE(?,instance_id),worker=COALESCE(?,worker),"
+            "worker_ip=COALESCE(?,worker_ip) WHERE id=?",
+            (
+                status, rc, stamp, stamp,
+                str(meta.get("instanceId") or "") or None,
+                str(meta.get("worker") or "") or None,
+                str(meta.get("workerIp") or "") or None,
+                row["id"],
+            ),
         )
         finish_admission(row["id"])
         return
@@ -321,6 +339,7 @@ def scheduler_error_backoff(consecutive_failures: int) -> float:
 
 
 def submit_job(payload: dict) -> dict:
+    require_new_admission_open()
     owner = str(payload.get("owner") or "").strip()
     command = str(payload.get("command") or "").strip()
     if not owner or not command:
@@ -431,6 +450,8 @@ def manager_proxy(payload: dict) -> dict:
     action=argv[0]
     if action not in {"reserve","provision","finish"}:
         raise ValueError(f"manager proxy action is not allowed: {action}")
+    if action == "reserve":
+        require_new_admission_open()
     if action=="reserve" and len(argv) < 3:
         raise ValueError("reserve requires owner/project arguments")
     if action=="provision" and len(argv) != 2:
@@ -487,6 +508,8 @@ def workers_state() -> dict:
         "mode": "elastic-headless",
         "batchMax": 48,
         "maxLaunchers": MAX_LAUNCHERS,
+        "draining": draining(),
+        "drainFile": str(DRAIN_FILE),
         "queuedJobs": queued,
         "runningJobs": running,
         "ephemeralHeadless": headless,
@@ -560,7 +583,7 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path); q = parse_qs(u.query)
         try:
             if u.path == "/health":
-                return self.send_json({"ok":True,"service":"codex-headless-job-scheduler","time":now_iso(),"maxLaunchers":MAX_LAUNCHERS})
+                return self.send_json({"ok":True,"service":"codex-headless-job-scheduler","time":now_iso(),"maxLaunchers":MAX_LAUNCHERS,"draining":draining()})
             if u.path == "/api/workers":
                 return self.send_json(workers_state())
             if u.path == "/api/jobs":
