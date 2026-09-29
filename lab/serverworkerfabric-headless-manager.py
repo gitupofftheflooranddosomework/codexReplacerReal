@@ -26,6 +26,7 @@ TOKEN_FILE=os.environ.get("CODEX_CI_SWF_API_TOKEN_FILE","").strip()
 CA_FILE=os.environ.get("CODEX_CI_SWF_API_CA_FILE","").strip()
 PROFILE=os.environ.get("CODEX_CI_SWF_HEADLESS_PROFILE","headless").strip() or "headless"
 HTTP_TIMEOUT=max(1.0,float(os.environ.get("CODEX_CI_SWF_API_TIMEOUT","10")))
+CREATE_TIMEOUT=max(HTTP_TIMEOUT,float(os.environ.get("CODEX_CI_SWF_CREATE_TIMEOUT","420")))
 READY_TIMEOUT=max(5.0,float(os.environ.get("CODEX_CI_SWF_READY_TIMEOUT","180")))
 POLL_SECONDS=max(0.1,float(os.environ.get("CODEX_CI_SWF_READY_POLL_SECONDS","2")))
 
@@ -57,8 +58,8 @@ def base_url():
     return BASE_URL
 
 
-def _urlopen(request):
-    kwargs={"timeout":HTTP_TIMEOUT}
+def _urlopen(request,timeout=None):
+    kwargs={"timeout":HTTP_TIMEOUT if timeout is None else float(timeout)}
     if CA_FILE:
         try:
             kwargs["context"]=ssl.create_default_context(cafile=CA_FILE)
@@ -69,7 +70,7 @@ def _urlopen(request):
     return urllib.request.urlopen(request,**kwargs)
 
 
-def _request(method,path,payload=None,*,allow_404=False):
+def _request(method,path,payload=None,*,allow_404=False,timeout=None):
     url=base_url()+path
     headers={
         "Accept":"application/json",
@@ -82,7 +83,7 @@ def _request(method,path,payload=None,*,allow_404=False):
         headers["Content-Type"]="application/json"
     request=urllib.request.Request(url,data=data,method=method,headers=headers)
     try:
-        with _urlopen(request) as response:
+        with _urlopen(request,timeout=timeout) as response:
             raw=response.read()
             status=int(getattr(response,"status",200))
     except urllib.error.HTTPError as exc:
@@ -155,6 +156,7 @@ def reserve(owner,project,ttl_seconds,session_key=None,**_resources):
             "correlation_id":_correlation(owner,project),
             "ttl_seconds":ttl,
         },
+        timeout=CREATE_TIMEOUT,
     )
     return {"instance":_instance(payload,owner=owner,project=project),"reused":False}
 
