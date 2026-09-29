@@ -68,6 +68,31 @@ class ServerWorkerFabricHeadlessManagerTests(unittest.TestCase):
         self.assertEqual(payload["ttl_seconds"],600)
         self.assertRegex(payload["correlation_id"],r"^ci-[0-9a-f]{16}$")
 
+    def test_job_scoped_correlation_separates_independent_jobs_but_dedupes_retries(self):
+        first=m._correlation("same-owner","same-project","job-a")
+        retry=m._correlation("same-owner","same-project","job-a")
+        second=m._correlation("same-owner","same-project","job-b")
+        fallback=m._correlation("same-owner","same-project","")
+        self.assertEqual(first,retry)
+        self.assertNotEqual(first,second)
+        self.assertNotEqual(first,fallback)
+        self.assertRegex(first,r"^ci-[0-9a-f]{16}$")
+
+    def test_reserve_uses_explicit_job_correlation(self):
+        calls=[]
+        def open_url(request,timeout):
+            calls.append((request,timeout))
+            return Response({
+                "instance_id":"headless-job",
+                "worker":{"logical_id":"headless-job","state":"creating","address":None,"metadata":{}},
+            },201)
+        p1,p2,p3=self.settings()
+        with p1,p2,p3,mock.patch.object(m.urllib.request,"urlopen",side_effect=open_url):
+            m.reserve("same-owner","same-project",600,correlation_id="scheduler-job-123")
+        payload=json.loads(calls[0][0].data)
+        self.assertEqual(payload["correlation_id"],m._correlation("same-owner","same-project","scheduler-job-123"))
+        self.assertNotEqual(payload["correlation_id"],m._correlation("same-owner","same-project","scheduler-job-456"))
+
     def test_reserve_refuses_retained_session_before_api_call(self):
         p1,p2,p3=self.settings()
         with p1,p2,p3,mock.patch.object(

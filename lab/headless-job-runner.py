@@ -166,6 +166,9 @@ def main() -> int:
     rc_path = job_dir / "rc"
     workspace = prepare_workspace(payload, job_dir)
     revision = str(payload.get("revision") or "").strip()
+    job_id = str(payload["id"]).strip()
+    if not job_id:
+        raise RuntimeError("scheduler job id is required")
     rollout_admission.authorize_effect(
         str(payload["id"]),
         payload.get("admissionGeneration"),
@@ -196,6 +199,7 @@ def main() -> int:
         "--memory-mib", str(memory_mib),
         "--max-memory-mib", str(max_memory_mib),
         "--vcpus", str(vcpus),
+        "--correlation-id", job_id,
     ]
     if revision:
         argv += ["--expected-revision", revision]

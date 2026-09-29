@@ -197,6 +197,7 @@ def acquire(a):
         argv=["reserve","--owner",a.owner,"--project",a.project or "","--ttl-seconds",str(ttl),
               "--memory-mib",str(a.memory_mib),"--max-memory-mib",str(a.max_memory_mib),
               "--vcpus",str(a.vcpus),"--disk-gib",str(a.disk_gib)]
+        if a.correlation_id: argv += ["--correlation-id",a.correlation_id]
         if a.session_key: argv += ["--session-key",a.session_key]
         try:
             reserved=manager(*argv,timeout=RESERVE_TIMEOUT)
@@ -212,6 +213,7 @@ def main():
     p.add_argument("--owner",required=True); p.add_argument("--project",default="")
     p.add_argument("--workspace",default=os.environ.get("GITHUB_WORKSPACE",".")); p.add_argument("--command",required=True)
     p.add_argument("--expected-revision",default="")
+    p.add_argument("--correlation-id",default="")
     p.add_argument("--timeout",type=int,default=3600); p.add_argument("--wait-seconds",type=int,default=600); p.add_argument("--ttl-minutes",type=int,default=180)
     p.add_argument("--persist-hours",type=float,default=0); p.add_argument("--session-key",default="")
     p.add_argument("--memory-mib",type=int,default=int(os.environ.get("CODEX_CI_HEADLESS_MEMORY_MIB","2048")))
