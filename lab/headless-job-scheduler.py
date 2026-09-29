@@ -227,8 +227,16 @@ def reconcile_one(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
         canceled = bool(row["cancel_requested"])
         status = "canceled" if canceled or rc == 130 else ("succeeded" if rc == 0 else ("timed_out" if rc == 124 else "failed"))
         conn.execute(
-            "UPDATE jobs SET status=?,exit_code=?,finished_at=COALESCE(finished_at,?),updated_at=?,launcher_pid=NULL WHERE id=?",
-            (status, rc, stamp, stamp, row["id"]),
+            "UPDATE jobs SET status=?,exit_code=?,finished_at=COALESCE(finished_at,?),updated_at=?,"
+            "launcher_pid=NULL,instance_id=COALESCE(?,instance_id),worker=COALESCE(?,worker),"
+            "worker_ip=COALESCE(?,worker_ip) WHERE id=?",
+            (
+                status, rc, stamp, stamp,
+                str(meta.get("instanceId") or "") or None,
+                str(meta.get("worker") or "") or None,
+                str(meta.get("workerIp") or "") or None,
+                row["id"],
+            ),
         )
         finish_admission(row["id"])
         return
