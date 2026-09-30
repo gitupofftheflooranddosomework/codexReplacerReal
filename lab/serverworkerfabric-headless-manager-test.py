@@ -140,6 +140,55 @@ class ServerWorkerFabricHeadlessManagerTests(unittest.TestCase):
             for c in calls
         ))
 
+    def test_provision_retries_transient_readiness_transport_failure(self):
+        responses=[
+            urllib.error.URLError("temporary readiness transport failure"),
+            Response({
+                "ready":True,
+                "worker":{
+                    "logical_id":"headless-abcd",
+                    "state":"running",
+                    "address":"10.77.20.44",
+                    "metadata":{"name":"swf-headless-abcd"},
+                },
+            },200),
+        ]
+        calls=[]
+        def open_url(request,timeout):
+            calls.append((request,timeout))
+            result=responses.pop(0)
+            if isinstance(result,BaseException):
+                raise result
+            return result
+        p1,p2,p3=self.settings()
+        with p1,p2,p3, \
+             mock.patch.object(m,"READY_TIMEOUT",10), \
+             mock.patch.object(m,"POLL_SECONDS",0.001), \
+             mock.patch.object(m.urllib.request,"urlopen",side_effect=open_url), \
+             mock.patch.object(m.time,"sleep") as sleep:
+            got=m.provision("headless-abcd")
+        self.assertEqual(got["id"],"headless-abcd")
+        self.assertEqual(got["ip"],"10.77.20.44")
+        self.assertEqual(len(calls),2)
+        sleep.assert_called_once_with(0.001)
+
+    def test_provision_transport_failure_exhausts_deadline_fail_closed(self):
+        p1,p2,p3=self.settings()
+        with p1,p2,p3, \
+             mock.patch.object(m,"READY_TIMEOUT",10), \
+             mock.patch.object(m.time,"monotonic",side_effect=[100.0,111.0]), \
+             mock.patch.object(
+                 m.urllib.request,"urlopen",
+                 side_effect=urllib.error.URLError("persistent readiness transport failure"),
+             ), \
+             mock.patch.object(m.time,"sleep") as sleep:
+            with self.assertRaisesRegex(
+                m.FabricManagerError,
+                "did not become ready: readiness request failed",
+            ):
+                m.provision("headless-abcd")
+        sleep.assert_not_called()
+
     def test_provision_identity_mismatch_fails_closed(self):
         p1,p2,p3=self.settings()
         with p1,p2,p3,mock.patch.object(
