@@ -77,8 +77,8 @@ def ssh_capture(rec,cmd,input_bytes=None,timeout=30):
 
 
 def rpc(command):
-    """Invoke the forced-command worker endpoint through the migrated admin key."""
-    return f"env SSH_ORIGINAL_COMMAND={shlex.quote(command)} {shlex.quote(REMOTE_RPC)}"
+    """Send the RPC verb directly; the guest's restricted SSH key owns the forced endpoint."""
+    return command
 
 
 def wait_ready(rec,seconds=180):
@@ -110,6 +110,19 @@ def dirty_paths(workspace):
         if cp.returncode: raise RuntimeError(cp.stderr.decode(errors="replace").strip() or "git workspace inspection failed")
         out|={x.decode(errors="surrogateescape") for x in cp.stdout.split(b"\0") if x}
     return out
+
+
+def verify_workspace_revision(workspace, expected_revision):
+    expected=str(expected_revision or "").strip()
+    if not expected:
+        return None
+    cp=subprocess.run(["git","rev-parse","HEAD"],cwd=workspace,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=False)
+    if cp.returncode:
+        raise RuntimeError(cp.stderr.strip() or cp.stdout.strip() or "unable to resolve workspace HEAD")
+    actual=cp.stdout.strip()
+    if actual != expected:
+        raise RuntimeError(f"workspace revision mismatch: expected {expected}, got {actual}")
+    return actual
 
 
 def validate_workspace(workspace,inputs):
@@ -184,6 +197,7 @@ def acquire(a):
         argv=["reserve","--owner",a.owner,"--project",a.project or "","--ttl-seconds",str(ttl),
               "--memory-mib",str(a.memory_mib),"--max-memory-mib",str(a.max_memory_mib),
               "--vcpus",str(a.vcpus),"--disk-gib",str(a.disk_gib)]
+        if a.correlation_id: argv += ["--correlation-id",a.correlation_id]
         if a.session_key: argv += ["--session-key",a.session_key]
         try:
             reserved=manager(*argv,timeout=RESERVE_TIMEOUT)
@@ -198,6 +212,8 @@ def main():
     p=argparse.ArgumentParser(description="Dispatch one CI command to an elastic project-scoped headless KVM")
     p.add_argument("--owner",required=True); p.add_argument("--project",default="")
     p.add_argument("--workspace",default=os.environ.get("GITHUB_WORKSPACE",".")); p.add_argument("--command",required=True)
+    p.add_argument("--expected-revision",default="")
+    p.add_argument("--correlation-id",default="")
     p.add_argument("--timeout",type=int,default=3600); p.add_argument("--wait-seconds",type=int,default=600); p.add_argument("--ttl-minutes",type=int,default=180)
     p.add_argument("--persist-hours",type=float,default=0); p.add_argument("--session-key",default="")
     p.add_argument("--memory-mib",type=int,default=int(os.environ.get("CODEX_CI_HEADLESS_MEMORY_MIB","2048")))
@@ -207,6 +223,7 @@ def main():
     a=p.parse_args()
     if a.persist_hours and not a.session_key: p.error("--persist-hours requires --session-key")
     workspace=pathlib.Path(a.workspace).resolve(); validate_workspace(workspace,a.input); env=parse_env(a.env)
+    verify_workspace_revision(workspace,a.expected_revision)
     rec=None; iid=None; claimed=False; rc=1; status="failed"; old={}
     class Interrupted(Exception): pass
     def interrupted(_sig,_frame): raise Interrupted()
@@ -238,7 +255,11 @@ def main():
         wait_ready(rec); iid=uuid.uuid4().hex
         payload={"leaseId":iid,"owner":a.owner,"project":a.project or None,"source":"github-actions"}
         cp=ssh_capture(rec,rpc("codex-ci claim "+enc(json.dumps(payload,separators=(",", ":")))),timeout=15)
-        if cp.returncode: raise RuntimeError("headless worker claim failed: "+(cp.stderr or cp.stdout).decode(errors="replace").strip())
+        if cp.returncode:
+            stdout=cp.stdout.decode(errors="replace").strip()
+            stderr=cp.stderr.decode(errors="replace").strip()
+            detail="; ".join(x for x in (f"stdout={stdout}" if stdout else "", f"stderr={stderr}" if stderr else "") if x)
+            raise RuntimeError("headless worker claim failed" + (f": {detail}" if detail else f" (rc={cp.returncode})"))
         claimed=True
         stream_snapshot(rec,iid,workspace); push_inputs(rec,iid,workspace,a.input)
         rc=run_command(rec,iid,a.command,max(1,a.timeout),env)

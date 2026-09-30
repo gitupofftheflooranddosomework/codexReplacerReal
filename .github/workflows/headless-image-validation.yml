@@ -8,6 +8,8 @@ on:
       - 'lab/headless-job-scheduler.py'
       - 'lab/headless-job-scheduler-test.py'
       - 'lab/headless-job-runner.py'
+      - 'lab/codex-ci-dispatch.py'
+      - 'lab/codex-ci-revision-contract-test.py'
       - 'lab/headless-private-repo-auth-test.py'
       - 'lab/headless-rollout-admission-test.py'
       - 'lab/headless-synthetic-canary-test.py'
@@ -36,6 +38,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          test -x lab/codex-ci-dispatch.py
+          test -x lab/headless-job-runner.py
           bash -n lab/build-ci-headless-base.sh
           python3 -m py_compile \
             lab/codex-ci-headless.py \
@@ -43,6 +47,8 @@ jobs:
             lab/headless-job-scheduler.py \
             lab/headless-job-scheduler-test.py \
             lab/headless-job-runner.py \
+            lab/codex-ci-dispatch.py \
+            lab/codex-ci-revision-contract-test.py \
             lab/headless-private-repo-auth-test.py \
             lab/headless-rollout-admission-test.py \
             lab/headless-synthetic-canary-test.py \
@@ -50,6 +56,7 @@ jobs:
             lab/rollout_admission.py \
             lab/serverworkerfabric-headless-manager.py \
             lab/serverworkerfabric-headless-manager-test.py
+          python3 lab/codex-ci-revision-contract-test.py
           python3 lab/headless-template-identity-test.py
           python3 lab/headless-job-scheduler-test.py
           python3 lab/headless-private-repo-auth-test.py

@@ -113,8 +113,12 @@ def _request(method,path,payload=None,*,allow_404=False,timeout=None):
     return status,body
 
 
-def _correlation(owner,project):
-    raw=f"{owner}\0{project}".encode()
+def _correlation(owner,project,correlation_id=""):
+    explicit=str(correlation_id or "").strip()
+    if explicit:
+        raw=f"job\0{explicit}".encode()
+    else:
+        raw=f"owner-project\0{owner}\0{project}".encode()
     return "ci-"+hashlib.sha256(raw).hexdigest()[:16]
 
 
@@ -140,7 +144,7 @@ def _instance(payload,*,owner=None,project=None):
     }
 
 
-def reserve(owner,project,ttl_seconds,session_key=None,**_resources):
+def reserve(owner,project,ttl_seconds,session_key=None,correlation_id=None,**_resources):
     if session_key:
         raise FabricManagerError(
             "ServerWorkerFabric manager does not support retained session reuse"
@@ -153,7 +157,7 @@ def reserve(owner,project,ttl_seconds,session_key=None,**_resources):
         "/v1/headless",
         {
             "profile":PROFILE,
-            "correlation_id":_correlation(owner,project),
+            "correlation_id":_correlation(owner,project,correlation_id),
             "ttl_seconds":ttl,
         },
         timeout=CREATE_TIMEOUT,
@@ -289,6 +293,7 @@ def parser():
     r=sub.add_parser("reserve")
     r.add_argument("--owner",required=True)
     r.add_argument("--project",default="")
+    r.add_argument("--correlation-id",default="")
     r.add_argument("--ttl-seconds",type=int,default=3600)
     r.add_argument("--session-key")
     r.add_argument("--memory-mib",type=int,default=2048)
@@ -314,6 +319,7 @@ def main(argv=None):
         if a.action=="reserve":
             result=reserve(
                 a.owner,a.project,a.ttl_seconds,a.session_key,
+                correlation_id=a.correlation_id,
                 memory_mib=a.memory_mib,max_memory_mib=a.max_memory_mib,
                 vcpus=a.vcpus,disk_gib=a.disk_gib,
             )
