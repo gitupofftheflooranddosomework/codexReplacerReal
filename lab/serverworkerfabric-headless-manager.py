@@ -201,7 +201,13 @@ def provision(instance_id):
                     f"ServerWorkerFabric readiness failed: {detail}"
                 ) from exc
         except (urllib.error.URLError,TimeoutError,socket.timeout,OSError) as exc:
-            raise FabricManagerError("ServerWorkerFabric readiness request failed") from exc
+            last="readiness request failed"
+            if time.monotonic() >= deadline:
+                raise FabricManagerError(
+                    f"ServerWorkerFabric worker {logical!r} did not become ready: {last}"
+                ) from exc
+            time.sleep(POLL_SECONDS)
+            continue
         try:
             body=json.loads(raw.decode()) if raw else {}
         except (UnicodeDecodeError,json.JSONDecodeError) as exc:
