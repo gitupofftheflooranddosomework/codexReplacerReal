@@ -77,8 +77,8 @@ def ssh_capture(rec,cmd,input_bytes=None,timeout=30):
 
 
 def rpc(command):
-    """Invoke the forced-command worker endpoint through the migrated admin key."""
-    return f"env SSH_ORIGINAL_COMMAND={shlex.quote(command)} {shlex.quote(REMOTE_RPC)}"
+    """Send the RPC verb directly; the guest's restricted SSH key owns the forced endpoint."""
+    return command
 
 
 def wait_ready(rec,seconds=180):

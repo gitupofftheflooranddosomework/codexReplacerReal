@@ -31,6 +31,14 @@ class RevisionContractTests(unittest.TestCase):
         head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
         return td, root, head
 
+    def test_restricted_key_rpc_is_sent_directly(self):
+        self.assertEqual(dispatch.rpc("codex-ci probe"), "codex-ci probe")
+        self.assertEqual(
+            dispatch.rpc("codex-ci claim abc123"),
+            "codex-ci claim abc123",
+        )
+        self.assertNotIn("SSH_ORIGINAL_COMMAND", dispatch.rpc("codex-ci probe"))
+
     def test_workspace_revision_match_passes(self):
         td, root, head = self.make_repo()
         self.addCleanup(td.cleanup)
