@@ -155,6 +155,22 @@ def prepare_workspace(payload: dict, job_dir: pathlib.Path) -> pathlib.Path:
     return workspace
 
 
+def resolved_workspace_revision(payload: dict, workspace: pathlib.Path) -> str:
+    """Return the immutable commit actually checked out for a requested Git revision."""
+    if not str(payload.get("revision") or "").strip():
+        return ""
+    cp = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=workspace,
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+    if cp.returncode:
+        raise RuntimeError(cp.stderr.strip() or cp.stdout.strip() or "unable to resolve workspace HEAD")
+    resolved = cp.stdout.strip()
+    if len(resolved) != 40 or any(ch not in "0123456789abcdefABCDEF" for ch in resolved):
+        raise RuntimeError(f"resolved workspace revision is not a commit SHA: {resolved}")
+    return resolved.lower()
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         print("usage: headless-job-runner.py PAYLOAD.json", file=sys.stderr)
@@ -166,6 +182,7 @@ def main() -> int:
     rc_path = job_dir / "rc"
     workspace = prepare_workspace(payload, job_dir)
     revision = str(payload.get("revision") or "").strip()
+    resolved_revision = resolved_workspace_revision(payload, workspace)
     job_id = str(payload["id"]).strip()
     if not job_id:
         raise RuntimeError("scheduler job id is required")
@@ -201,8 +218,8 @@ def main() -> int:
         "--vcpus", str(vcpus),
         "--correlation-id", job_id,
     ]
-    if revision:
-        argv += ["--expected-revision", revision]
+    if resolved_revision:
+        argv += ["--expected-revision", resolved_revision]
     for key, value in (payload.get("env") or {}).items():
         argv += ["--env", f"{key}={value}"]
 

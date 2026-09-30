@@ -17,8 +17,34 @@ def load(name, filename):
     return module
 
 dispatch = load("codex_ci_dispatch_under_test", "codex-ci-dispatch.py")
+runner = load("headless_job_runner_under_test", "headless-job-runner.py")
 
 class RevisionContractTests(unittest.TestCase):
+    def make_source_repo(self):
+        td = tempfile.TemporaryDirectory()
+        root = pathlib.Path(td.name).resolve()
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=root, check=True)
+        (root / "file.txt").write_text("one\n")
+        subprocess.run(["git", "add", "."], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "one"], cwd=root, check=True)
+        subprocess.run(["git", "tag", "v1"], cwd=root, check=True)
+        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+        return td, root, head
+
+    def test_generic_branch_and_tag_revision_resolve_to_checked_out_sha(self):
+        source_td, source, expected = self.make_source_repo()
+        self.addCleanup(source_td.cleanup)
+        for revision in ("main", "v1", expected):
+            with self.subTest(revision=revision):
+                job_td = tempfile.TemporaryDirectory()
+                self.addCleanup(job_td.cleanup)
+                job_dir = pathlib.Path(job_td.name).resolve()
+                payload = {"repoUrl": source.as_uri(), "revision": revision}
+                workspace = runner.prepare_workspace(payload, job_dir)
+                self.assertEqual(runner.resolved_workspace_revision(payload, workspace), expected)
+
     def make_repo(self):
         td = tempfile.TemporaryDirectory()
         root = pathlib.Path(td.name)

@@ -38,6 +38,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          test -x lab/codex-ci-dispatch.py
+          test -x lab/headless-job-runner.py
           bash -n lab/build-ci-headless-base.sh
           python3 -m py_compile \
             lab/codex-ci-headless.py \
