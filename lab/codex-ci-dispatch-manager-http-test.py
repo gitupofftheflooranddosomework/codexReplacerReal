@@ -106,6 +106,37 @@ class DispatchManagerHTTPTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,"not allowed: gc"):
                 dispatch.manager("gc")
 
+    def test_finish_retries_transient_manager_failures(self):
+        rec={"id":"headless-retry"}
+        calls=[]
+        def manager(*args,**_kwargs):
+            calls.append(args)
+            if len(calls) < 3:
+                raise RuntimeError("temporary fabric failure")
+            return {"status":"destroyed"}
+        with mock.patch.object(dispatch,"manager",side_effect=manager), \
+             mock.patch.object(dispatch.time,"sleep") as sleep:
+            result=dispatch.finish_with_retry(rec,"failed",127,0)
+        self.assertEqual(result,{"status":"destroyed"})
+        self.assertEqual(len(calls),3)
+        self.assertEqual([x.args[0] for x in sleep.call_args_list],[1,2])
+        self.assertTrue(all(call[0]=="finish" and call[1]=="headless-retry" for call in calls))
+
+    def test_finish_exhaustion_is_structured_and_does_not_raise(self):
+        rec={"id":"headless-leaked"}
+        err=io.StringIO()
+        with mock.patch.object(dispatch,"manager",side_effect=RuntimeError("fabric unavailable")), \
+             mock.patch.object(dispatch.time,"sleep"), \
+             mock.patch.object(dispatch.sys,"stderr",err):
+            result=dispatch.finish_with_retry(rec,"failed",1,0,attempts=2)
+        self.assertIsNone(result)
+        lines=[line for line in err.getvalue().splitlines() if line.startswith("{")]
+        self.assertEqual(len(lines),1)
+        event=json.loads(lines[0])
+        self.assertEqual(event["event"],"headless_lifecycle_cleanup_exhausted")
+        self.assertEqual(event["instanceId"],"headless-leaked")
+        self.assertEqual(event["attempts"],2)
+
     def test_local_manager_remains_default_rollback_path(self):
         result=subprocess.CompletedProcess(
             ["manager","reserve"],0,

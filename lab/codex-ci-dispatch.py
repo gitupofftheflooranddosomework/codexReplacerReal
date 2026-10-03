@@ -66,6 +66,39 @@ def manager(*args,timeout=120):
     except json.JSONDecodeError as exc: raise RuntimeError(f"invalid manager response: {cp.stdout[:500]}") from exc
 
 
+def finish_with_retry(rec,status,rc,keep,attempts=3):
+    """Idempotently finish a headless instance despite transient manager transport failures."""
+    total=max(1,int(attempts))
+    last=None
+    for attempt in range(1,total+1):
+        try:
+            return manager(
+                "finish",rec["id"],
+                "--status",status,
+                "--exit-code",str(rc),
+                "--reason",status,
+                "--keep-seconds",str(keep),
+                timeout=90,
+            )
+        except Exception as exc:
+            last=exc
+            if attempt < total:
+                delay=min(4,2 ** (attempt-1))
+                print(
+                    f"warning: headless lifecycle cleanup attempt {attempt}/{total} failed: {exc}; retrying in {delay}s",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
+    print(json.dumps({
+        "event":"headless_lifecycle_cleanup_exhausted",
+        "instanceId":str(rec.get("id") or ""),
+        "status":status,
+        "attempts":total,
+        "error":str(last)[:1000],
+    },separators=(",",":")),file=sys.stderr)
+    return None
+
+
 def ssh_base(rec):
     return ["ssh","-i",SSH_KEY,"-o","IdentitiesOnly=yes","-o","BatchMode=yes",
             "-o",f"UserKnownHostsFile={KNOWN_HOSTS}","-o","StrictHostKeyChecking=accept-new",
@@ -288,8 +321,7 @@ def main():
                 print(f'worker release failed; destroying instead of retaining: {exc}',file=sys.stderr)
         if rec:
             keep=max(0,int(a.persist_hours*3600)) if claimed and released else 0
-            try: manager("finish",rec["id"],"--status",status,"--exit-code",str(rc),"--reason",status,"--keep-seconds",str(keep),timeout=90)
-            except Exception as exc: print(f"warning: headless lifecycle cleanup failed: {exc}",file=sys.stderr)
+            finish_with_retry(rec,status,rc,keep)
 
 
 if __name__=="__main__": raise SystemExit(main())
