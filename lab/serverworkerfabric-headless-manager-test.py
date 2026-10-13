@@ -93,13 +93,66 @@ class ServerWorkerFabricHeadlessManagerTests(unittest.TestCase):
         self.assertEqual(payload["correlation_id"],m._correlation("same-owner","same-project","scheduler-job-123"))
         self.assertNotEqual(payload["correlation_id"],m._correlation("same-owner","same-project","scheduler-job-456"))
 
-    def test_reserve_refuses_retained_session_before_api_call(self):
+    def test_retained_session_reuses_hashed_correlation_without_leaking_key(self):
+        calls=[]
+        def open_url(request,timeout):
+            calls.append((request,timeout))
+            return Response({
+                "changed":False,
+                "created":False,
+                "status":"existing-allocation",
+                "instance_id":"headless-retained",
+                "expires_at_epoch":3600,
+                "worker":{
+                    "logical_id":"headless-retained",
+                    "state":"running",
+                    "address":"10.77.20.55",
+                    "metadata":{"name":"swf-headless-retained"},
+                },
+            },201)
+        p1,p2,p3=self.settings()
+        with p1,p2,p3,mock.patch.object(
+            m.urllib.request,"urlopen",side_effect=open_url
+        ):
+            got=m.reserve("owner","project",3600,session_key="reuse-me")
+        self.assertTrue(got["reused"])
+        self.assertEqual(got["instance"]["id"],"headless-retained")
+        payload=json.loads(calls[0][0].data)
+        self.assertEqual(
+            payload["correlation_id"],
+            m._correlation("owner","project",session_key="reuse-me"),
+        )
+        self.assertNotIn("reuse-me",calls[0][0].data.decode())
+
+    def test_retained_guest_without_address_is_sent_through_readiness(self):
+        def open_url(_request,timeout):
+            self.assertEqual(timeout,m.CREATE_TIMEOUT)
+            return Response({
+                "changed":False,
+                "created":False,
+                "instance_id":"headless-rebooting",
+                "worker":{
+                    "logical_id":"headless-rebooting",
+                    "state":"running",
+                    "address":None,
+                    "metadata":{},
+                },
+            },201)
+        p1,p2,p3=self.settings()
+        with p1,p2,p3,mock.patch.object(m.urllib.request,"urlopen",side_effect=open_url):
+            got=m.reserve("owner","project",3600,session_key="reboot-proof")
+        self.assertFalse(got["reused"])
+        self.assertEqual(got["instance"]["ip"],"")
+
+    def test_invalid_retained_session_key_fails_before_api_call(self):
         p1,p2,p3=self.settings()
         with p1,p2,p3,mock.patch.object(
             m.urllib.request,"urlopen",side_effect=AssertionError("API must not run")
         ):
-            with self.assertRaisesRegex(m.FabricManagerError,"retained session"):
-                m.reserve("owner","project",600,session_key="reuse-me")
+            for key in ("", " " * 3, "x" * 257):
+                with self.subTest(key_length=len(key)):
+                    with self.assertRaisesRegex(m.FabricManagerError,"session_key"):
+                        m.reserve("owner","project",600,session_key=key)
 
     def test_reserve_rejects_out_of_bounds_ttl_before_api_call(self):
         p1,p2,p3=self.settings()
@@ -238,13 +291,13 @@ class ServerWorkerFabricHeadlessManagerTests(unittest.TestCase):
         self.assertIsNone(request.data)
         self.assertEqual(timeout,m.HTTP_TIMEOUT)
 
-    def test_finish_refuses_retention_without_deleting(self):
+    def test_finish_retains_until_existing_fabric_expiry_without_deleting(self):
         p1,p2,p3=self.settings()
         with p1,p2,p3,mock.patch.object(
             m.urllib.request,"urlopen",side_effect=AssertionError("DELETE must not run")
         ):
-            with self.assertRaisesRegex(m.FabricManagerError,"keep_seconds"):
-                m.finish("headless-abcd",keep_seconds=60)
+            got=m.finish("headless-abcd",keep_seconds=60)
+        self.assertEqual(got,{"id":"headless-abcd","status":"retained","deleted":False,"keep_seconds":60})
 
     def test_finish_delete_is_idempotent_when_gc_already_removed_worker(self):
         error=urllib.error.HTTPError(
