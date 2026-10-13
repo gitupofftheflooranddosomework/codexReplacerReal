@@ -10,9 +10,15 @@ TCP peer IP plus the homeserver lease state.
 import json
 import os
 import re
+import sys
+import threading
 
 DEFAULT_BASE_URL = "http://10.0.0.181:8788"
 MAX_RESPONSE_BYTES = 256 * 1024
+ACTIVITY_TTL_MS = 120_000
+ACTIVITY_REFRESH_SECONDS = 45
+ACTIVITY_HTTP_TIMEOUT_SECONDS = 2
+ACTIVITY_EXEC_TIMEOUT_SECONDS = 4
 MESSAGE_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", re.IGNORECASE)
 TOOL_NAMES = {
     "slackcontroller_identity",
@@ -32,6 +38,7 @@ base = os.environ["SC_BASE"].rstrip("/")
 path = os.environ["SC_PATH"]
 method = os.environ["SC_METHOD"]
 body = os.environ.get("SC_BODY", "")
+timeout = float(os.environ.get("SC_TIMEOUT", "15"))
 if not base.startswith("http://10.0.0.181:") and not base.startswith("https://10.0.0.181:"):
     raise SystemExit("invalid SlackController base URL")
 if not path.startswith("/worker/v1/"):
@@ -42,7 +49,7 @@ if data is not None:
     headers["content-type"] = "application/json"
 request = urllib.request.Request(base + path, data=data, method=method, headers=headers)
 try:
-    response = urllib.request.urlopen(request, timeout=15)
+    response = urllib.request.urlopen(request, timeout=timeout)
 except urllib.error.HTTPError as error:
     response = error
 with response:
@@ -76,7 +83,7 @@ def _message_id(value):
     return message_id
 
 
-def _request(server, lease_id, method, path, payload=None):
+def _request(server, lease_id, method, path, payload=None, *, request_timeout=15, execute_timeout=20):
     lease_id = str(lease_id or "").strip()
     if not lease_id:
         raise ValueError("leaseId from vm_lab_acquire is required")
@@ -90,12 +97,13 @@ def _request(server, lease_id, method, path, payload=None):
         "python3 - <<'PY'\n" + GUEST_REQUEST + "\nPY",
         lease_id=lease_id,
         cwd="/workspace",
-        timeout=20,
+        timeout=execute_timeout,
         env={
             "SC_BASE": _base_url(),
             "SC_METHOD": method,
             "SC_PATH": path,
             "SC_BODY": body,
+            "SC_TIMEOUT": str(request_timeout),
         },
         max_bytes=MAX_RESPONSE_BYTES,
     )
@@ -113,6 +121,58 @@ def _request(server, lease_id, method, path, payload=None):
         code = str(response_body.get("error") or "request_failed")[:120]
         raise RuntimeError(f"SlackController worker API error ({status}): {code}")
     return response_body
+
+
+def _activity_once(server, lease_id, phase):
+    lease_id = str(lease_id or "").strip()
+    if not lease_id:
+        return False
+    try:
+        _request(
+            server,
+            lease_id,
+            "POST",
+            "/worker/v1/activity",
+            {"phase": phase, "ttl_ms": ACTIVITY_TTL_MS},
+            request_timeout=ACTIVITY_HTTP_TIMEOUT_SECONDS,
+            execute_timeout=ACTIVITY_EXEC_TIMEOUT_SECONDS,
+        )
+        return True
+    except Exception as error:
+        sys.stderr.write(f"SlackController activity {phase} failed: {type(error).__name__}: {error}\n")
+        return False
+
+
+class ActivityPulse:
+    def __init__(self, server, lease_id, phase="working"):
+        self.server = server
+        self.lease_id = str(lease_id or "").strip()
+        self.phase = phase
+        self.stop_event = threading.Event()
+        self.thread = None
+
+    def _run(self):
+        while not self.stop_event.is_set():
+            _activity_once(self.server, self.lease_id, self.phase)
+            if self.stop_event.wait(ACTIVITY_REFRESH_SECONDS):
+                break
+        _activity_once(self.server, self.lease_id, "idle")
+
+    def start(self):
+        if not self.lease_id:
+            return self
+        self.thread = threading.Thread(target=self._run, name=f"slack-activity-{self.lease_id[:12]}", daemon=True)
+        self.thread.start()
+        return self
+
+    def stop(self, *, wait=False):
+        self.stop_event.set()
+        if wait and self.thread is not None:
+            self.thread.join(timeout=ACTIVITY_EXEC_TIMEOUT_SECONDS * 2)
+
+
+def start_activity_pulse(server, lease_id, phase="working"):
+    return ActivityPulse(server, lease_id, phase).start()
 
 
 def install(server):
@@ -231,5 +291,34 @@ def install(server):
     ]
     server.DIRECT_TOOLS.update(dict(tools))
     server.BROKER_DIRECT_TOOL_NAMES.update(TOOL_NAMES)
+
+    if not getattr(server, "_slack_activity_wrapped", False):
+        original_exec = server.DIRECT_TOOLS["vm_lab_exec"]["handler"]
+        original_release = server.DIRECT_TOOLS["vm_lab_release"]["handler"]
+        original_browser_call = server.KVM_BROWSER_POOL.call
+
+        def vm_lab_exec_with_activity(arguments):
+            pulse = start_activity_pulse(server, arguments.get("leaseId"), "working")
+            try:
+                return original_exec(arguments)
+            finally:
+                pulse.stop()
+
+        def vm_lab_release_with_activity(arguments):
+            _activity_once(server, arguments.get("leaseId"), "idle")
+            return original_release(arguments)
+
+        def browser_call_with_activity(name, arguments):
+            pulse = start_activity_pulse(server, arguments.get("leaseId"), "working")
+            try:
+                return original_browser_call(name, arguments)
+            finally:
+                pulse.stop()
+
+        server.DIRECT_TOOLS["vm_lab_exec"]["handler"] = vm_lab_exec_with_activity
+        server.DIRECT_TOOLS["vm_lab_release"]["handler"] = vm_lab_release_with_activity
+        server.KVM_BROWSER_POOL.call = browser_call_with_activity
+        server._slack_activity_wrapped = True
+
     if INSTRUCTION not in server.CONVERSATION_CONTINUITY_INSTRUCTIONS:
         server.CONVERSATION_CONTINUITY_INSTRUCTIONS += INSTRUCTION

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -84,6 +85,59 @@ class SlackControllerBridgeTest(unittest.TestCase):
             result = handler({'leaseId':'lease-3','status':'active'})
         self.assertEqual(result['structuredContent']['status'], 'active')
         with self.assertRaises(ValueError): handler({'leaseId':'lease-3','status':'busy'})
+
+    def test_activity_request_uses_lease_bound_worker_path_and_short_timeouts(self):
+        with patch.object(server.vm_lab_manager, 'execute', return_value=self.response({'ok':True,'handle':'rankmoose','phase':'working','ttl_ms':120000})) as execute:
+            self.assertTrue(bridge._activity_once(server, 'lease-3', 'working'))
+        kwargs = execute.call_args.kwargs
+        self.assertEqual(kwargs['lease_id'], 'lease-3')
+        self.assertEqual(kwargs['timeout'], bridge.ACTIVITY_EXEC_TIMEOUT_SECONDS)
+        self.assertEqual(kwargs['env']['SC_PATH'], '/worker/v1/activity')
+        self.assertEqual(float(kwargs['env']['SC_TIMEOUT']), bridge.ACTIVITY_HTTP_TIMEOUT_SECONDS)
+        self.assertEqual(json.loads(kwargs['env']['SC_BODY']), {'phase':'working','ttl_ms':120000})
+
+    def test_activity_failure_is_best_effort(self):
+        with patch.object(server.vm_lab_manager, 'execute', side_effect=RuntimeError('hook down')):
+            self.assertFalse(bridge._activity_once(server, 'lease-3', 'working'))
+
+    def test_activity_pulse_refreshes_long_work_and_finishes_idle(self):
+        calls = []
+        with patch.object(bridge, '_activity_once', side_effect=lambda _server, _lease, phase: calls.append(phase) or True), \
+             patch.object(bridge, 'ACTIVITY_REFRESH_SECONDS', 0.01):
+            pulse = bridge.ActivityPulse(server, 'lease-3').start()
+            time.sleep(0.035)
+            pulse.stop(wait=True)
+        self.assertGreaterEqual(calls.count('working'), 2)
+        self.assertEqual(calls[-1], 'idle')
+
+    def test_vm_lab_exec_and_browser_calls_are_wrapped_without_changing_primary_result(self):
+        fake_pulse = unittest.mock.MagicMock()
+        with patch.object(bridge, 'start_activity_pulse', return_value=fake_pulse) as start, \
+             patch.object(server.vm_lab_manager, 'execute', return_value={'exitCode':0,'stdout':'ok','stderr':'','truncated':False}):
+            result = server.DIRECT_TOOLS['vm_lab_exec']['handler']({'leaseId':'lease-3','command':'true'})
+        self.assertEqual(result['structuredContent']['exitCode'], 0)
+        start.assert_called_with(server, 'lease-3', 'working')
+        fake_pulse.stop.assert_called_once_with()
+
+        fake_pulse = unittest.mock.MagicMock()
+        with patch.object(bridge, 'start_activity_pulse', return_value=fake_pulse) as start, \
+             patch.object(server.vm_lab_manager, 'validate_lease', return_value={'leaseId':'lease-3'}), \
+             patch.object(server.KVM_BROWSER_POOL.clients[3], 'call', return_value={'content':[]}):
+            result = server.KVM_BROWSER_POOL.call('vm_browser_snapshot', {'station':3,'leaseId':'lease-3'})
+        self.assertEqual(result, {'content':[]})
+        start.assert_called_with(server, 'lease-3', 'working')
+        fake_pulse.stop.assert_called_once_with()
+
+    def test_vm_lab_release_publishes_idle_before_release_and_never_blocks_release_on_activity_failure(self):
+        events = []
+        def activity(*_args):
+            events.append('idle')
+            return False
+        with patch.object(bridge, '_activity_once', side_effect=activity), \
+             patch.object(server.vm_lab_manager, 'release', side_effect=lambda **_kwargs: events.append('release') or {'status':'released'}):
+            result = server.DIRECT_TOOLS['vm_lab_release']['handler']({'leaseId':'lease-3'})
+        self.assertEqual(result['structuredContent']['status'], 'released')
+        self.assertEqual(events, ['idle', 'release'])
 
     def test_expired_or_invalid_lease_failure_is_not_bypassed(self):
         handler = server.DIRECT_TOOLS['slackcontroller_identity']['handler']

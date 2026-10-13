@@ -12,4 +12,6 @@ After a chat worker acquires its own full KVM with `vm_lab_acquire`, it uses tha
 
 The broker validates the lease and performs the fixed private HTTP request inside the leased KVM, so SlackController sees the worker's actual `192.168.122.x` TCP peer and validates it against the homeserver lease state. Callers cannot supply a bot handle, Slack channel ID, thread timestamp, arbitrary URL, headers, API path, or the master SlackController bearer token.
 
+For interactive execution visibility, the broker also emits best-effort transient activity through that same lease-bound worker path while `vm_lab_exec` and `vm_browser_*` calls are running. Long calls refresh the bounded activity TTL, and `vm_lab_release` attempts an `idle` transition before releasing the lease. Activity-hook failures are observability failures only: they are logged and never fail the underlying shell, browser, or release operation. This does not treat caller-supplied headless-job owner strings as authoritative bot identity.
+
 Default private worker API: `http://10.0.0.181:8788/worker/v1/`. Operators may override the fixed base with `SLACKCONTROLLER_WORKER_BASE_URL` on the Codex Replacer service; chat callers cannot override it.
