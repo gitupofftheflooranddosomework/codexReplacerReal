@@ -84,7 +84,7 @@ def main():
         required = {
             "fs_read", "fs_write", "fs_search", "host_exec", "process_start",
             "git", "github", "docker", "browser_navigate", "browser_take_screenshot",
-            "prepare_chat_handoff", "chatgpt_start_chat", "chatgpt_browser_status", "chatgpt_auth_begin",
+            "prepare_chat_handoff", "chatgpt_start_chat", "chatgpt_continue_chat", "chatgpt_browser_status", "chatgpt_auth_begin",
             "dotmoose_vault_list", "dotmoose_vault_get",
             "lab_list", "lab_acquire", "lab_release", "lab_exec", "lab_gc",
             "vm_lab_list", "vm_lab_acquire", "vm_lab_release", "vm_lab_exec", "vm_lab_gc",
@@ -95,6 +95,8 @@ def main():
             raise RuntimeError(f"Missing tools: {missing}")
         if name_list.count("chatgpt_start_chat") != 1:
             raise RuntimeError("chatgpt_start_chat must be exposed exactly once.")
+        if name_list.count("chatgpt_continue_chat") != 1:
+            raise RuntimeError("chatgpt_continue_chat must be exposed exactly once.")
         if name_list.count("chatgpt_auth_begin") != 1:
             raise RuntimeError("chatgpt_auth_begin must be exposed exactly once.")
         chat_tool = next(item for item in tools if item["name"] == "chatgpt_start_chat")
@@ -110,6 +112,12 @@ def main():
         })
         if invalid_chat_start.get("isError") is not True or "message is required" not in json.dumps(invalid_chat_start):
             raise RuntimeError("chatgpt_start_chat did not reject empty input locally.")
+        invalid_chat_continue = client.request("tools/call", {
+            "name": "chatgpt_continue_chat",
+            "arguments": {"chatUrl": "https://example.com/c/not-chatgpt", "message": "continue"},
+        })
+        if invalid_chat_continue.get("isError") is not True or "chatUrl must be" not in json.dumps(invalid_chat_continue):
+            raise RuntimeError("chatgpt_continue_chat did not reject a non-ChatGPT URL locally.")
         checks["tools"] = len(tools)
 
         handoff = structured(client.call("prepare_chat_handoff", {

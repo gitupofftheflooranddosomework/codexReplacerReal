@@ -1855,6 +1855,70 @@ def handle_chatgpt_start_chat(arguments):
         }, message=str(error), is_error=True)
 
 
+def handle_chatgpt_continue_chat(arguments):
+    """Append a message to one previously confirmed ChatGPT web conversation."""
+    message = str(arguments.get("message") or "").strip()
+    chat_url = str(arguments.get("chatUrl") or "").strip()
+    if not message:
+        return tool_result({"continued": False}, message="message is required.", is_error=True)
+    if len(message) > 50000:
+        return tool_result({"continued": False}, message="message must be 50,000 characters or fewer.", is_error=True)
+    try:
+        parsed = urllib.parse.urlparse(chat_url)
+    except Exception:
+        parsed = None
+    if not parsed or parsed.scheme != "https" or parsed.hostname != "chatgpt.com" or "/c/" not in parsed.path:
+        return tool_result({"continued": False}, message="chatUrl must be a confirmed https://chatgpt.com/c/... conversation URL.", is_error=True)
+
+    try:
+        CHATGPT_BROWSER_CLIENT.call("browser_tabs", {"action": "new", "url": chat_url})
+        CHATGPT_BROWSER_CLIENT.call("browser_wait_for", {"time": 1.5})
+        snapshot = _chatgpt_snapshot(depth=10)
+        if _chatgpt_authentication_required(snapshot):
+            return tool_result({
+                "continued": False,
+                "submitted": False,
+                "authenticationRequired": True,
+                "chatUrl": chat_url,
+                "browserUrl": _snapshot_page_url(snapshot),
+                "mode": "headed-cdp",
+            }, message="The persistent ChatGPT browser must be signed in before this conversation can continue.", is_error=True)
+
+        browser_url = _snapshot_page_url(snapshot)
+        if not browser_url or "/c/" not in browser_url:
+            raise RuntimeError("The saved ChatGPT conversation is no longer available.")
+        composer_ref = _chatgpt_composer_ref(snapshot)
+        if not composer_ref:
+            raise RuntimeError("The saved ChatGPT conversation is not accepting another message; it may be full or unavailable.")
+        CHATGPT_BROWSER_CLIENT.call("browser_fill_form", {
+            "fields": [{
+                "name": "ChatGPT message",
+                "type": "textbox",
+                "target": composer_ref,
+                "element": "ChatGPT message composer",
+                "value": message,
+            }],
+        })
+        CHATGPT_BROWSER_CLIENT.call("browser_press_key", {"key": "Enter"})
+        return tool_result({
+            "continued": True,
+            "submitted": True,
+            "authenticationRequired": False,
+            "chatUrl": browser_url,
+            "browserUrl": browser_url,
+            "mode": "headed-cdp",
+        }, message=f"Continued ChatGPT chat: {browser_url}")
+    except Exception as error:
+        return tool_result({
+            "continued": False,
+            "submitted": False,
+            "authenticationRequired": False,
+            "chatUrl": chat_url,
+            "mode": "headed-cdp",
+            "error": str(error),
+        }, message=str(error), is_error=True)
+
+
 def handle_prepare_chat_handoff(arguments):
     objective = str(arguments.get("objective") or "").strip()
     current_state = str(arguments.get("currentState") or "").strip()
@@ -1933,6 +1997,7 @@ DIRECT_TOOLS = dict([
     tool("chatgpt_browser_status", "Inspect ChatGPT browser", "Check whether the dedicated normal headed Chromium session for ChatGPT is reachable and authenticated. This does not expose general control of that browser.", object_schema(), handle_chatgpt_browser_status, annotations(True, False, True)),
     tool("chatgpt_auth_begin", "Begin ChatGPT authentication", "Start or resume the normal Google authentication flow for the persistent headed ChatGPT browser using only user-approved passkey or phone-prompt methods. This tool intentionally cannot accept passwords, one-time codes, backup codes, passkey secrets, or MFA secrets.", object_schema({"method": {"type": "string", "enum": ["passkey", "phone_prompt"], "default": "passkey"}, "accountEmail": string("Optional Google account email used only to fill the account identifier field.")}), handle_chatgpt_auth_begin, annotations(False, False, True)),
     tool("chatgpt_start_chat", "Start ChatGPT chat", "Create a new ChatGPT conversation through the user's persistent headed Chromium session, optionally select an installed ChatGPT app, seed it with a message, submit it, and return the resulting conversation URL. Use this only when the user explicitly asks to start, hand off, or continue work in another ChatGPT chat.", object_schema({"message": string("First message to place in the new chat."), "project": string("Optional exact ChatGPT Project name."), "projectUrl": string("Optional exact https://chatgpt.com project URL; prefer when known."), "app": string("Optional exact installed ChatGPT app name to select through the composer mention picker before sending."), "submit": {"type": "boolean", "default": True}}, ["message"]), handle_chatgpt_start_chat, annotations(False, False, True)),
+    tool("chatgpt_continue_chat", "Continue ChatGPT chat", "Append a message to a previously confirmed ChatGPT web conversation through the persistent headed browser. This uses the existing web subscription and never a model API key.", object_schema({"chatUrl": string("Exact previously confirmed https://chatgpt.com/c/... conversation URL."), "message": string("Message to append to the saved conversation.")}, ["chatUrl", "message"]), handle_chatgpt_continue_chat, annotations(False, False, True)),
     tool("system_info", "Inspect VM", "Use this when you need the dedicated Codex Replacer VM identity, Mark's guest execution context, or installed development tools.", object_schema(), handle_system_info, annotations(True, False, False)),
     tool("fs_stat", "Inspect path", "Use this when you need metadata, ownership, permissions, timestamps, link target, or an optional SHA-256 hash for any host path.", object_schema({"path": string(), "hash": {"type": "boolean", "default": False}}, ["path"]), handle_fs_stat, annotations(True, False, False)),
     tool("fs_list", "List files", "Use this when you need to list any host directory, optionally recursively.", object_schema({"path": string(), "recursive": {"type": "boolean", "default": False}, "maxDepth": {"type": "integer", "minimum": 0, "maximum": 100}, "maxEntries": {"type": "integer", "minimum": 1, "maximum": 10000}}, ["path"]), handle_fs_list, annotations(True, False, False)),
@@ -1986,6 +2051,7 @@ BROKER_DIRECT_TOOL_NAMES = {
     "chatgpt_browser_status",
     "chatgpt_auth_begin",
     "chatgpt_start_chat",
+    "chatgpt_continue_chat",
     "vm_lab_list",
     "vm_lab_acquire",
     "vm_lab_release",
