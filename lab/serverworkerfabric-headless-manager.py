@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """codex-ci-dispatch-compatible headless manager backed by ServerWorkerFabric.
 
-This adapter intentionally implements only disposable headless reserve/provision/finish.
-Retained sessions are refused until their semantics are explicitly represented by the
-Fabric worker API.
+This adapter supports disposable jobs and bounded retained sessions. Retention uses
+the Fabric API's correlation-owned allocation plus its existing expiry/GC boundary;
+the caller's session key is hashed and is never sent to the provider.
 """
 from __future__ import annotations
 
@@ -113,9 +113,12 @@ def _request(method,path,payload=None,*,allow_404=False,timeout=None):
     return status,body
 
 
-def _correlation(owner,project,correlation_id=""):
+def _correlation(owner,project,correlation_id="",session_key=""):
+    session=str(session_key or "").strip()
     explicit=str(correlation_id or "").strip()
-    if explicit:
+    if session:
+        raw=f"session\0{owner}\0{project}\0{session}".encode()
+    elif explicit:
         raw=f"job\0{explicit}".encode()
     else:
         raw=f"owner-project\0{owner}\0{project}".encode()
@@ -145,10 +148,9 @@ def _instance(payload,*,owner=None,project=None):
 
 
 def reserve(owner,project,ttl_seconds,session_key=None,correlation_id=None,**_resources):
-    if session_key:
-        raise FabricManagerError(
-            "ServerWorkerFabric manager does not support retained session reuse"
-        )
+    session=str(session_key or "").strip()
+    if session_key is not None and (not session or len(session) > 256):
+        raise FabricManagerError("session_key must contain between 1 and 256 characters")
     ttl=int(ttl_seconds)
     if ttl < 60 or ttl > 7*24*3600:
         raise FabricManagerError("ttl_seconds must be between 60 and 604800")
@@ -157,12 +159,20 @@ def reserve(owner,project,ttl_seconds,session_key=None,correlation_id=None,**_re
         "/v1/headless",
         {
             "profile":PROFILE,
-            "correlation_id":_correlation(owner,project,correlation_id),
+            "correlation_id":_correlation(
+                owner,project,correlation_id,session_key=session,
+            ),
             "ttl_seconds":ttl,
         },
         timeout=CREATE_TIMEOUT,
     )
-    return {"instance":_instance(payload,owner=owner,project=project),"reused":False}
+    instance=_instance(payload,owner=owner,project=project)
+    existing=payload.get("created") is False
+    # A correlated guest may be between shutdown and boot when it is reserved.
+    # Report it as needing provisioning in that case so codex-ci-dispatch polls
+    # the authenticated readiness endpoint before attempting SSH.
+    reused=bool(existing and instance["ip"])
+    return {"instance":instance,"reused":reused}
 
 
 def provision(instance_id):
@@ -274,9 +284,15 @@ def finish(instance_id,status="finished",exit_code=None,reason="job_finished",ke
     if not logical:
         raise FabricManagerError("instance id is required")
     if int(keep_seconds or 0) > 0:
-        raise FabricManagerError(
-            "ServerWorkerFabric manager does not support retained keep_seconds"
-        )
+        # The allocation already carries the bounded expiry supplied to reserve.
+        # Leaving it untouched makes it reusable by the same hashed correlation;
+        # Fabric GC remains the only automatic deletion authority.
+        return {
+            "id":logical,
+            "status":"retained",
+            "deleted":False,
+            "keep_seconds":int(keep_seconds),
+        }
     quoted=urllib.parse.quote(logical,safe="")
     code,payload=_request("DELETE",f"/v1/headless/{quoted}",allow_404=True)
     if code==404:
